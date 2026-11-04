@@ -15,7 +15,31 @@ the panel's reverse-proxy shape:
   (Sec-Fetch-Site is a forbidden header pages cannot forge, so a
   genuine cross-site POST keeps its Origin and is still rejected).
 """
+import os
 from urllib.parse import urlsplit
+
+
+def _state_dir():
+    """Persistent state directory: the platform's DATA_DIR env var
+    when provided, else the ./data symlink the panel creates inside
+    the project folder, else ./.runtime for standalone local runs."""
+    env = os.environ.get("DATA_DIR")
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    link = os.path.join(here, "data")
+    if os.path.isdir(link):
+        return link
+    return os.path.join(here, ".runtime")
+
+
+# The app reads its Zhihu-cookie and site-settings state file paths
+# from the environment; point them at the platform data directory so
+# the state is covered by platform backups. Explicitly configured
+# values always win.
+_state = _state_dir()
+os.environ.setdefault("COOKIE_STATE_FILE", os.path.join(_state, "cookie-state.json"))
+os.environ.setdefault("APP_SETTINGS_FILE", os.path.join(_state, "site-settings.json"))
 
 try:
     from app import app as _inner_app
