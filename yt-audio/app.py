@@ -35,11 +35,26 @@ from urllib.parse import parse_qs, quote, urlparse
 import auth
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+
+def _platform_data_dir(base):
+    """Persistent data directory: the platform's DATA_DIR env var when
+    provided, else the ./data symlink the panel creates inside the
+    project folder (pointing at the central data directory), else
+    ./.runtime for standalone local runs."""
+    env = os.environ.get("DATA_DIR")
+    if env:
+        return env
+    link = os.path.join(base, "data")
+    if os.path.isdir(link):
+        return link
+    return os.path.join(base, ".runtime")
+
 RUNTIME = os.path.join(BASE, ".runtime")
 DL_DIR = os.path.join(RUNTIME, "downloads")
 BIN_DIR = os.path.join(RUNTIME, "bin")
 INDEX_FILE = os.path.join(DL_DIR, "index.json")
-COOKIE_FILE = os.path.join(RUNTIME, "youtube-cookies.txt")
+DATA_DIR = _platform_data_dir(BASE)
+COOKIE_FILE = os.path.join(DATA_DIR, "youtube-cookies.txt")
 YTDLP_PATH = os.environ.get("YTDLP_BIN") or os.path.join(BIN_DIR, "yt-dlp")
 YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
 DENO_URL = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip"
