@@ -28,7 +28,21 @@ import auth
 from page import PAGE_HTML
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / ".runtime" / "openrouter"
+
+def _platform_data_dir(base):
+    """Persistent data directory: the platform's DATA_DIR env var when
+    provided, else the ./data symlink the panel creates inside the
+    project folder (pointing at the central data directory), else
+    ./.runtime for standalone local runs."""
+    env = os.environ.get("DATA_DIR")
+    if env:
+        return env
+    link = os.path.join(base, "data")
+    if os.path.isdir(link):
+        return link
+    return os.path.join(base, ".runtime")
+
+DATA_DIR = Path(_platform_data_dir(str(BASE_DIR))) / "openrouter"
 SEED_DIR = BASE_DIR / "seed"
 
 MODELS_FILE = DATA_DIR / "models.json"
