@@ -27,7 +27,21 @@ from page import PAGE_HTML
 from webutil import json_response, read_json
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-RUNTIME = os.path.join(BASE, ".runtime")
+
+def _platform_data_dir(base):
+    """Persistent data directory: the platform's DATA_DIR env var when
+    provided, else the ./data symlink the panel creates inside the
+    project folder (pointing at the central data directory), else
+    ./.runtime for standalone local runs."""
+    env = os.environ.get("DATA_DIR")
+    if env:
+        return env
+    link = os.path.join(base, "data")
+    if os.path.isdir(link):
+        return link
+    return os.path.join(base, ".runtime")
+
+RUNTIME = _platform_data_dir(BASE)
 STATE_FILE = os.path.join(RUNTIME, "dns_state.json")
 DOMAIN_SUFFIX = os.getenv("DNS_DOMAIN_SUFFIX", "su7.dpdns.org").strip().lower().rstrip(".")
 STATUS_TTL = 15
