@@ -38,7 +38,21 @@ def args_get(key, default=None):
 
 
 
-DOCS_DIR = os.environ.get("NOTES_DOCS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".runtime", "docsnew_data"))
+def _platform_data_dir(base):
+    """Persistent data directory: the platform's DATA_DIR env var when
+    provided, else the ./data symlink the panel creates inside the
+    project folder (pointing at the central data directory), else
+    ./.runtime for standalone local runs."""
+    env = os.environ.get("DATA_DIR")
+    if env:
+        return env
+    link = os.path.join(base, "data")
+    if os.path.isdir(link):
+        return link
+    return os.path.join(base, ".runtime")
+
+
+DOCS_DIR = os.environ.get("NOTES_DOCS_DIR", os.path.join(_platform_data_dir(os.path.dirname(os.path.abspath(__file__))), "docsnew_data"))
 INBOX_DIR = os.path.join(DOCS_DIR, "inbox")
 ARCHIVE_DIR = os.path.join(DOCS_DIR, "archive")
 TRASH_DIR = DOCS_DIR + "_trash"  # 保持回收站在扫描目录之外
