@@ -1,12 +1,9 @@
 """微书签 — a tiny personal link hub for the App Hub.
 
-A single page of bookmarks the user can add to from the browser, gated by
-the same login as the other hub projects (its own account, with the App
-Hub panel session accepted as single sign-on). It also exposes
-/auth/verify, an endpoint Caddy's forward_auth can call to gate OTHER
-services (e.g. OpenCode on its own port) behind the same unified login:
-2xx means "let them through", otherwise it answers with a redirect to
-the panel login page, which Caddy passes back to the browser.
+A single page of bookmarks the user can add to from the browser.
+This app contains no identity verification: the App Hub platform
+gate in front of /web/links/ performs it centrally, and direct
+access on the local port is trusted.
 """
 import json
 import os
@@ -16,15 +13,37 @@ import time
 from urllib.parse import urlparse
 
 import auth
-import panel_auth
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-RUNTIME = os.path.join(BASE, ".runtime")
+
+def _platform_data_dir(base):
+    """Persistent data directory: the platform's DATA_DIR env var when
+    provided, else the ./data symlink the panel creates inside the
+    project folder (pointing at the central data directory), else
+    ./.runtime for standalone local runs."""
+    env = os.environ.get("DATA_DIR")
+    if env:
+        return env
+    link = os.path.join(base, "data")
+    if os.path.isdir(link):
+        return link
+    return os.path.join(base, ".runtime")
+
+RUNTIME = _platform_data_dir(BASE)
 LINKS_FILE = os.path.join(RUNTIME, "links.json")
-LOGIN_URL = os.environ.get("LINKS_LOGIN_URL", "https://debi.su7.dpdns.org:10443/")
+OPENCODE_URL = "https://debi.su7.dpdns.org:31426/"
 MAX_LINKS = 500
 
 _account, _account_from_env = auth.load_account()
+
+
+
+def _client_ip(environ):
+    fwd = environ.get("HTTP_X_FORWARDED_FOR", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return environ.get("REMOTE_ADDR", "") or "unknown"
+
 _account_lock = threading.Lock()
 _links_lock = threading.Lock()
 
@@ -52,21 +71,23 @@ def _save_links(links):
 
 def _public_link(e):
     return {"id": e["id"], "name": e.get("name", ""), "url": e.get("url", ""),
-            "note": e.get("note", ""), "created_at": e.get("created_at")}
+            "note": e.get("note", ""), "category": e.get("category", ""),
+            "created_at": e.get("created_at")}
 
 
 def _validate_link(data):
     name = str(data.get("name") or "").strip()
     url = str(data.get("url") or "").strip()
     note = str(data.get("note") or "").strip()
+    category = str(data.get("category") or "").strip()
     if not (1 <= len(name) <= 80):
         return None, "名称需为 1–80 个字符。"
-    if len(url) > 2048 or len(note) > 200:
-        return None, "链接或备注过长。"
+    if len(url) > 2048 or len(note) > 200 or len(category) > 40:
+        return None, "链接、备注或分类过长。"
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return None, "链接需为完整的 http(s) 地址。"
-    return {"name": name, "url": url, "note": note}, None
+    return {"name": name, "url": url, "note": note, "category": category}, None
 
 # ---------------------------------------------------------------- http helpers
 
@@ -112,20 +133,12 @@ def _current_account():
 
 
 def _auth_state(environ):
-    """(authenticated, via, username): own account session wins; a valid
-    App Hub panel session is accepted as fallback (single sign-on)."""
+    """Identity verification lives at the platform layer (the App Hub
+    gate in front of /web/<slug>/). This app performs no verification
+    itself: any request that reaches it has either passed the
+    platform gate or arrived on the local port, which is trusted."""
     account = _current_account()
-    cookie = environ.get("HTTP_COOKIE", "")
-    if account:
-        for part in cookie.split(";"):
-            name, _, value = part.strip().partition("=")
-            if name == COOKIE_NAME and value and account.check_token(value):
-                return True, "account", account.username
-    panel_user = panel_auth.panel_username(cookie)
-    if panel_user:
-        return True, "panel", panel_user
-    return False, None, None
-
+    return True, "platform", (account.username if account else "local")
 
 def _authed(environ):
     return _auth_state(environ)[0]
@@ -179,25 +192,11 @@ def handle_session(environ, start_response):
     authed, via, username = _auth_state(environ)
     return _json(start_response, "200 OK", {
         "ok": True,
-        "setup_required": account is None,
+        "setup_required": False,
         "authenticated": authed,
         "via": via,
         "username": username if authed else None,
     })
-
-
-def handle_verify(environ, start_response):
-    """Caddy forward_auth target. 200 + X-Auth-User when the unified login
-    (panel session or this project's account session) is present; a 302 to
-    the panel login page otherwise, which Caddy returns to the browser."""
-    authed, via, username = _auth_state(environ)
-    if authed:
-        return _json(start_response, "200 OK", {"ok": True, "username": username},
-                     [("X-Auth-User", username)])
-    start_response("302 Found", [("Location", LOGIN_URL),
-                                 ("Content-Length", "0")])
-    return [b""]
-
 
 def handle_links_list(environ, start_response):
     with _links_lock:
@@ -261,90 +260,112 @@ PAGE = """<!DOCTYPE html>
 <title>微书签</title>
 <style>
   :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
   body { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-         margin: 0 auto; max-width: 760px; padding: 20px 16px 48px; line-height: 1.55; }
-  h1 { font-size: 22px; margin: 4px 0 2px; }
-  .sub { opacity: .65; font-size: 13px; margin-bottom: 18px; }
-  .card { border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
-          border-radius: 12px; padding: 14px 16px; margin: 12px 0; }
-  label { display: block; font-size: 13px; margin: 10px 0 4px; }
-  input[type=text], input[type=url], input[type=password] {
-    width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px;
-    border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
-    background: transparent; color: inherit; font-size: 15px; }
-  button { padding: 9px 16px; border-radius: 8px; border: 0; cursor: pointer;
-           background: #2563eb; color: #fff; font-size: 14px; }
-  button.ghost { background: transparent; color: inherit;
-                 border: 1px solid color-mix(in srgb, currentColor 30%, transparent); }
-  button.danger { background: #dc2626; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  .link { display: flex; gap: 10px; align-items: baseline; padding: 10px 2px;
-          border-bottom: 1px solid color-mix(in srgb, currentColor 10%, transparent); }
-  .link:last-child { border-bottom: 0; }
-  .link a { font-size: 16px; text-decoration: none; word-break: break-all; }
-  .link .note { opacity: .6; font-size: 13px; }
-  .link .ops { margin-left: auto; white-space: nowrap; }
-  .link .ops button { padding: 4px 10px; font-size: 12px; }
-  .msg { min-height: 20px; font-size: 14px; margin: 8px 0; }
+         margin: 0 auto; max-width: 880px; padding: 0 14px 56px; line-height: 1.5;
+         -webkit-tap-highlight-color: transparent; }
+  header { position: sticky; top: 0; z-index: 20; display: flex; gap: 8px; align-items: center;
+           padding: 12px 2px 10px;
+           background: color-mix(in srgb, Canvas 88%, transparent);
+           backdrop-filter: blur(8px); }
+  header h1 { font-size: 19px; margin: 0; white-space: nowrap; }
+  #q { flex: 1; min-width: 0; padding: 9px 12px; border-radius: 999px; font-size: 15px;
+       border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+       background: transparent; color: inherit; outline: none; }
+  #q:focus { border-color: #2f6fd0; }
+  .tbtn { padding: 8px 14px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+          background: transparent; color: inherit; font-size: 14px; cursor: pointer; white-space: nowrap; }
+  .tbtn.on { background: #2f6fd0; border-color: #2f6fd0; color: #fff; }
+  .hintbar { display: none; font-size: 13px; opacity: .65; padding: 2px 2px 8px; }
+  body.editing .hintbar { display: block; }
+  h2.cat { font-size: 14px; margin: 20px 2px 10px; opacity: .75; font-weight: 600;
+           display: flex; align-items: baseline; gap: 8px; }
+  h2.cat .n { font-size: 12px; opacity: .6; font-weight: 400; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr 1fr; } }
+  .card { display: flex; gap: 10px; align-items: center; padding: 12px; border-radius: 14px;
+          border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
+          background: color-mix(in srgb, currentColor 4%, transparent);
+          text-decoration: none; color: inherit; position: relative; min-height: 64px;
+          transition: transform .05s ease; }
+  .card:active { transform: scale(.985); }
+  .tile { flex: 0 0 auto; width: 40px; height: 40px; border-radius: 11px; color: #fff;
+          display: flex; align-items: center; justify-content: center;
+          font-size: 18px; font-weight: 700; background: hsl(var(--h, 210) 52% 44%); }
+  .meta { min-width: 0; }
+  .name { font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub2 { font-size: 12px; opacity: .55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  body.editing .card { border-style: dashed; cursor: pointer; }
+  body.editing .card::after { content: "编辑"; position: absolute; top: 6px; right: 8px;
+          font-size: 11px; opacity: .55; }
+  .addcard { display: none; align-items: center; justify-content: center; min-height: 64px;
+          border-radius: 14px; border: 1.5px dashed color-mix(in srgb, currentColor 30%, transparent);
+          font-size: 15px; opacity: .75; cursor: pointer; background: transparent; color: inherit; }
+  body.editing .addcard { display: flex; }
+  .empty { opacity: .55; font-size: 14px; padding: 26px 2px; }
+  footer { margin-top: 30px; font-size: 12px; opacity: .45; padding: 0 2px; }
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.48); z-index: 50;
+             display: none; align-items: flex-end; justify-content: center; }
+  .overlay.show { display: flex; }
+  .sheet { background: Canvas; color: CanvasText; width: 100%; max-width: 520px;
+           border-radius: 18px 18px 0 0; padding: 18px 18px 22px; }
+  @media (min-width: 640px) { .overlay { align-items: center; } .sheet { border-radius: 18px; } }
+  .sheet h3 { margin: 0 0 6px; font-size: 16px; }
+  .sheet label { display: block; font-size: 13px; margin: 12px 0 4px; opacity: .8; }
+  .sheet input { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 15px;
+           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+           background: transparent; color: inherit; outline: none; }
+  .sheet input:focus { border-color: #2f6fd0; }
+  .srow { display: flex; gap: 8px; margin-top: 18px; align-items: center; }
+  .sbtn { padding: 10px 18px; border-radius: 10px; border: 0; background: #2f6fd0; color: #fff;
+          font-size: 14px; cursor: pointer; }
+  .sbtn.ghost { background: transparent; color: inherit;
+          border: 1px solid color-mix(in srgb, currentColor 28%, transparent); }
+  .sbtn.danger { background: transparent; color: #dc2626;
+          border: 1px solid color-mix(in srgb, #dc2626 45%, transparent); }
+  .msg { min-height: 18px; font-size: 13px; margin-top: 8px; }
   .err { color: #dc2626; }
-  [hidden] { display: none !important; }
+  #gate-note { display: none; padding: 40px 6px; font-size: 15px; opacity: .75; }
 </style>
 </head>
 <body>
-<h1>微书签</h1>
-<div class="sub">随手存、随时开的个人链接页。和面板共用登录；OpenCode 等受控入口也走同一道验证。</div>
+<header>
+  <h1>微书签</h1>
+  <input id="q" type="search" placeholder="搜索链接…" autocomplete="off">
+  <button id="editToggle" class="tbtn" type="button">编辑</button>
+</header>
+<div class="hintbar">编辑模式：点任意卡片修改，点虚线框添加新链接；打开链接请先退出编辑模式。</div>
+<main id="board"></main>
+<div id="gate-note">这个页面由平台统一验证。请从控制台进入，或完成平台验证后刷新本页。</div>
+<footer id="foot"></footer>
 
-<section id="setup-panel" class="card" hidden>
-  <h2 style="font-size:16px;margin:0 0 6px">首次设置 · 创建账户</h2>
-  <form id="setup-form">
-    <label>账户名</label><input id="setup-username" type="text" autocomplete="username" required maxlength="128">
-    <label>设置密码（至少 10 位）</label><input id="setup-password" type="password" autocomplete="new-password" required maxlength="1024">
-    <label>再次输入密码</label><input id="setup-password2" type="password" autocomplete="new-password" required maxlength="1024">
-    <div class="row" style="margin-top:12px"><button type="submit">创建账户并登录</button></div>
-    <p class="msg" id="setup-msg"></p>
+<div class="overlay" id="overlay">
+  <form class="sheet" id="sheet">
+    <h3 id="sheetTitle">添加链接</h3>
+    <label>名称</label>
+    <input id="s-name" type="text" required maxlength="80" placeholder="例如 OpenCode">
+    <label>链接</label>
+    <input id="s-url" type="url" required maxlength="2048" placeholder="https://…">
+    <label>备注（可选）</label>
+    <input id="s-note" type="text" maxlength="200">
+    <label>分类（可选）</label>
+    <input id="s-cat" type="text" maxlength="40" list="catlist" placeholder="例如 平台 / 工具 / 记录">
+    <datalist id="catlist"></datalist>
+    <div class="srow">
+      <button id="s-del" type="button" class="sbtn danger" hidden>删除</button>
+      <span style="flex:1"></span>
+      <button id="s-cancel" type="button" class="sbtn ghost">取消</button>
+      <button type="submit" class="sbtn">保存</button>
+    </div>
+    <p class="msg" id="sheetMsg"></p>
   </form>
-</section>
-
-<section id="login-panel" class="card" hidden>
-  <h2 style="font-size:16px;margin:0 0 6px">登录后使用</h2>
-  <form id="login-form">
-    <label>账户名</label><input id="username" type="text" autocomplete="username" required maxlength="128">
-    <label>密码</label><input id="password" type="password" autocomplete="current-password" required maxlength="1024">
-    <div class="row" style="margin-top:12px"><button type="submit">登录</button></div>
-    <p class="msg" id="login-msg"></p>
-  </form>
-</section>
-
-<main id="workspace" hidden>
-  <div class="row" style="justify-content:space-between">
-    <span id="who" class="sub" style="margin:0"></span>
-    <button id="logout" class="ghost" type="button">退出</button>
-  </div>
-
-  <section class="card">
-    <h2 style="font-size:16px;margin:0 0 6px" id="form-title">添加链接</h2>
-    <form id="add-form">
-      <label>名称</label><input id="f-name" type="text" required maxlength="80" placeholder="例如 OpenCode">
-      <label>链接</label><input id="f-url" type="url" required maxlength="2048" placeholder="https://…">
-      <label>备注（可选）</label><input id="f-note" type="text" maxlength="200">
-      <div class="row" style="margin-top:12px">
-        <button type="submit" id="f-submit">添加</button>
-        <button type="button" id="f-cancel" class="ghost" hidden>取消编辑</button>
-      </div>
-      <p class="msg" id="form-msg"></p>
-    </form>
-  </section>
-
-  <section class="card">
-    <h2 style="font-size:16px;margin:0 0 6px">我的链接</h2>
-    <div id="links"></div>
-    <p class="msg" id="list-msg"></p>
-  </section>
-</main>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
-let editingId = null;
+let allLinks = [];
+let editing = false;
+let sheetId = null;
 
 async function api(path, options) {
   const res = await fetch(path, {credentials: "same-origin", cache: "no-store", ...options});
@@ -354,94 +375,112 @@ async function api(path, options) {
 }
 const post = (path, body) => api(path, {method: "POST",
   headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
-
 function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
+function hueOf(s) { let h = 0; for (const ch of s) h = (h * 31 + ch.codePointAt(0)) % 360; return h; }
+function hostOf(u) { try { return new URL(u).host; } catch (e) { return u; } }
 
-async function refresh() {
-  const {data} = await api("api/session");
-  if (!data.authenticated && data.setup_required) {
-    $("setup-panel").hidden = false; $("login-panel").hidden = true; $("workspace").hidden = true;
-    return;
+function groups() {
+  const q = $("q").value.trim().toLowerCase();
+  const filtered = allLinks.filter(l => !q ||
+    (l.name + " " + (l.note || "") + " " + l.url + " " + (l.category || "")).toLowerCase().includes(q));
+  const order = [];
+  const byCat = new Map();
+  for (const l of filtered) {
+    const c = (l.category || "").trim();
+    if (!byCat.has(c)) { byCat.set(c, []); order.push(c); }
+    byCat.get(c).push(l);
   }
-  if (!data.authenticated) {
-    $("setup-panel").hidden = true; $("login-panel").hidden = false; $("workspace").hidden = true;
-    return;
+  order.sort((a, b) => (a === "" ? 1 : 0) - (b === "" ? 1 : 0));
+  return order.map(c => ({cat: c, items: byCat.get(c)}));
+}
+
+function cardHtml(l) {
+  const letter = esc(Array.from(l.name || "?")[0] || "?");
+  const sub = esc(l.note || hostOf(l.url));
+  const inner = `<span class="tile" style="--h:${hueOf(l.name || "")}">${letter}</span>` +
+    `<span class="meta"><span class="name">${esc(l.name)}</span><br>` +
+    `<span class="sub2">${sub}</span></span>`;
+  if (editing) return `<div class="card" data-edit="${l.id}">${inner}</div>`;
+  return `<a class="card" href="${esc(l.url)}" target="_blank" rel="noopener">${inner}</a>`;
+}
+
+function render() {
+  const gs = groups();
+  const board = $("board");
+  if (!allLinks.length) {
+    board.innerHTML = `<div class="empty">暂无链接。点右上角「编辑」添加第一个。</div>`;
+  } else if (!gs.length) {
+    board.innerHTML = `<div class="empty">没有匹配的链接。</div>`;
+  } else {
+    board.innerHTML = gs.map(g =>
+      `<h2 class="cat">${esc(g.cat || "未分类")}<span class="n">${g.items.length}</span></h2>` +
+      `<div class="grid">` + g.items.map(cardHtml).join("") +
+      (editing && !($("q").value.trim()) ? `<button type="button" class="addcard" data-add="${esc(g.cat)}">＋ 添加</button>` : "") +
+      `</div>`).join("");
   }
-  $("setup-panel").hidden = true; $("login-panel").hidden = true; $("workspace").hidden = false;
-  $("who").textContent = "已登录：" + (data.username || "") + (data.via === "panel" ? "（面板免登）" : "");
-  await loadLinks();
+  board.querySelectorAll("[data-edit]").forEach(el => el.onclick = () => openSheet(el.dataset.edit));
+  board.querySelectorAll("[data-add]").forEach(el => el.onclick = () => openSheet(null, el.dataset.add));
+  const cats = [...new Set(allLinks.map(l => (l.category || "").trim()).filter(Boolean))];
+  $("catlist").innerHTML = cats.map(c => `<option value="${esc(c)}">`).join("");
+  $("foot").textContent = allLinks.length ? `共 ${allLinks.length} 条 · 点卡片打开，编辑是低频操作，收在右上角「编辑」里` : "";
 }
 
 async function loadLinks() {
   const {status, data} = await api("api/links");
-  const box = $("links");
-  if (status !== 200) { $("list-msg").textContent = data.message || "加载失败"; return; }
-  if (!data.links.length) { box.innerHTML = ""; $("list-msg").textContent = "暂无链接，用上面的表单添加第一个。"; return; }
-  $("list-msg").textContent = "";
-  box.innerHTML = data.links.map(l =>
-    `<div class="link"><div><a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.name)}</a>` +
-    (l.note ? `<div class="note">${esc(l.note)}</div>` : "") +
-    `</div><span class="ops"><button class="ghost" data-edit="${l.id}">编辑</button> ` +
-    `<button class="danger" data-del="${l.id}">删除</button></span></div>`).join("");
-  box.querySelectorAll("[data-edit]").forEach(b => b.onclick = () => startEdit(b.dataset.edit, data.links));
-  box.querySelectorAll("[data-del]").forEach(b => b.onclick = () => removeLink(b.dataset.del));
+  if (status !== 200) { $("board").innerHTML = `<div class="empty">加载失败，请刷新重试。</div>`; return; }
+  allLinks = data.links || [];
+  render();
 }
 
-function startEdit(id, links) {
-  const l = links.find(x => x.id === id);
-  if (!l) return;
-  editingId = id;
-  $("f-name").value = l.name; $("f-url").value = l.url; $("f-note").value = l.note || "";
-  $("form-title").textContent = "编辑链接"; $("f-submit").textContent = "保存";
-  $("f-cancel").hidden = false;
-  window.scrollTo({top: 0, behavior: "smooth"});
+function openSheet(id, presetCat) {
+  const l = id ? allLinks.find(x => x.id === id) : null;
+  sheetId = id || null;
+  $("sheetTitle").textContent = l ? "编辑链接" : "添加链接";
+  $("s-name").value = l ? l.name : "";
+  $("s-url").value = l ? l.url : "";
+  $("s-note").value = l ? (l.note || "") : "";
+  $("s-cat").value = l ? (l.category || "") : (presetCat || "");
+  $("s-del").hidden = !l;
+  $("sheetMsg").textContent = "";
+  $("overlay").classList.add("show");
+  setTimeout(() => $("s-name").focus(), 30);
 }
-function resetForm() {
-  editingId = null;
-  $("add-form").reset();
-  $("form-title").textContent = "添加链接"; $("f-submit").textContent = "添加";
-  $("f-cancel").hidden = true; $("form-msg").textContent = "";
-}
-$("f-cancel").onclick = resetForm;
+function closeSheet() { $("overlay").classList.remove("show"); }
+$("s-cancel").onclick = closeSheet;
+$("overlay").addEventListener("click", e => { if (e.target === $("overlay")) closeSheet(); });
 
-$("add-form").onsubmit = async (e) => {
+$("sheet").onsubmit = async (e) => {
   e.preventDefault();
-  const body = {name: $("f-name").value, url: $("f-url").value, note: $("f-note").value};
-  const path = editingId ? "api/links/" + editingId : "api/links";
+  const body = {name: $("s-name").value, url: $("s-url").value,
+                note: $("s-note").value, category: $("s-cat").value};
+  const path = sheetId ? "api/links/" + sheetId : "api/links";
   const {status, data} = await post(path, body);
-  if (status !== 200) { $("form-msg").innerHTML = `<span class="err">${esc(data.message || "保存失败")}</span>`; return; }
-  resetForm();
+  if (status !== 200) { $("sheetMsg").innerHTML = `<span class="err">${esc(data.message || "保存失败")}</span>`; return; }
+  closeSheet();
+  await loadLinks();
+};
+$("s-del").onclick = async () => {
+  if (!sheetId || !confirm("删除这条链接？")) return;
+  const {status, data} = await api("api/links/" + sheetId, {method: "DELETE"});
+  if (status !== 200) { $("sheetMsg").innerHTML = `<span class="err">${esc(data.message || "删除失败")}</span>`; return; }
+  closeSheet();
   await loadLinks();
 };
 
-async function removeLink(id) {
-  if (!confirm("删除这条链接？")) return;
-  const {status, data} = await api("api/links/" + id, {method: "DELETE"});
-  if (status !== 200) { alert(data.message || "删除失败"); return; }
-  if (editingId === id) resetForm();
+$("editToggle").onclick = () => {
+  editing = !editing;
+  document.body.classList.toggle("editing", editing);
+  $("editToggle").textContent = editing ? "完成" : "编辑";
+  $("editToggle").classList.toggle("on", editing);
+  render();
+};
+$("q").addEventListener("input", render);
+
+(async () => {
+  const {data} = await api("api/session");
+  if (!data.authenticated) { $("gate-note").style.display = "block"; return; }
   await loadLinks();
-}
-
-$("setup-form").onsubmit = async (e) => {
-  e.preventDefault();
-  if ($("setup-password").value !== $("setup-password2").value) {
-    $("setup-msg").innerHTML = '<span class="err">两次输入的密码不一致。</span>'; return;
-  }
-  const {status, data} = await post("api/setup",
-    {username: $("setup-username").value, password: $("setup-password").value});
-  if (status !== 200) { $("setup-msg").innerHTML = `<span class="err">${esc(data.message || "设置失败")}</span>`; return; }
-  await refresh();
-};
-$("login-form").onsubmit = async (e) => {
-  e.preventDefault();
-  const {status, data} = await post("api/login",
-    {username: $("username").value, password: $("password").value});
-  if (status !== 200) { $("login-msg").innerHTML = `<span class="err">${esc(data.message || "登录失败")}</span>`; return; }
-  await refresh();
-};
-$("logout").onclick = async () => { await post("api/logout"); await refresh(); };
-
-refresh();
+})();
 </script>
 </body>
 </html>
@@ -456,14 +495,11 @@ def application(environ, start_response):
     try:
         if path == "/health":
             return _json(start_response, "200 OK", {"ok": True, "service": "links"})
-        if path == "/auth/verify" and method == "GET":
-            return handle_verify(environ, start_response)
         if path == "/api/session" and method == "GET":
             return handle_session(environ, start_response)
-        if path == "/api/setup" and method == "POST":
-            return handle_setup(environ, start_response)
-        if path == "/api/login" and method == "POST":
-            return handle_login(environ, start_response)
+        if path in ("/api/setup", "/api/login") and method == "POST":
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "error": "not_found", "message": "接口不存在。"})
         if path == "/api/logout" and method == "POST":
             return handle_logout(environ, start_response)
         if path.startswith("/api/links"):

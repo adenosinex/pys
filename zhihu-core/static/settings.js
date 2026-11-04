@@ -171,10 +171,7 @@ window.siteSettingsUI = (() => {
   }
 
   function failure(error) {
-    if (error.status === 401) {
-      showAccount(null);
-      el('login-message').textContent = '登录已过期，请重新登录。';
-    } else { message(error.message, 'warning'); }
+    message(error.message, 'warning');
   }
 
   async function load() {
@@ -250,13 +247,6 @@ window.siteSettingsUI = (() => {
     const rule = routeFor(parsed.hostname.toLowerCase().replace(/\.$/, ''));
     if (!rule || rule.transport === 'server') return api('/api/extract', {url, format, ...options}, signal);
     if (url.length > 8000) throw new Error('链接过长，请使用原始网址或短链接。');
-    const session = await api('/api/session', undefined, signal);
-    if (!session.authenticated) {
-      const error = new Error('登录已过期，请重新登录。');
-      error.status = 401;
-      error.code = 'unauthorized';
-      throw error;
-    }
     const controller = new AbortController();
     const abort = () => controller.abort();
     let timedOut = false;

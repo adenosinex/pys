@@ -20,30 +20,9 @@
       <div class="brandline">
         <a class="brand-logo" href="/" aria-label="链接转文本首页"><img src="/static/logo.svg" width="44" height="44" alt=""></a>
         <div class="brand-title"><h1>链接转文本</h1><p>粘贴链接或整段文本，自动识别知乎、YouTube 和已配置的网站。支持 Markdown / 纯文本 / JSON。</p></div>
-        <div id="account" hidden><span id="account-name"></span><button id="logout" class="btn btn-ghost btn-sm" type="button">退出登录</button></div>
       </div>
     </header>
-    <section id="setup-panel" class="card login" aria-labelledby="setup-title" hidden>
-      <div class="cardhead"><h2 id="setup-title">首次设置 · 创建管理员账户</h2></div>
-      <form id="setup-form">
-        <label for="setup-username">账户名</label><input id="setup-username" name="username" type="text" autocomplete="username" value="xin" maxlength="128" required>
-        <label for="setup-password">设置密码</label><input id="setup-password" name="password" type="password" autocomplete="new-password" maxlength="1024" required>
-        <label for="setup-password2">再次输入密码</label><input id="setup-password2" type="password" autocomplete="new-password" maxlength="1024" required>
-        <button id="setup-button" class="btn btn-primary login-submit" type="submit">创建账户并登录</button>
-        <p class="hint">这是本服务的第一个账户，只有尚未设置账户时才会出现此页面，创建成功后入口自动关闭。密码至少 10 位。</p>
-        <p id="setup-message" class="message" role="status" aria-live="polite"></p>
-      </form>
-    </section>
-    <section id="login-panel" class="card login" aria-labelledby="login-title">
-      <div class="cardhead"><h2 id="login-title">登录后使用</h2></div>
-      <form id="login-form">
-        <label for="username">账户名</label><input id="username" name="username" type="text" autocomplete="username" value="xin" maxlength="128" required>
-        <label for="password">密码</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024" required>
-        <button id="login-button" class="btn btn-primary login-submit" type="submit">登录</button>
-        <p id="login-message" class="message" role="status" aria-live="polite"></p>
-      </form>
-    </section>
-    <section id="workspace" hidden>
+    <section id="workspace">
       <nav class="shortcut-bar" aria-label="快捷链接"><div id="shortcut-links" class="shortcut-links"></div><button id="open-settings" class="btn btn-ghost btn-sm" type="button">＋ 链接与设置</button></nav>
       <div class="zenbar"><label class="zenSwitch" id="zenSwitch" for="zenMode"><input type="checkbox" id="zenMode"><span class="dot" aria-hidden="true"></span><span>无感模式</span><span class="sub">复制链接 → 点页面空白处提取 → 再点一次复制</span></label></div>
       <form id="extract-form" class="card">

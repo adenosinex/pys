@@ -3,8 +3,11 @@
 Hosts the user's docsnew system ported from myweb: the manager/editor
 page and the reader page, backed by his document logic (backend.py)
 over markdown files in .runtime/docsnew_data. The notes data is not
-part of the code package; it lives only in .runtime. Access is gated
-by the hub's unified login for every route, including the reader.
+part of the code package; it lives only in .runtime. This app
+contains no identity verification: the App Hub platform gate in
+front of /web/docsnew/ performs it centrally (this project's level
+is console-only, set in the console's access-control page), and
+direct access on the local port is trusted.
 """
 import json
 import os
@@ -12,7 +15,6 @@ import threading
 from urllib.parse import parse_qs, unquote
 
 import auth
-import panel_auth
 import backend
 from pages import PAGES
 from webutil import json_response, read_json, serve_file
@@ -41,65 +43,23 @@ def _current_account():
 
 
 def _auth_state(environ):
+    """Identity verification lives at the platform layer (the App Hub
+    gate in front of /web/<slug>/, this project's level: console).
+    This app performs no verification itself: any request that
+    reaches it has either passed the platform gate or arrived on the
+    local port, which is trusted."""
     account = _current_account()
-    cookie = environ.get("HTTP_COOKIE", "")
-    if account:
-        for part in cookie.split(";"):
-            name, _, value = part.strip().partition("=")
-            if name == COOKIE_NAME and value and account.check_token(value):
-                return True, "account", account.username
-    panel_user = panel_auth.panel_username(cookie)
-    if panel_user:
-        return True, "panel", panel_user
-    return False, None, None
-
+    return True, "platform", (account.username if account else "local")
 
 def _authed(environ):
     return _auth_state(environ)[0]
-
-
-def handle_setup(environ, start_response):
-    global _account
-    with _account_lock:
-        if _account is not None:
-            return json_response(start_response,
-                                 {"ok": False, "error": "setup_done", "message": "账户已设置，设置入口已关闭。"}, 409)
-        data = read_json(environ) or {}
-        username = str(data.get("username") or "").strip()
-        password = str(data.get("password") or "")
-        if not (1 <= len(username) <= 128):
-            return json_response(start_response,
-                                 {"ok": False, "error": "bad_username", "message": "账户名需为 1–128 个字符。"}, 400)
-        if len(password) < 10:
-            return json_response(start_response,
-                                 {"ok": False, "error": "short_password", "message": "密码至少 10 位。"}, 400)
-        _account = auth.store_account(username, password)
-        account = _account
-    return json_response(start_response, {"ok": True, "username": account.username},
-                         extra_headers=[_session_cookie(environ, account.make_token(), auth.SESSION_TTL)])
-
-
-def handle_login(environ, start_response):
-    account = _current_account()
-    if account is None:
-        return json_response(start_response,
-                             {"ok": False, "error": "not_configured", "message": "尚未设置账户。"}, 503)
-    data = read_json(environ) or {}
-    username = str(data.get("username") or "").strip()
-    password = str(data.get("password") or "")
-    if username != account.username or not account.check_password(password):
-        return json_response(start_response,
-                             {"ok": False, "error": "bad_credentials", "message": "账户名或密码不正确。"}, 401)
-    return json_response(start_response, {"ok": True, "username": account.username},
-                         extra_headers=[_session_cookie(environ, account.make_token(), auth.SESSION_TTL)])
-
 
 def handle_session(environ, start_response):
     account = _current_account()
     authed, via, username = _auth_state(environ)
     return json_response(start_response, {
         "ok": True,
-        "setup_required": account is None,
+        "setup_required": False,
         "authenticated": authed,
         "via": via,
         "username": username if authed else None,
@@ -126,10 +86,6 @@ def application(environ, start_response):
         return json_response(start_response, {"ok": True})
     if path == "/api/session" and method == "GET":
         return handle_session(environ, start_response)
-    if path == "/api/setup" and method == "POST":
-        return handle_setup(environ, start_response)
-    if path == "/api/login" and method == "POST":
-        return handle_login(environ, start_response)
     if path == "/api/logout" and method == "POST":
         return json_response(start_response, {"ok": True},
                              extra_headers=[_session_cookie(environ, "", 0)])

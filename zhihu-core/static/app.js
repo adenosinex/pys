@@ -28,21 +28,12 @@ async function api(path, body, signal) {
 }
 
 function showAccount(username) {
-  activeUsername = username;
-  $('login-panel').hidden = Boolean(username);
-  $('workspace').hidden = !username;
-  $('account').hidden = !username;
-  $('account-name').textContent = username || '';
-  $('password').value = '';
-  window.siteSettingsUI.accountChanged(username);
-  if (!username) {
-    clearTimeout(cookieTimer);
-    cookieGeneration += 1;
-    $('cookie-input').value = '';
-    $('cookie-message').textContent = '';
-    cookieState = null;
-    resetExtraction({quiet: true});
-  } else { loadCookieState(); }
+  // No in-app verification: entry is gated by the platform layer, so
+  // the workspace is shown directly.
+  activeUsername = username || 'platform';
+  $('workspace').hidden = false;
+  window.siteSettingsUI.accountChanged(activeUsername);
+  loadCookieState();
 }
 
 function cookieMessage(message, kind = '') {
@@ -72,10 +63,7 @@ function validationMessage(validation, prefix) {
 }
 
 function cookieFailure(error) {
-  if (error.status === 401) {
-    showAccount(null);
-    $('login-message').textContent = '登录已过期，请重新登录。';
-  } else { cookieMessage(error.message, 'warning'); }
+  cookieMessage(error.message, 'warning');
 }
 
 function syncCookieLink(inputId, linkId, storageKey, persist = true) {
@@ -188,55 +176,6 @@ for (const [input, link, storage] of [['cookie-help-url', 'cookie-help-link', 'z
     if (input === 'cookie-test-url') { cookieGeneration += 1; queueCookiePreview(); }
   });
 }
-
-function showSetup() {
-  $('login-panel').hidden = true;
-  $('setup-panel').hidden = false;
-}
-
-$('setup-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  if ($('setup-password').value !== $('setup-password2').value) {
-    $('setup-message').textContent = '两次输入的密码不一致。';
-    return;
-  }
-  $('setup-button').disabled = true;
-  $('setup-message').textContent = '';
-  try {
-    const data = await api('/api/setup', {username: $('setup-username').value.trim(), password: $('setup-password').value});
-    $('setup-panel').hidden = true;
-    showAccount(data.username);
-    $('url').focus();
-  } catch (error) {
-    $('setup-message').textContent = error.message;
-  } finally { $('setup-button').disabled = false; }
-});
-
-$('login-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  $('login-button').disabled = true;
-  $('login-message').textContent = '';
-  try {
-    const data = await api('/api/login', {username: $('username').value.trim(), password: $('password').value});
-    showAccount(data.username);
-    $('url').focus();
-  } catch (error) {
-    $('login-message').textContent = error.message;
-    $('password').value = '';
-    $('password').focus();
-  } finally { $('login-button').disabled = false; }
-});
-
-$('logout').addEventListener('click', async () => {
-  $('logout').disabled = true;
-  try {
-    await api('/api/logout', {});
-    showAccount(null);
-    $('login-message').textContent = '';
-  } catch (error) { $('extract-message').textContent = error.message; }
-  finally { $('logout').disabled = false; }
-});
-
 
 // Clipboard workflow follows the supplied page: read/extract, then click/copy.
 const flow = {links: [], selected: '', busy: false, reading: false, copying: false,
@@ -436,15 +375,10 @@ async function extractContent({copyOnNextClick = false} = {}) {
     if (generation !== flow.generation || error.name === 'AbortError') return false;
     flow.phase = 'idle';
     $('status').textContent = '提取未完成';
-    if (error.status === 401 && error.code === 'unauthorized') {
-      showAccount(null);
-      $('login-message').textContent = '登录已过期，请重新登录。';
-    } else {
-      extractMessage(error.code === 'cookie_not_configured'
-        ? '请在页面下方展开“知乎 Cookie”，粘贴并保存后再提取。' : error.message, 'warning');
-      if (error.code === 'cookie_not_configured') $('cookie-panel').open = true;
-      if (error.code === 'route_not_configured') window.siteSettingsUI.open();
-    }
+    extractMessage(error.code === 'cookie_not_configured'
+      ? '请在页面下方展开“知乎 Cookie”，粘贴并保存后再提取。' : error.message, 'warning');
+    if (error.code === 'cookie_not_configured') $('cookie-panel').open = true;
+    if (error.code === 'route_not_configured') window.siteSettingsUI.open();
     return false;
   } finally {
     if (generation === flow.generation) {
@@ -639,8 +573,4 @@ try {
   sessionStorage.removeItem('routing-input');
 } catch {}
 controls();
-api('/api/session').then(data => {
-  showAccount(data.authenticated ? data.username : null);
-  if (!data.authenticated && data.setup_required) showSetup();
-  else if (!data.account_login_enabled) $('login-message').textContent = '账户登录尚未配置，请联系管理员。';
-}).catch(error => { $('login-message').textContent = error.message; });
+showAccount('platform');

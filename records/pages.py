@@ -22,12 +22,17 @@ PAGES = {
 <style>
   #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
   #authGate.show{display:flex}
-  #authGate .card{width:min(92vw,340px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
+  #authGate .card{width:min(92vw,360px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
   #authGate h2{margin:0 0 4px;font-size:16px}
-  #authGate p{margin:0;font-size:12px;color:#8b93a7}
+  #authGate p{margin:0;font-size:12px;color:#8b93a7;line-height:1.5}
+  #authGate .hint-row{font-size:14px}
+  #authGate .hint-row b{color:#ffd479;font-size:16px}
   #authGate input{background:#0f1116;border:1px solid #232a37;color:inherit;padding:10px 12px;border-radius:10px;font:inherit;outline:none;width:100%;box-sizing:border-box}
   #authGate input:focus{border-color:#3d6ea8}
-  #authGate button{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
+  #authGate .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  #authGate .word-btn{flex:1 1 30%;background:#0f1116;color:#e6e8ee;border:1px solid #2b3444;border-radius:10px;padding:9px 4px;font:inherit;cursor:pointer}
+  #authGate .word-btn.sel{border-color:#2f6fd0;background:#1b2a44;color:#fff}
+  #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
 </head>
@@ -574,50 +579,72 @@ createApp({
 </script>
 
 <div id="authGate">
-  <form class="card" id="authForm" autocomplete="off">
-    <h2 id="authTitle">记录台 · 登录</h2>
-    <p>使用本项目账户登录；从 App Hub 面板进入时自动免登。</p>
-    <input id="authUser" placeholder="账户名" maxlength="128">
-    <input id="authPass" type="password" placeholder="密码" maxlength="256">
+  <div class="card">
+    <h2>记录台 · 验证</h2>
+    <p>弱服务独立验证：看提示词，想起同一行的三个词，输入中间的词，再点中最后一个词。有控制台会话时刷新即可直接进入，不必过这一关。</p>
+    <div class="hint-row">提示：<b id="chHint">…</b></div>
+    <input id="chInput" placeholder="输入中间的词" maxlength="64" autocomplete="off">
+    <div class="btn-row" id="chButtons"></div>
     <div class="err" id="authErr"></div>
-    <button type="submit" id="authBtn">登录</button>
-  </form>
+    <button id="chGo" type="button">进入</button>
+  </div>
 </div>
 <script>
-window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");
-document.addEventListener("DOMContentLoaded", function () {
-  document.querySelectorAll('a[href^="/api"], a[href^="/api2"], a[href^="/tracker"], a[href^="/audiom"]').forEach(function (a) {
-    a.setAttribute("href", window.API_BASE + a.getAttribute("href"));
-  });
-});
 (function(){
   "use strict";
-  var BASE = window.API_BASE;
-  function showGate(setup){
+  var BASE = window.API_BASE || location.pathname.replace(/\/[^/]*$/, "");
+  var cid = null, selToken = null;
+  function loadChallenge(){
+    document.getElementById("authErr").textContent = "";
+    document.getElementById("chInput").value = "";
+    selToken = null;
+    fetch(BASE + "/api/challenge", {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        cid = d.challenge_id;
+        document.getElementById("chHint").textContent = d.hint;
+        var box = document.getElementById("chButtons");
+        box.innerHTML = "";
+        (d.buttons || []).forEach(function(b){
+          var btn = document.createElement("button");
+          btn.type = "button"; btn.className = "word-btn"; btn.textContent = b.label;
+          btn.addEventListener("click", function(){
+            selToken = b.token;
+            Array.prototype.forEach.call(box.children, function(c){ c.classList.remove("sel"); });
+            btn.classList.add("sel");
+          });
+          box.appendChild(btn);
+        });
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "挑战加载失败，请刷新重试"; });
+  }
+  function showGate(){
     document.getElementById("authGate").classList.add("show");
-    document.getElementById("authTitle").textContent = setup ? "记录台 · 首次设置" : "记录台 · 登录";
-    document.getElementById("authBtn").textContent = setup ? "创建账户并进入" : "登录";
-    document.getElementById("authForm").dataset.mode = setup ? "setup" : "login";
+    loadChallenge();
   }
   fetch(BASE + "/api/session", {cache:"no-store"})
-    .then(function(r){return r.json();})
-    .then(function(s){ if(!s.authenticated) showGate(!!s.setup_required); })
-    .catch(function(){ showGate(false); });
-  document.getElementById("authForm").addEventListener("submit", function(e){
-    e.preventDefault();
-    var mode = e.target.dataset.mode || "login";
-    fetch(BASE + "/api/" + mode, {
+    .then(function(r){ return r.json(); })
+    .then(function(s){ if(!s.authenticated) showGate(); })
+    .catch(function(){ showGate(); });
+  document.getElementById("chGo").addEventListener("click", function(){
+    if(!cid){ return; }
+    if(!selToken){ document.getElementById("authErr").textContent = "请先点中正确的词按钮"; return; }
+    fetch(BASE + "/api/challenge", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        username: document.getElementById("authUser").value.trim(),
-        password: document.getElementById("authPass").value
-      })
+      body: JSON.stringify({challenge_id: cid, token: selToken,
+                            input: document.getElementById("chInput").value})
     }).then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
       .then(function(res){
         if(res.ok){ location.reload(); }
-        else{ document.getElementById("authErr").textContent = (res.d && res.d.message) || "登录失败，请重试"; }
+        else{
+          document.getElementById("authErr").textContent = (res.d && res.d.message) || "验证失败，请重试";
+          loadChallenge();
+        }
       })
       .catch(function(){ document.getElementById("authErr").textContent = "网络错误，请重试"; });
+  });
+  document.getElementById("chInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); document.getElementById("chGo").click(); }
   });
 })();
 </script>
@@ -644,12 +671,17 @@ document.addEventListener("DOMContentLoaded", function () {
 <style>
   #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
   #authGate.show{display:flex}
-  #authGate .card{width:min(92vw,340px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
+  #authGate .card{width:min(92vw,360px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
   #authGate h2{margin:0 0 4px;font-size:16px}
-  #authGate p{margin:0;font-size:12px;color:#8b93a7}
+  #authGate p{margin:0;font-size:12px;color:#8b93a7;line-height:1.5}
+  #authGate .hint-row{font-size:14px}
+  #authGate .hint-row b{color:#ffd479;font-size:16px}
   #authGate input{background:#0f1116;border:1px solid #232a37;color:inherit;padding:10px 12px;border-radius:10px;font:inherit;outline:none;width:100%;box-sizing:border-box}
   #authGate input:focus{border-color:#3d6ea8}
-  #authGate button{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
+  #authGate .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  #authGate .word-btn{flex:1 1 30%;background:#0f1116;color:#e6e8ee;border:1px solid #2b3444;border-radius:10px;padding:9px 4px;font:inherit;cursor:pointer}
+  #authGate .word-btn.sel{border-color:#2f6fd0;background:#1b2a44;color:#fff}
+  #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
 </head>
@@ -1014,50 +1046,72 @@ createApp({
 </script>
 
 <div id="authGate">
-  <form class="card" id="authForm" autocomplete="off">
-    <h2 id="authTitle">记录台 · 登录</h2>
-    <p>使用本项目账户登录；从 App Hub 面板进入时自动免登。</p>
-    <input id="authUser" placeholder="账户名" maxlength="128">
-    <input id="authPass" type="password" placeholder="密码" maxlength="256">
+  <div class="card">
+    <h2>记录台 · 验证</h2>
+    <p>弱服务独立验证：看提示词，想起同一行的三个词，输入中间的词，再点中最后一个词。有控制台会话时刷新即可直接进入，不必过这一关。</p>
+    <div class="hint-row">提示：<b id="chHint">…</b></div>
+    <input id="chInput" placeholder="输入中间的词" maxlength="64" autocomplete="off">
+    <div class="btn-row" id="chButtons"></div>
     <div class="err" id="authErr"></div>
-    <button type="submit" id="authBtn">登录</button>
-  </form>
+    <button id="chGo" type="button">进入</button>
+  </div>
 </div>
 <script>
-window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");
-document.addEventListener("DOMContentLoaded", function () {
-  document.querySelectorAll('a[href^="/api"], a[href^="/api2"], a[href^="/tracker"], a[href^="/audiom"]').forEach(function (a) {
-    a.setAttribute("href", window.API_BASE + a.getAttribute("href"));
-  });
-});
 (function(){
   "use strict";
-  var BASE = window.API_BASE;
-  function showGate(setup){
+  var BASE = window.API_BASE || location.pathname.replace(/\/[^/]*$/, "");
+  var cid = null, selToken = null;
+  function loadChallenge(){
+    document.getElementById("authErr").textContent = "";
+    document.getElementById("chInput").value = "";
+    selToken = null;
+    fetch(BASE + "/api/challenge", {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        cid = d.challenge_id;
+        document.getElementById("chHint").textContent = d.hint;
+        var box = document.getElementById("chButtons");
+        box.innerHTML = "";
+        (d.buttons || []).forEach(function(b){
+          var btn = document.createElement("button");
+          btn.type = "button"; btn.className = "word-btn"; btn.textContent = b.label;
+          btn.addEventListener("click", function(){
+            selToken = b.token;
+            Array.prototype.forEach.call(box.children, function(c){ c.classList.remove("sel"); });
+            btn.classList.add("sel");
+          });
+          box.appendChild(btn);
+        });
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "挑战加载失败，请刷新重试"; });
+  }
+  function showGate(){
     document.getElementById("authGate").classList.add("show");
-    document.getElementById("authTitle").textContent = setup ? "记录台 · 首次设置" : "记录台 · 登录";
-    document.getElementById("authBtn").textContent = setup ? "创建账户并进入" : "登录";
-    document.getElementById("authForm").dataset.mode = setup ? "setup" : "login";
+    loadChallenge();
   }
   fetch(BASE + "/api/session", {cache:"no-store"})
-    .then(function(r){return r.json();})
-    .then(function(s){ if(!s.authenticated) showGate(!!s.setup_required); })
-    .catch(function(){ showGate(false); });
-  document.getElementById("authForm").addEventListener("submit", function(e){
-    e.preventDefault();
-    var mode = e.target.dataset.mode || "login";
-    fetch(BASE + "/api/" + mode, {
+    .then(function(r){ return r.json(); })
+    .then(function(s){ if(!s.authenticated) showGate(); })
+    .catch(function(){ showGate(); });
+  document.getElementById("chGo").addEventListener("click", function(){
+    if(!cid){ return; }
+    if(!selToken){ document.getElementById("authErr").textContent = "请先点中正确的词按钮"; return; }
+    fetch(BASE + "/api/challenge", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        username: document.getElementById("authUser").value.trim(),
-        password: document.getElementById("authPass").value
-      })
+      body: JSON.stringify({challenge_id: cid, token: selToken,
+                            input: document.getElementById("chInput").value})
     }).then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
       .then(function(res){
         if(res.ok){ location.reload(); }
-        else{ document.getElementById("authErr").textContent = (res.d && res.d.message) || "登录失败，请重试"; }
+        else{
+          document.getElementById("authErr").textContent = (res.d && res.d.message) || "验证失败，请重试";
+          loadChallenge();
+        }
       })
       .catch(function(){ document.getElementById("authErr").textContent = "网络错误，请重试"; });
+  });
+  document.getElementById("chInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); document.getElementById("chGo").click(); }
   });
 })();
 </script>
@@ -1096,12 +1150,17 @@ document.addEventListener("DOMContentLoaded", function () {
 <style>
   #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
   #authGate.show{display:flex}
-  #authGate .card{width:min(92vw,340px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
+  #authGate .card{width:min(92vw,360px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
   #authGate h2{margin:0 0 4px;font-size:16px}
-  #authGate p{margin:0;font-size:12px;color:#8b93a7}
+  #authGate p{margin:0;font-size:12px;color:#8b93a7;line-height:1.5}
+  #authGate .hint-row{font-size:14px}
+  #authGate .hint-row b{color:#ffd479;font-size:16px}
   #authGate input{background:#0f1116;border:1px solid #232a37;color:inherit;padding:10px 12px;border-radius:10px;font:inherit;outline:none;width:100%;box-sizing:border-box}
   #authGate input:focus{border-color:#3d6ea8}
-  #authGate button{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
+  #authGate .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  #authGate .word-btn{flex:1 1 30%;background:#0f1116;color:#e6e8ee;border:1px solid #2b3444;border-radius:10px;padding:9px 4px;font:inherit;cursor:pointer}
+  #authGate .word-btn.sel{border-color:#2f6fd0;background:#1b2a44;color:#fff}
+  #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
 </head>
@@ -1426,50 +1485,72 @@ document.addEventListener("DOMContentLoaded", function () {
     </script>
 
 <div id="authGate">
-  <form class="card" id="authForm" autocomplete="off">
-    <h2 id="authTitle">记录台 · 登录</h2>
-    <p>使用本项目账户登录；从 App Hub 面板进入时自动免登。</p>
-    <input id="authUser" placeholder="账户名" maxlength="128">
-    <input id="authPass" type="password" placeholder="密码" maxlength="256">
+  <div class="card">
+    <h2>记录台 · 验证</h2>
+    <p>弱服务独立验证：看提示词，想起同一行的三个词，输入中间的词，再点中最后一个词。有控制台会话时刷新即可直接进入，不必过这一关。</p>
+    <div class="hint-row">提示：<b id="chHint">…</b></div>
+    <input id="chInput" placeholder="输入中间的词" maxlength="64" autocomplete="off">
+    <div class="btn-row" id="chButtons"></div>
     <div class="err" id="authErr"></div>
-    <button type="submit" id="authBtn">登录</button>
-  </form>
+    <button id="chGo" type="button">进入</button>
+  </div>
 </div>
 <script>
-window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");
-document.addEventListener("DOMContentLoaded", function () {
-  document.querySelectorAll('a[href^="/api"], a[href^="/api2"], a[href^="/tracker"], a[href^="/audiom"]').forEach(function (a) {
-    a.setAttribute("href", window.API_BASE + a.getAttribute("href"));
-  });
-});
 (function(){
   "use strict";
-  var BASE = window.API_BASE;
-  function showGate(setup){
+  var BASE = window.API_BASE || location.pathname.replace(/\/[^/]*$/, "");
+  var cid = null, selToken = null;
+  function loadChallenge(){
+    document.getElementById("authErr").textContent = "";
+    document.getElementById("chInput").value = "";
+    selToken = null;
+    fetch(BASE + "/api/challenge", {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        cid = d.challenge_id;
+        document.getElementById("chHint").textContent = d.hint;
+        var box = document.getElementById("chButtons");
+        box.innerHTML = "";
+        (d.buttons || []).forEach(function(b){
+          var btn = document.createElement("button");
+          btn.type = "button"; btn.className = "word-btn"; btn.textContent = b.label;
+          btn.addEventListener("click", function(){
+            selToken = b.token;
+            Array.prototype.forEach.call(box.children, function(c){ c.classList.remove("sel"); });
+            btn.classList.add("sel");
+          });
+          box.appendChild(btn);
+        });
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "挑战加载失败，请刷新重试"; });
+  }
+  function showGate(){
     document.getElementById("authGate").classList.add("show");
-    document.getElementById("authTitle").textContent = setup ? "记录台 · 首次设置" : "记录台 · 登录";
-    document.getElementById("authBtn").textContent = setup ? "创建账户并进入" : "登录";
-    document.getElementById("authForm").dataset.mode = setup ? "setup" : "login";
+    loadChallenge();
   }
   fetch(BASE + "/api/session", {cache:"no-store"})
-    .then(function(r){return r.json();})
-    .then(function(s){ if(!s.authenticated) showGate(!!s.setup_required); })
-    .catch(function(){ showGate(false); });
-  document.getElementById("authForm").addEventListener("submit", function(e){
-    e.preventDefault();
-    var mode = e.target.dataset.mode || "login";
-    fetch(BASE + "/api/" + mode, {
+    .then(function(r){ return r.json(); })
+    .then(function(s){ if(!s.authenticated) showGate(); })
+    .catch(function(){ showGate(); });
+  document.getElementById("chGo").addEventListener("click", function(){
+    if(!cid){ return; }
+    if(!selToken){ document.getElementById("authErr").textContent = "请先点中正确的词按钮"; return; }
+    fetch(BASE + "/api/challenge", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        username: document.getElementById("authUser").value.trim(),
-        password: document.getElementById("authPass").value
-      })
+      body: JSON.stringify({challenge_id: cid, token: selToken,
+                            input: document.getElementById("chInput").value})
     }).then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
       .then(function(res){
         if(res.ok){ location.reload(); }
-        else{ document.getElementById("authErr").textContent = (res.d && res.d.message) || "登录失败，请重试"; }
+        else{
+          document.getElementById("authErr").textContent = (res.d && res.d.message) || "验证失败，请重试";
+          loadChallenge();
+        }
       })
       .catch(function(){ document.getElementById("authErr").textContent = "网络错误，请重试"; });
+  });
+  document.getElementById("chInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); document.getElementById("chGo").click(); }
   });
 })();
 </script>
@@ -1530,12 +1611,17 @@ document.addEventListener("DOMContentLoaded", function () {
 <style>
   #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
   #authGate.show{display:flex}
-  #authGate .card{width:min(92vw,340px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
+  #authGate .card{width:min(92vw,360px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
   #authGate h2{margin:0 0 4px;font-size:16px}
-  #authGate p{margin:0;font-size:12px;color:#8b93a7}
+  #authGate p{margin:0;font-size:12px;color:#8b93a7;line-height:1.5}
+  #authGate .hint-row{font-size:14px}
+  #authGate .hint-row b{color:#ffd479;font-size:16px}
   #authGate input{background:#0f1116;border:1px solid #232a37;color:inherit;padding:10px 12px;border-radius:10px;font:inherit;outline:none;width:100%;box-sizing:border-box}
   #authGate input:focus{border-color:#3d6ea8}
-  #authGate button{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
+  #authGate .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  #authGate .word-btn{flex:1 1 30%;background:#0f1116;color:#e6e8ee;border:1px solid #2b3444;border-radius:10px;padding:9px 4px;font:inherit;cursor:pointer}
+  #authGate .word-btn.sel{border-color:#2f6fd0;background:#1b2a44;color:#fff}
+  #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
 </head>
@@ -2163,50 +2249,72 @@ loadData();
 </script>
 
 <div id="authGate">
-  <form class="card" id="authForm" autocomplete="off">
-    <h2 id="authTitle">记录台 · 登录</h2>
-    <p>使用本项目账户登录；从 App Hub 面板进入时自动免登。</p>
-    <input id="authUser" placeholder="账户名" maxlength="128">
-    <input id="authPass" type="password" placeholder="密码" maxlength="256">
+  <div class="card">
+    <h2>记录台 · 验证</h2>
+    <p>弱服务独立验证：看提示词，想起同一行的三个词，输入中间的词，再点中最后一个词。有控制台会话时刷新即可直接进入，不必过这一关。</p>
+    <div class="hint-row">提示：<b id="chHint">…</b></div>
+    <input id="chInput" placeholder="输入中间的词" maxlength="64" autocomplete="off">
+    <div class="btn-row" id="chButtons"></div>
     <div class="err" id="authErr"></div>
-    <button type="submit" id="authBtn">登录</button>
-  </form>
+    <button id="chGo" type="button">进入</button>
+  </div>
 </div>
 <script>
-window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");
-document.addEventListener("DOMContentLoaded", function () {
-  document.querySelectorAll('a[href^="/api"], a[href^="/api2"], a[href^="/tracker"], a[href^="/audiom"]').forEach(function (a) {
-    a.setAttribute("href", window.API_BASE + a.getAttribute("href"));
-  });
-});
 (function(){
   "use strict";
-  var BASE = window.API_BASE;
-  function showGate(setup){
+  var BASE = window.API_BASE || location.pathname.replace(/\/[^/]*$/, "");
+  var cid = null, selToken = null;
+  function loadChallenge(){
+    document.getElementById("authErr").textContent = "";
+    document.getElementById("chInput").value = "";
+    selToken = null;
+    fetch(BASE + "/api/challenge", {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        cid = d.challenge_id;
+        document.getElementById("chHint").textContent = d.hint;
+        var box = document.getElementById("chButtons");
+        box.innerHTML = "";
+        (d.buttons || []).forEach(function(b){
+          var btn = document.createElement("button");
+          btn.type = "button"; btn.className = "word-btn"; btn.textContent = b.label;
+          btn.addEventListener("click", function(){
+            selToken = b.token;
+            Array.prototype.forEach.call(box.children, function(c){ c.classList.remove("sel"); });
+            btn.classList.add("sel");
+          });
+          box.appendChild(btn);
+        });
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "挑战加载失败，请刷新重试"; });
+  }
+  function showGate(){
     document.getElementById("authGate").classList.add("show");
-    document.getElementById("authTitle").textContent = setup ? "记录台 · 首次设置" : "记录台 · 登录";
-    document.getElementById("authBtn").textContent = setup ? "创建账户并进入" : "登录";
-    document.getElementById("authForm").dataset.mode = setup ? "setup" : "login";
+    loadChallenge();
   }
   fetch(BASE + "/api/session", {cache:"no-store"})
-    .then(function(r){return r.json();})
-    .then(function(s){ if(!s.authenticated) showGate(!!s.setup_required); })
-    .catch(function(){ showGate(false); });
-  document.getElementById("authForm").addEventListener("submit", function(e){
-    e.preventDefault();
-    var mode = e.target.dataset.mode || "login";
-    fetch(BASE + "/api/" + mode, {
+    .then(function(r){ return r.json(); })
+    .then(function(s){ if(!s.authenticated) showGate(); })
+    .catch(function(){ showGate(); });
+  document.getElementById("chGo").addEventListener("click", function(){
+    if(!cid){ return; }
+    if(!selToken){ document.getElementById("authErr").textContent = "请先点中正确的词按钮"; return; }
+    fetch(BASE + "/api/challenge", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        username: document.getElementById("authUser").value.trim(),
-        password: document.getElementById("authPass").value
-      })
+      body: JSON.stringify({challenge_id: cid, token: selToken,
+                            input: document.getElementById("chInput").value})
     }).then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
       .then(function(res){
         if(res.ok){ location.reload(); }
-        else{ document.getElementById("authErr").textContent = (res.d && res.d.message) || "登录失败，请重试"; }
+        else{
+          document.getElementById("authErr").textContent = (res.d && res.d.message) || "验证失败，请重试";
+          loadChallenge();
+        }
       })
       .catch(function(){ document.getElementById("authErr").textContent = "网络错误，请重试"; });
+  });
+  document.getElementById("chInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); document.getElementById("chGo").click(); }
   });
 })();
 </script>
@@ -2266,12 +2374,17 @@ document.addEventListener("DOMContentLoaded", function () {
 <style>
   #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
   #authGate.show{display:flex}
-  #authGate .card{width:min(92vw,340px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
+  #authGate .card{width:min(92vw,360px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
   #authGate h2{margin:0 0 4px;font-size:16px}
-  #authGate p{margin:0;font-size:12px;color:#8b93a7}
+  #authGate p{margin:0;font-size:12px;color:#8b93a7;line-height:1.5}
+  #authGate .hint-row{font-size:14px}
+  #authGate .hint-row b{color:#ffd479;font-size:16px}
   #authGate input{background:#0f1116;border:1px solid #232a37;color:inherit;padding:10px 12px;border-radius:10px;font:inherit;outline:none;width:100%;box-sizing:border-box}
   #authGate input:focus{border-color:#3d6ea8}
-  #authGate button{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
+  #authGate .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  #authGate .word-btn{flex:1 1 30%;background:#0f1116;color:#e6e8ee;border:1px solid #2b3444;border-radius:10px;padding:9px 4px;font:inherit;cursor:pointer}
+  #authGate .word-btn.sel{border-color:#2f6fd0;background:#1b2a44;color:#fff}
+  #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
 </head>
@@ -2525,50 +2638,72 @@ document.addEventListener("DOMContentLoaded", function () {
     </script>
 
 <div id="authGate">
-  <form class="card" id="authForm" autocomplete="off">
-    <h2 id="authTitle">记录台 · 登录</h2>
-    <p>使用本项目账户登录；从 App Hub 面板进入时自动免登。</p>
-    <input id="authUser" placeholder="账户名" maxlength="128">
-    <input id="authPass" type="password" placeholder="密码" maxlength="256">
+  <div class="card">
+    <h2>记录台 · 验证</h2>
+    <p>弱服务独立验证：看提示词，想起同一行的三个词，输入中间的词，再点中最后一个词。有控制台会话时刷新即可直接进入，不必过这一关。</p>
+    <div class="hint-row">提示：<b id="chHint">…</b></div>
+    <input id="chInput" placeholder="输入中间的词" maxlength="64" autocomplete="off">
+    <div class="btn-row" id="chButtons"></div>
     <div class="err" id="authErr"></div>
-    <button type="submit" id="authBtn">登录</button>
-  </form>
+    <button id="chGo" type="button">进入</button>
+  </div>
 </div>
 <script>
-window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");
-document.addEventListener("DOMContentLoaded", function () {
-  document.querySelectorAll('a[href^="/api"], a[href^="/api2"], a[href^="/tracker"], a[href^="/audiom"]').forEach(function (a) {
-    a.setAttribute("href", window.API_BASE + a.getAttribute("href"));
-  });
-});
 (function(){
   "use strict";
-  var BASE = window.API_BASE;
-  function showGate(setup){
+  var BASE = window.API_BASE || location.pathname.replace(/\/[^/]*$/, "");
+  var cid = null, selToken = null;
+  function loadChallenge(){
+    document.getElementById("authErr").textContent = "";
+    document.getElementById("chInput").value = "";
+    selToken = null;
+    fetch(BASE + "/api/challenge", {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        cid = d.challenge_id;
+        document.getElementById("chHint").textContent = d.hint;
+        var box = document.getElementById("chButtons");
+        box.innerHTML = "";
+        (d.buttons || []).forEach(function(b){
+          var btn = document.createElement("button");
+          btn.type = "button"; btn.className = "word-btn"; btn.textContent = b.label;
+          btn.addEventListener("click", function(){
+            selToken = b.token;
+            Array.prototype.forEach.call(box.children, function(c){ c.classList.remove("sel"); });
+            btn.classList.add("sel");
+          });
+          box.appendChild(btn);
+        });
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "挑战加载失败，请刷新重试"; });
+  }
+  function showGate(){
     document.getElementById("authGate").classList.add("show");
-    document.getElementById("authTitle").textContent = setup ? "记录台 · 首次设置" : "记录台 · 登录";
-    document.getElementById("authBtn").textContent = setup ? "创建账户并进入" : "登录";
-    document.getElementById("authForm").dataset.mode = setup ? "setup" : "login";
+    loadChallenge();
   }
   fetch(BASE + "/api/session", {cache:"no-store"})
-    .then(function(r){return r.json();})
-    .then(function(s){ if(!s.authenticated) showGate(!!s.setup_required); })
-    .catch(function(){ showGate(false); });
-  document.getElementById("authForm").addEventListener("submit", function(e){
-    e.preventDefault();
-    var mode = e.target.dataset.mode || "login";
-    fetch(BASE + "/api/" + mode, {
+    .then(function(r){ return r.json(); })
+    .then(function(s){ if(!s.authenticated) showGate(); })
+    .catch(function(){ showGate(); });
+  document.getElementById("chGo").addEventListener("click", function(){
+    if(!cid){ return; }
+    if(!selToken){ document.getElementById("authErr").textContent = "请先点中正确的词按钮"; return; }
+    fetch(BASE + "/api/challenge", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        username: document.getElementById("authUser").value.trim(),
-        password: document.getElementById("authPass").value
-      })
+      body: JSON.stringify({challenge_id: cid, token: selToken,
+                            input: document.getElementById("chInput").value})
     }).then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
       .then(function(res){
         if(res.ok){ location.reload(); }
-        else{ document.getElementById("authErr").textContent = (res.d && res.d.message) || "登录失败，请重试"; }
+        else{
+          document.getElementById("authErr").textContent = (res.d && res.d.message) || "验证失败，请重试";
+          loadChallenge();
+        }
       })
       .catch(function(){ document.getElementById("authErr").textContent = "网络错误，请重试"; });
+  });
+  document.getElementById("chInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); document.getElementById("chGo").click(); }
   });
 })();
 </script>
@@ -2588,12 +2723,17 @@ document.addEventListener("DOMContentLoaded", function () {
 <style>
   #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
   #authGate.show{display:flex}
-  #authGate .card{width:min(92vw,340px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
+  #authGate .card{width:min(92vw,360px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
   #authGate h2{margin:0 0 4px;font-size:16px}
-  #authGate p{margin:0;font-size:12px;color:#8b93a7}
+  #authGate p{margin:0;font-size:12px;color:#8b93a7;line-height:1.5}
+  #authGate .hint-row{font-size:14px}
+  #authGate .hint-row b{color:#ffd479;font-size:16px}
   #authGate input{background:#0f1116;border:1px solid #232a37;color:inherit;padding:10px 12px;border-radius:10px;font:inherit;outline:none;width:100%;box-sizing:border-box}
   #authGate input:focus{border-color:#3d6ea8}
-  #authGate button{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
+  #authGate .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  #authGate .word-btn{flex:1 1 30%;background:#0f1116;color:#e6e8ee;border:1px solid #2b3444;border-radius:10px;padding:9px 4px;font:inherit;cursor:pointer}
+  #authGate .word-btn.sel{border-color:#2f6fd0;background:#1b2a44;color:#fff}
+  #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
 </head>
@@ -3076,50 +3216,72 @@ document.addEventListener("DOMContentLoaded", function () {
     <style> [v-cloak] { display: none; } </style>
 
 <div id="authGate">
-  <form class="card" id="authForm" autocomplete="off">
-    <h2 id="authTitle">记录台 · 登录</h2>
-    <p>使用本项目账户登录；从 App Hub 面板进入时自动免登。</p>
-    <input id="authUser" placeholder="账户名" maxlength="128">
-    <input id="authPass" type="password" placeholder="密码" maxlength="256">
+  <div class="card">
+    <h2>记录台 · 验证</h2>
+    <p>弱服务独立验证：看提示词，想起同一行的三个词，输入中间的词，再点中最后一个词。有控制台会话时刷新即可直接进入，不必过这一关。</p>
+    <div class="hint-row">提示：<b id="chHint">…</b></div>
+    <input id="chInput" placeholder="输入中间的词" maxlength="64" autocomplete="off">
+    <div class="btn-row" id="chButtons"></div>
     <div class="err" id="authErr"></div>
-    <button type="submit" id="authBtn">登录</button>
-  </form>
+    <button id="chGo" type="button">进入</button>
+  </div>
 </div>
 <script>
-window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");
-document.addEventListener("DOMContentLoaded", function () {
-  document.querySelectorAll('a[href^="/api"], a[href^="/api2"], a[href^="/tracker"], a[href^="/audiom"]').forEach(function (a) {
-    a.setAttribute("href", window.API_BASE + a.getAttribute("href"));
-  });
-});
 (function(){
   "use strict";
-  var BASE = window.API_BASE;
-  function showGate(setup){
+  var BASE = window.API_BASE || location.pathname.replace(/\/[^/]*$/, "");
+  var cid = null, selToken = null;
+  function loadChallenge(){
+    document.getElementById("authErr").textContent = "";
+    document.getElementById("chInput").value = "";
+    selToken = null;
+    fetch(BASE + "/api/challenge", {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        cid = d.challenge_id;
+        document.getElementById("chHint").textContent = d.hint;
+        var box = document.getElementById("chButtons");
+        box.innerHTML = "";
+        (d.buttons || []).forEach(function(b){
+          var btn = document.createElement("button");
+          btn.type = "button"; btn.className = "word-btn"; btn.textContent = b.label;
+          btn.addEventListener("click", function(){
+            selToken = b.token;
+            Array.prototype.forEach.call(box.children, function(c){ c.classList.remove("sel"); });
+            btn.classList.add("sel");
+          });
+          box.appendChild(btn);
+        });
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "挑战加载失败，请刷新重试"; });
+  }
+  function showGate(){
     document.getElementById("authGate").classList.add("show");
-    document.getElementById("authTitle").textContent = setup ? "记录台 · 首次设置" : "记录台 · 登录";
-    document.getElementById("authBtn").textContent = setup ? "创建账户并进入" : "登录";
-    document.getElementById("authForm").dataset.mode = setup ? "setup" : "login";
+    loadChallenge();
   }
   fetch(BASE + "/api/session", {cache:"no-store"})
-    .then(function(r){return r.json();})
-    .then(function(s){ if(!s.authenticated) showGate(!!s.setup_required); })
-    .catch(function(){ showGate(false); });
-  document.getElementById("authForm").addEventListener("submit", function(e){
-    e.preventDefault();
-    var mode = e.target.dataset.mode || "login";
-    fetch(BASE + "/api/" + mode, {
+    .then(function(r){ return r.json(); })
+    .then(function(s){ if(!s.authenticated) showGate(); })
+    .catch(function(){ showGate(); });
+  document.getElementById("chGo").addEventListener("click", function(){
+    if(!cid){ return; }
+    if(!selToken){ document.getElementById("authErr").textContent = "请先点中正确的词按钮"; return; }
+    fetch(BASE + "/api/challenge", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        username: document.getElementById("authUser").value.trim(),
-        password: document.getElementById("authPass").value
-      })
+      body: JSON.stringify({challenge_id: cid, token: selToken,
+                            input: document.getElementById("chInput").value})
     }).then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
       .then(function(res){
         if(res.ok){ location.reload(); }
-        else{ document.getElementById("authErr").textContent = (res.d && res.d.message) || "登录失败，请重试"; }
+        else{
+          document.getElementById("authErr").textContent = (res.d && res.d.message) || "验证失败，请重试";
+          loadChallenge();
+        }
       })
       .catch(function(){ document.getElementById("authErr").textContent = "网络错误，请重试"; });
+  });
+  document.getElementById("chInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); document.getElementById("chGo").click(); }
   });
 })();
 </script>
@@ -3181,12 +3343,17 @@ document.addEventListener("DOMContentLoaded", function () {
 <style>
   #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
   #authGate.show{display:flex}
-  #authGate .card{width:min(92vw,340px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
+  #authGate .card{width:min(92vw,360px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
   #authGate h2{margin:0 0 4px;font-size:16px}
-  #authGate p{margin:0;font-size:12px;color:#8b93a7}
+  #authGate p{margin:0;font-size:12px;color:#8b93a7;line-height:1.5}
+  #authGate .hint-row{font-size:14px}
+  #authGate .hint-row b{color:#ffd479;font-size:16px}
   #authGate input{background:#0f1116;border:1px solid #232a37;color:inherit;padding:10px 12px;border-radius:10px;font:inherit;outline:none;width:100%;box-sizing:border-box}
   #authGate input:focus{border-color:#3d6ea8}
-  #authGate button{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
+  #authGate .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  #authGate .word-btn{flex:1 1 30%;background:#0f1116;color:#e6e8ee;border:1px solid #2b3444;border-radius:10px;padding:9px 4px;font:inherit;cursor:pointer}
+  #authGate .word-btn.sel{border-color:#2f6fd0;background:#1b2a44;color:#fff}
+  #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
 </head>
@@ -3533,50 +3700,72 @@ document.addEventListener("DOMContentLoaded", function () {
     </script>
 
 <div id="authGate">
-  <form class="card" id="authForm" autocomplete="off">
-    <h2 id="authTitle">记录台 · 登录</h2>
-    <p>使用本项目账户登录；从 App Hub 面板进入时自动免登。</p>
-    <input id="authUser" placeholder="账户名" maxlength="128">
-    <input id="authPass" type="password" placeholder="密码" maxlength="256">
+  <div class="card">
+    <h2>记录台 · 验证</h2>
+    <p>弱服务独立验证：看提示词，想起同一行的三个词，输入中间的词，再点中最后一个词。有控制台会话时刷新即可直接进入，不必过这一关。</p>
+    <div class="hint-row">提示：<b id="chHint">…</b></div>
+    <input id="chInput" placeholder="输入中间的词" maxlength="64" autocomplete="off">
+    <div class="btn-row" id="chButtons"></div>
     <div class="err" id="authErr"></div>
-    <button type="submit" id="authBtn">登录</button>
-  </form>
+    <button id="chGo" type="button">进入</button>
+  </div>
 </div>
 <script>
-window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");
-document.addEventListener("DOMContentLoaded", function () {
-  document.querySelectorAll('a[href^="/api"], a[href^="/api2"], a[href^="/tracker"], a[href^="/audiom"]').forEach(function (a) {
-    a.setAttribute("href", window.API_BASE + a.getAttribute("href"));
-  });
-});
 (function(){
   "use strict";
-  var BASE = window.API_BASE;
-  function showGate(setup){
+  var BASE = window.API_BASE || location.pathname.replace(/\/[^/]*$/, "");
+  var cid = null, selToken = null;
+  function loadChallenge(){
+    document.getElementById("authErr").textContent = "";
+    document.getElementById("chInput").value = "";
+    selToken = null;
+    fetch(BASE + "/api/challenge", {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        cid = d.challenge_id;
+        document.getElementById("chHint").textContent = d.hint;
+        var box = document.getElementById("chButtons");
+        box.innerHTML = "";
+        (d.buttons || []).forEach(function(b){
+          var btn = document.createElement("button");
+          btn.type = "button"; btn.className = "word-btn"; btn.textContent = b.label;
+          btn.addEventListener("click", function(){
+            selToken = b.token;
+            Array.prototype.forEach.call(box.children, function(c){ c.classList.remove("sel"); });
+            btn.classList.add("sel");
+          });
+          box.appendChild(btn);
+        });
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "挑战加载失败，请刷新重试"; });
+  }
+  function showGate(){
     document.getElementById("authGate").classList.add("show");
-    document.getElementById("authTitle").textContent = setup ? "记录台 · 首次设置" : "记录台 · 登录";
-    document.getElementById("authBtn").textContent = setup ? "创建账户并进入" : "登录";
-    document.getElementById("authForm").dataset.mode = setup ? "setup" : "login";
+    loadChallenge();
   }
   fetch(BASE + "/api/session", {cache:"no-store"})
-    .then(function(r){return r.json();})
-    .then(function(s){ if(!s.authenticated) showGate(!!s.setup_required); })
-    .catch(function(){ showGate(false); });
-  document.getElementById("authForm").addEventListener("submit", function(e){
-    e.preventDefault();
-    var mode = e.target.dataset.mode || "login";
-    fetch(BASE + "/api/" + mode, {
+    .then(function(r){ return r.json(); })
+    .then(function(s){ if(!s.authenticated) showGate(); })
+    .catch(function(){ showGate(); });
+  document.getElementById("chGo").addEventListener("click", function(){
+    if(!cid){ return; }
+    if(!selToken){ document.getElementById("authErr").textContent = "请先点中正确的词按钮"; return; }
+    fetch(BASE + "/api/challenge", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        username: document.getElementById("authUser").value.trim(),
-        password: document.getElementById("authPass").value
-      })
+      body: JSON.stringify({challenge_id: cid, token: selToken,
+                            input: document.getElementById("chInput").value})
     }).then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
       .then(function(res){
         if(res.ok){ location.reload(); }
-        else{ document.getElementById("authErr").textContent = (res.d && res.d.message) || "登录失败，请重试"; }
+        else{
+          document.getElementById("authErr").textContent = (res.d && res.d.message) || "验证失败，请重试";
+          loadChallenge();
+        }
       })
       .catch(function(){ document.getElementById("authErr").textContent = "网络错误，请重试"; });
+  });
+  document.getElementById("chInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); document.getElementById("chGo").click(); }
   });
 })();
 </script>
@@ -3613,12 +3802,17 @@ document.addEventListener("DOMContentLoaded", function () {
 <style>
   #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
   #authGate.show{display:flex}
-  #authGate .card{width:min(92vw,340px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
+  #authGate .card{width:min(92vw,360px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
   #authGate h2{margin:0 0 4px;font-size:16px}
-  #authGate p{margin:0;font-size:12px;color:#8b93a7}
+  #authGate p{margin:0;font-size:12px;color:#8b93a7;line-height:1.5}
+  #authGate .hint-row{font-size:14px}
+  #authGate .hint-row b{color:#ffd479;font-size:16px}
   #authGate input{background:#0f1116;border:1px solid #232a37;color:inherit;padding:10px 12px;border-radius:10px;font:inherit;outline:none;width:100%;box-sizing:border-box}
   #authGate input:focus{border-color:#3d6ea8}
-  #authGate button{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
+  #authGate .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  #authGate .word-btn{flex:1 1 30%;background:#0f1116;color:#e6e8ee;border:1px solid #2b3444;border-radius:10px;padding:9px 4px;font:inherit;cursor:pointer}
+  #authGate .word-btn.sel{border-color:#2f6fd0;background:#1b2a44;color:#fff}
+  #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
 </head>
@@ -4643,50 +4837,72 @@ document.addEventListener("DOMContentLoaded", function () {
     </script>
 
 <div id="authGate">
-  <form class="card" id="authForm" autocomplete="off">
-    <h2 id="authTitle">记录台 · 登录</h2>
-    <p>使用本项目账户登录；从 App Hub 面板进入时自动免登。</p>
-    <input id="authUser" placeholder="账户名" maxlength="128">
-    <input id="authPass" type="password" placeholder="密码" maxlength="256">
+  <div class="card">
+    <h2>记录台 · 验证</h2>
+    <p>弱服务独立验证：看提示词，想起同一行的三个词，输入中间的词，再点中最后一个词。有控制台会话时刷新即可直接进入，不必过这一关。</p>
+    <div class="hint-row">提示：<b id="chHint">…</b></div>
+    <input id="chInput" placeholder="输入中间的词" maxlength="64" autocomplete="off">
+    <div class="btn-row" id="chButtons"></div>
     <div class="err" id="authErr"></div>
-    <button type="submit" id="authBtn">登录</button>
-  </form>
+    <button id="chGo" type="button">进入</button>
+  </div>
 </div>
 <script>
-window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");
-document.addEventListener("DOMContentLoaded", function () {
-  document.querySelectorAll('a[href^="/api"], a[href^="/api2"], a[href^="/tracker"], a[href^="/audiom"]').forEach(function (a) {
-    a.setAttribute("href", window.API_BASE + a.getAttribute("href"));
-  });
-});
 (function(){
   "use strict";
-  var BASE = window.API_BASE;
-  function showGate(setup){
+  var BASE = window.API_BASE || location.pathname.replace(/\/[^/]*$/, "");
+  var cid = null, selToken = null;
+  function loadChallenge(){
+    document.getElementById("authErr").textContent = "";
+    document.getElementById("chInput").value = "";
+    selToken = null;
+    fetch(BASE + "/api/challenge", {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        cid = d.challenge_id;
+        document.getElementById("chHint").textContent = d.hint;
+        var box = document.getElementById("chButtons");
+        box.innerHTML = "";
+        (d.buttons || []).forEach(function(b){
+          var btn = document.createElement("button");
+          btn.type = "button"; btn.className = "word-btn"; btn.textContent = b.label;
+          btn.addEventListener("click", function(){
+            selToken = b.token;
+            Array.prototype.forEach.call(box.children, function(c){ c.classList.remove("sel"); });
+            btn.classList.add("sel");
+          });
+          box.appendChild(btn);
+        });
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "挑战加载失败，请刷新重试"; });
+  }
+  function showGate(){
     document.getElementById("authGate").classList.add("show");
-    document.getElementById("authTitle").textContent = setup ? "记录台 · 首次设置" : "记录台 · 登录";
-    document.getElementById("authBtn").textContent = setup ? "创建账户并进入" : "登录";
-    document.getElementById("authForm").dataset.mode = setup ? "setup" : "login";
+    loadChallenge();
   }
   fetch(BASE + "/api/session", {cache:"no-store"})
-    .then(function(r){return r.json();})
-    .then(function(s){ if(!s.authenticated) showGate(!!s.setup_required); })
-    .catch(function(){ showGate(false); });
-  document.getElementById("authForm").addEventListener("submit", function(e){
-    e.preventDefault();
-    var mode = e.target.dataset.mode || "login";
-    fetch(BASE + "/api/" + mode, {
+    .then(function(r){ return r.json(); })
+    .then(function(s){ if(!s.authenticated) showGate(); })
+    .catch(function(){ showGate(); });
+  document.getElementById("chGo").addEventListener("click", function(){
+    if(!cid){ return; }
+    if(!selToken){ document.getElementById("authErr").textContent = "请先点中正确的词按钮"; return; }
+    fetch(BASE + "/api/challenge", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        username: document.getElementById("authUser").value.trim(),
-        password: document.getElementById("authPass").value
-      })
+      body: JSON.stringify({challenge_id: cid, token: selToken,
+                            input: document.getElementById("chInput").value})
     }).then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
       .then(function(res){
         if(res.ok){ location.reload(); }
-        else{ document.getElementById("authErr").textContent = (res.d && res.d.message) || "登录失败，请重试"; }
+        else{
+          document.getElementById("authErr").textContent = (res.d && res.d.message) || "验证失败，请重试";
+          loadChallenge();
+        }
       })
       .catch(function(){ document.getElementById("authErr").textContent = "网络错误，请重试"; });
+  });
+  document.getElementById("chInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); document.getElementById("chGo").click(); }
   });
 })();
 </script>
@@ -4711,12 +4927,17 @@ document.addEventListener("DOMContentLoaded", function () {
 <style>
   #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
   #authGate.show{display:flex}
-  #authGate .card{width:min(92vw,340px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
+  #authGate .card{width:min(92vw,360px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
   #authGate h2{margin:0 0 4px;font-size:16px}
-  #authGate p{margin:0;font-size:12px;color:#8b93a7}
+  #authGate p{margin:0;font-size:12px;color:#8b93a7;line-height:1.5}
+  #authGate .hint-row{font-size:14px}
+  #authGate .hint-row b{color:#ffd479;font-size:16px}
   #authGate input{background:#0f1116;border:1px solid #232a37;color:inherit;padding:10px 12px;border-radius:10px;font:inherit;outline:none;width:100%;box-sizing:border-box}
   #authGate input:focus{border-color:#3d6ea8}
-  #authGate button{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
+  #authGate .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  #authGate .word-btn{flex:1 1 30%;background:#0f1116;color:#e6e8ee;border:1px solid #2b3444;border-radius:10px;padding:9px 4px;font:inherit;cursor:pointer}
+  #authGate .word-btn.sel{border-color:#2f6fd0;background:#1b2a44;color:#fff}
+  #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
 </head>
@@ -5249,50 +5470,72 @@ document.addEventListener("DOMContentLoaded", function () {
     </script>
 
 <div id="authGate">
-  <form class="card" id="authForm" autocomplete="off">
-    <h2 id="authTitle">记录台 · 登录</h2>
-    <p>使用本项目账户登录；从 App Hub 面板进入时自动免登。</p>
-    <input id="authUser" placeholder="账户名" maxlength="128">
-    <input id="authPass" type="password" placeholder="密码" maxlength="256">
+  <div class="card">
+    <h2>记录台 · 验证</h2>
+    <p>弱服务独立验证：看提示词，想起同一行的三个词，输入中间的词，再点中最后一个词。有控制台会话时刷新即可直接进入，不必过这一关。</p>
+    <div class="hint-row">提示：<b id="chHint">…</b></div>
+    <input id="chInput" placeholder="输入中间的词" maxlength="64" autocomplete="off">
+    <div class="btn-row" id="chButtons"></div>
     <div class="err" id="authErr"></div>
-    <button type="submit" id="authBtn">登录</button>
-  </form>
+    <button id="chGo" type="button">进入</button>
+  </div>
 </div>
 <script>
-window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");
-document.addEventListener("DOMContentLoaded", function () {
-  document.querySelectorAll('a[href^="/api"], a[href^="/api2"], a[href^="/tracker"], a[href^="/audiom"]').forEach(function (a) {
-    a.setAttribute("href", window.API_BASE + a.getAttribute("href"));
-  });
-});
 (function(){
   "use strict";
-  var BASE = window.API_BASE;
-  function showGate(setup){
+  var BASE = window.API_BASE || location.pathname.replace(/\/[^/]*$/, "");
+  var cid = null, selToken = null;
+  function loadChallenge(){
+    document.getElementById("authErr").textContent = "";
+    document.getElementById("chInput").value = "";
+    selToken = null;
+    fetch(BASE + "/api/challenge", {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        cid = d.challenge_id;
+        document.getElementById("chHint").textContent = d.hint;
+        var box = document.getElementById("chButtons");
+        box.innerHTML = "";
+        (d.buttons || []).forEach(function(b){
+          var btn = document.createElement("button");
+          btn.type = "button"; btn.className = "word-btn"; btn.textContent = b.label;
+          btn.addEventListener("click", function(){
+            selToken = b.token;
+            Array.prototype.forEach.call(box.children, function(c){ c.classList.remove("sel"); });
+            btn.classList.add("sel");
+          });
+          box.appendChild(btn);
+        });
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "挑战加载失败，请刷新重试"; });
+  }
+  function showGate(){
     document.getElementById("authGate").classList.add("show");
-    document.getElementById("authTitle").textContent = setup ? "记录台 · 首次设置" : "记录台 · 登录";
-    document.getElementById("authBtn").textContent = setup ? "创建账户并进入" : "登录";
-    document.getElementById("authForm").dataset.mode = setup ? "setup" : "login";
+    loadChallenge();
   }
   fetch(BASE + "/api/session", {cache:"no-store"})
-    .then(function(r){return r.json();})
-    .then(function(s){ if(!s.authenticated) showGate(!!s.setup_required); })
-    .catch(function(){ showGate(false); });
-  document.getElementById("authForm").addEventListener("submit", function(e){
-    e.preventDefault();
-    var mode = e.target.dataset.mode || "login";
-    fetch(BASE + "/api/" + mode, {
+    .then(function(r){ return r.json(); })
+    .then(function(s){ if(!s.authenticated) showGate(); })
+    .catch(function(){ showGate(); });
+  document.getElementById("chGo").addEventListener("click", function(){
+    if(!cid){ return; }
+    if(!selToken){ document.getElementById("authErr").textContent = "请先点中正确的词按钮"; return; }
+    fetch(BASE + "/api/challenge", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        username: document.getElementById("authUser").value.trim(),
-        password: document.getElementById("authPass").value
-      })
+      body: JSON.stringify({challenge_id: cid, token: selToken,
+                            input: document.getElementById("chInput").value})
     }).then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
       .then(function(res){
         if(res.ok){ location.reload(); }
-        else{ document.getElementById("authErr").textContent = (res.d && res.d.message) || "登录失败，请重试"; }
+        else{
+          document.getElementById("authErr").textContent = (res.d && res.d.message) || "验证失败，请重试";
+          loadChallenge();
+        }
       })
       .catch(function(){ document.getElementById("authErr").textContent = "网络错误，请重试"; });
+  });
+  document.getElementById("chInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); document.getElementById("chGo").click(); }
   });
 })();
 </script>
@@ -5594,12 +5837,17 @@ document.addEventListener("DOMContentLoaded", function () {
 <style>
   #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
   #authGate.show{display:flex}
-  #authGate .card{width:min(92vw,340px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
+  #authGate .card{width:min(92vw,360px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
   #authGate h2{margin:0 0 4px;font-size:16px}
-  #authGate p{margin:0;font-size:12px;color:#8b93a7}
+  #authGate p{margin:0;font-size:12px;color:#8b93a7;line-height:1.5}
+  #authGate .hint-row{font-size:14px}
+  #authGate .hint-row b{color:#ffd479;font-size:16px}
   #authGate input{background:#0f1116;border:1px solid #232a37;color:inherit;padding:10px 12px;border-radius:10px;font:inherit;outline:none;width:100%;box-sizing:border-box}
   #authGate input:focus{border-color:#3d6ea8}
-  #authGate button{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
+  #authGate .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  #authGate .word-btn{flex:1 1 30%;background:#0f1116;color:#e6e8ee;border:1px solid #2b3444;border-radius:10px;padding:9px 4px;font:inherit;cursor:pointer}
+  #authGate .word-btn.sel{border-color:#2f6fd0;background:#1b2a44;color:#fff}
+  #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
 </head>
@@ -6219,50 +6467,72 @@ const PLANS = {
   </script>
 
 <div id="authGate">
-  <form class="card" id="authForm" autocomplete="off">
-    <h2 id="authTitle">记录台 · 登录</h2>
-    <p>使用本项目账户登录；从 App Hub 面板进入时自动免登。</p>
-    <input id="authUser" placeholder="账户名" maxlength="128">
-    <input id="authPass" type="password" placeholder="密码" maxlength="256">
+  <div class="card">
+    <h2>记录台 · 验证</h2>
+    <p>弱服务独立验证：看提示词，想起同一行的三个词，输入中间的词，再点中最后一个词。有控制台会话时刷新即可直接进入，不必过这一关。</p>
+    <div class="hint-row">提示：<b id="chHint">…</b></div>
+    <input id="chInput" placeholder="输入中间的词" maxlength="64" autocomplete="off">
+    <div class="btn-row" id="chButtons"></div>
     <div class="err" id="authErr"></div>
-    <button type="submit" id="authBtn">登录</button>
-  </form>
+    <button id="chGo" type="button">进入</button>
+  </div>
 </div>
 <script>
-window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");
-document.addEventListener("DOMContentLoaded", function () {
-  document.querySelectorAll('a[href^="/api"], a[href^="/api2"], a[href^="/tracker"], a[href^="/audiom"]').forEach(function (a) {
-    a.setAttribute("href", window.API_BASE + a.getAttribute("href"));
-  });
-});
 (function(){
   "use strict";
-  var BASE = window.API_BASE;
-  function showGate(setup){
+  var BASE = window.API_BASE || location.pathname.replace(/\/[^/]*$/, "");
+  var cid = null, selToken = null;
+  function loadChallenge(){
+    document.getElementById("authErr").textContent = "";
+    document.getElementById("chInput").value = "";
+    selToken = null;
+    fetch(BASE + "/api/challenge", {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        cid = d.challenge_id;
+        document.getElementById("chHint").textContent = d.hint;
+        var box = document.getElementById("chButtons");
+        box.innerHTML = "";
+        (d.buttons || []).forEach(function(b){
+          var btn = document.createElement("button");
+          btn.type = "button"; btn.className = "word-btn"; btn.textContent = b.label;
+          btn.addEventListener("click", function(){
+            selToken = b.token;
+            Array.prototype.forEach.call(box.children, function(c){ c.classList.remove("sel"); });
+            btn.classList.add("sel");
+          });
+          box.appendChild(btn);
+        });
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "挑战加载失败，请刷新重试"; });
+  }
+  function showGate(){
     document.getElementById("authGate").classList.add("show");
-    document.getElementById("authTitle").textContent = setup ? "记录台 · 首次设置" : "记录台 · 登录";
-    document.getElementById("authBtn").textContent = setup ? "创建账户并进入" : "登录";
-    document.getElementById("authForm").dataset.mode = setup ? "setup" : "login";
+    loadChallenge();
   }
   fetch(BASE + "/api/session", {cache:"no-store"})
-    .then(function(r){return r.json();})
-    .then(function(s){ if(!s.authenticated) showGate(!!s.setup_required); })
-    .catch(function(){ showGate(false); });
-  document.getElementById("authForm").addEventListener("submit", function(e){
-    e.preventDefault();
-    var mode = e.target.dataset.mode || "login";
-    fetch(BASE + "/api/" + mode, {
+    .then(function(r){ return r.json(); })
+    .then(function(s){ if(!s.authenticated) showGate(); })
+    .catch(function(){ showGate(); });
+  document.getElementById("chGo").addEventListener("click", function(){
+    if(!cid){ return; }
+    if(!selToken){ document.getElementById("authErr").textContent = "请先点中正确的词按钮"; return; }
+    fetch(BASE + "/api/challenge", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        username: document.getElementById("authUser").value.trim(),
-        password: document.getElementById("authPass").value
-      })
+      body: JSON.stringify({challenge_id: cid, token: selToken,
+                            input: document.getElementById("chInput").value})
     }).then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
       .then(function(res){
         if(res.ok){ location.reload(); }
-        else{ document.getElementById("authErr").textContent = (res.d && res.d.message) || "登录失败，请重试"; }
+        else{
+          document.getElementById("authErr").textContent = (res.d && res.d.message) || "验证失败，请重试";
+          loadChallenge();
+        }
       })
       .catch(function(){ document.getElementById("authErr").textContent = "网络错误，请重试"; });
+  });
+  document.getElementById("chInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); document.getElementById("chGo").click(); }
   });
 })();
 </script>
@@ -6500,12 +6770,17 @@ document.addEventListener("DOMContentLoaded", function () {
 <style>
   #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
   #authGate.show{display:flex}
-  #authGate .card{width:min(92vw,340px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
+  #authGate .card{width:min(92vw,360px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
   #authGate h2{margin:0 0 4px;font-size:16px}
-  #authGate p{margin:0;font-size:12px;color:#8b93a7}
+  #authGate p{margin:0;font-size:12px;color:#8b93a7;line-height:1.5}
+  #authGate .hint-row{font-size:14px}
+  #authGate .hint-row b{color:#ffd479;font-size:16px}
   #authGate input{background:#0f1116;border:1px solid #232a37;color:inherit;padding:10px 12px;border-radius:10px;font:inherit;outline:none;width:100%;box-sizing:border-box}
   #authGate input:focus{border-color:#3d6ea8}
-  #authGate button{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
+  #authGate .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  #authGate .word-btn{flex:1 1 30%;background:#0f1116;color:#e6e8ee;border:1px solid #2b3444;border-radius:10px;padding:9px 4px;font:inherit;cursor:pointer}
+  #authGate .word-btn.sel{border-color:#2f6fd0;background:#1b2a44;color:#fff}
+  #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
 </head>
@@ -6688,50 +6963,72 @@ document.addEventListener("DOMContentLoaded", function () {
   </script>
 
 <div id="authGate">
-  <form class="card" id="authForm" autocomplete="off">
-    <h2 id="authTitle">记录台 · 登录</h2>
-    <p>使用本项目账户登录；从 App Hub 面板进入时自动免登。</p>
-    <input id="authUser" placeholder="账户名" maxlength="128">
-    <input id="authPass" type="password" placeholder="密码" maxlength="256">
+  <div class="card">
+    <h2>记录台 · 验证</h2>
+    <p>弱服务独立验证：看提示词，想起同一行的三个词，输入中间的词，再点中最后一个词。有控制台会话时刷新即可直接进入，不必过这一关。</p>
+    <div class="hint-row">提示：<b id="chHint">…</b></div>
+    <input id="chInput" placeholder="输入中间的词" maxlength="64" autocomplete="off">
+    <div class="btn-row" id="chButtons"></div>
     <div class="err" id="authErr"></div>
-    <button type="submit" id="authBtn">登录</button>
-  </form>
+    <button id="chGo" type="button">进入</button>
+  </div>
 </div>
 <script>
-window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");
-document.addEventListener("DOMContentLoaded", function () {
-  document.querySelectorAll('a[href^="/api"], a[href^="/api2"], a[href^="/tracker"], a[href^="/audiom"]').forEach(function (a) {
-    a.setAttribute("href", window.API_BASE + a.getAttribute("href"));
-  });
-});
 (function(){
   "use strict";
-  var BASE = window.API_BASE;
-  function showGate(setup){
+  var BASE = window.API_BASE || location.pathname.replace(/\/[^/]*$/, "");
+  var cid = null, selToken = null;
+  function loadChallenge(){
+    document.getElementById("authErr").textContent = "";
+    document.getElementById("chInput").value = "";
+    selToken = null;
+    fetch(BASE + "/api/challenge", {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        cid = d.challenge_id;
+        document.getElementById("chHint").textContent = d.hint;
+        var box = document.getElementById("chButtons");
+        box.innerHTML = "";
+        (d.buttons || []).forEach(function(b){
+          var btn = document.createElement("button");
+          btn.type = "button"; btn.className = "word-btn"; btn.textContent = b.label;
+          btn.addEventListener("click", function(){
+            selToken = b.token;
+            Array.prototype.forEach.call(box.children, function(c){ c.classList.remove("sel"); });
+            btn.classList.add("sel");
+          });
+          box.appendChild(btn);
+        });
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "挑战加载失败，请刷新重试"; });
+  }
+  function showGate(){
     document.getElementById("authGate").classList.add("show");
-    document.getElementById("authTitle").textContent = setup ? "记录台 · 首次设置" : "记录台 · 登录";
-    document.getElementById("authBtn").textContent = setup ? "创建账户并进入" : "登录";
-    document.getElementById("authForm").dataset.mode = setup ? "setup" : "login";
+    loadChallenge();
   }
   fetch(BASE + "/api/session", {cache:"no-store"})
-    .then(function(r){return r.json();})
-    .then(function(s){ if(!s.authenticated) showGate(!!s.setup_required); })
-    .catch(function(){ showGate(false); });
-  document.getElementById("authForm").addEventListener("submit", function(e){
-    e.preventDefault();
-    var mode = e.target.dataset.mode || "login";
-    fetch(BASE + "/api/" + mode, {
+    .then(function(r){ return r.json(); })
+    .then(function(s){ if(!s.authenticated) showGate(); })
+    .catch(function(){ showGate(); });
+  document.getElementById("chGo").addEventListener("click", function(){
+    if(!cid){ return; }
+    if(!selToken){ document.getElementById("authErr").textContent = "请先点中正确的词按钮"; return; }
+    fetch(BASE + "/api/challenge", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        username: document.getElementById("authUser").value.trim(),
-        password: document.getElementById("authPass").value
-      })
+      body: JSON.stringify({challenge_id: cid, token: selToken,
+                            input: document.getElementById("chInput").value})
     }).then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
       .then(function(res){
         if(res.ok){ location.reload(); }
-        else{ document.getElementById("authErr").textContent = (res.d && res.d.message) || "登录失败，请重试"; }
+        else{
+          document.getElementById("authErr").textContent = (res.d && res.d.message) || "验证失败，请重试";
+          loadChallenge();
+        }
       })
       .catch(function(){ document.getElementById("authErr").textContent = "网络错误，请重试"; });
+  });
+  document.getElementById("chInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); document.getElementById("chGo").click(); }
   });
 })();
 </script>

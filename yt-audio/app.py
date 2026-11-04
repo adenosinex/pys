@@ -33,7 +33,6 @@ import zipfile
 from urllib.parse import parse_qs, quote, urlparse
 
 import auth
-import panel_auth
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = os.path.join(BASE, ".runtime")
@@ -567,22 +566,12 @@ def _current_account():
 
 
 def _auth_state(environ):
-    """(authenticated, via, username): the project's own account session
-    wins; a valid App Hub panel session is accepted as a fallback, so a
-    user who arrives already logged into the panel skips a second login.
-    Direct visits without either still use the project account."""
+    """Identity verification lives at the platform layer (the App Hub
+    gate in front of /web/<slug>/). This app performs no verification
+    itself: any request that reaches it has either passed the
+    platform gate or arrived on the local port, which is trusted."""
     account = _current_account()
-    cookie = environ.get("HTTP_COOKIE") or ""
-    if account:
-        for part in cookie.split(";"):
-            name, _, value = part.strip().partition("=")
-            if name == COOKIE_NAME and value and account.check_token(value):
-                return True, "account", account.username
-    panel_user = panel_auth.panel_username(cookie)
-    if panel_user:
-        return True, "panel", panel_user
-    return False, None, None
-
+    return True, "platform", (account.username if account else "local")
 
 def _authed(environ):
     return _auth_state(environ)[0]
@@ -601,49 +590,12 @@ def _external_sites():
             pass
     return DEFAULT_SITES
 
-
-def handle_setup(environ, start_response):
-    global _account
-    with _account_lock:
-        if _account is not None:
-            return _json(start_response, "409 Conflict",
-                         {"ok": False, "error": "setup_done", "message": "账户已设置，设置入口已关闭。"})
-        data = _read_json(environ)
-        username = str(data.get("username") or "").strip()
-        password = str(data.get("password") or "")
-        if not (1 <= len(username) <= 128):
-            return _json(start_response, "400 Bad Request",
-                         {"ok": False, "error": "bad_username", "message": "账户名需为 1–128 个字符。"})
-        if len(password) < 10:
-            return _json(start_response, "400 Bad Request",
-                         {"ok": False, "error": "short_password", "message": "密码至少 10 位。"})
-        _account = auth.store_account(username, password)
-        account = _account
-    return _json(start_response, "200 OK", {"ok": True, "username": account.username},
-                 [_session_cookie(environ, account.make_token(), auth.SESSION_TTL)])
-
-
-def handle_login(environ, start_response):
-    account = _current_account()
-    if account is None:
-        return _json(start_response, "503 Service Unavailable",
-                     {"ok": False, "error": "not_configured", "message": "尚未设置账户。"})
-    data = _read_json(environ)
-    username = str(data.get("username") or "").strip()
-    password = str(data.get("password") or "")
-    if username != account.username or not account.check_password(password):
-        return _json(start_response, "401 Unauthorized",
-                     {"ok": False, "error": "bad_credentials", "message": "账户名或密码不正确。"})
-    return _json(start_response, "200 OK", {"ok": True, "username": account.username},
-                 [_session_cookie(environ, account.make_token(), auth.SESSION_TTL)])
-
-
 def handle_session(environ, start_response):
     account = _current_account()
     authed, via, username = _auth_state(environ)
     return _json(start_response, "200 OK", {
         "ok": True,
-        "setup_required": account is None,
+        "setup_required": False,
         "authenticated": authed,
         "via": via,
         "username": username if authed else None,
@@ -1025,10 +977,6 @@ def application(environ, start_response):
             return [body]
         if path == "/api/session" and method == "GET":
             return handle_session(environ, start_response)
-        if path == "/api/setup" and method == "POST":
-            return handle_setup(environ, start_response)
-        if path == "/api/login" and method == "POST":
-            return handle_login(environ, start_response)
         if path == "/api/logout" and method == "POST":
             return _json(start_response, "200 OK", {"ok": True},
                          [_session_cookie(environ, "", 0)])

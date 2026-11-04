@@ -1,24 +1,20 @@
 """Small WSGI JSON API. Linux production: gunicorn -c gunicorn.conf.py app:app."""
 from http import HTTPStatus
-import hmac
 from html import escape
 import json
 import logging
 import os
 from pathlib import Path
-import secrets
 import threading
 import time
 from urllib.parse import urlsplit
 
 if __package__:
-    from .auth import AccountAuth, LoginLimited, hash_password, load_stored_account, store_account
     from .cookie_manager import CookieManager, DEFAULT_TEST_URL
     from .site_settings import SiteSettings
     from .site_router import SiteRouter
     from .extractor import ZhihuError, extract, render
 else:
-    from auth import AccountAuth, LoginLimited, hash_password, load_stored_account, store_account
     from cookie_manager import CookieManager, DEFAULT_TEST_URL
     from site_settings import SiteSettings
     from site_router import SiteRouter
@@ -27,24 +23,8 @@ else:
 MAX_REQUEST_BYTES = 16 * 1024
 
 
-def create_app(*, api_key=None, extract_fn=None, max_concurrency=None,
-               username=None, password_hash=None, session_secret=None, secure_cookie=None, cookie_manager=None,
-               site_settings=None):
-    key = os.environ.get('EXTRACTOR_API_KEY', '') if api_key is None else api_key
-    secure_flag = (os.environ.get('SESSION_COOKIE_SECURE', '1' if os.environ.get('K_SERVICE') else '0') == '1'
-                   if secure_cookie is None else secure_cookie)
-    account = AccountAuth(
-        os.environ.get('AUTH_USERNAME', 'xin') if username is None else username,
-        os.environ.get('AUTH_PASSWORD_HASH', '') if password_hash is None else password_hash,
-        os.environ.get('SESSION_SECRET', '') if session_secret is None else session_secret,
-        secure_cookie=secure_flag)
-    if not account.configured:
-        # First-run web setup may have stored an account locally; explicit
-        # environment configuration always takes precedence over the file.
-        stored = load_stored_account()
-        if stored is not None:
-            account = AccountAuth(*stored, secure_cookie=secure_flag)
-    setup_lock = threading.Lock()
+def create_app(*, extract_fn=None, max_concurrency=None,
+               cookie_manager=None, site_settings=None):
     cookies = CookieManager.from_environment() if cookie_manager is None else cookie_manager
     settings = SiteSettings.from_environment() if site_settings is None else site_settings
     router = SiteRouter(settings)
@@ -117,32 +97,27 @@ def create_app(*, api_key=None, extract_fn=None, max_concurrency=None,
             parsed = urlsplit(origin)
             return (parsed.scheme in {'https', 'http'} and not parsed.username and not parsed.password
                     and parsed.netloc.lower() == environ.get('HTTP_HOST', '').lower()
-                    and not parsed.path and not parsed.query and not parsed.fragment
-                    and (not account.secure_cookie or parsed.scheme == 'https'))
+                    and not parsed.path and not parsed.query and not parsed.fragment)
         except ValueError:
             return False
 
     def application(environ, start_response):
-        nonlocal account
         path, method = environ.get('PATH_INFO', ''), environ.get('REQUEST_METHOD', 'GET')
         if path in {'/health', '/api/health'} and method == 'GET':
-            return response(start_response, 200, {'ok': True, 'service': 'zhihu-core', 'version': '1.4.0',
-                            'authentication_configured': bool(key) or account.configured})
+            return response(start_response, 200, {'ok': True, 'service': 'zhihu-core', 'version': '1.4.0'})
         if path in assets and method == 'GET':
             if path == '/':
                 origins = []
-                if account.session_user(environ.get('HTTP_COOKIE', '')):
-                    try:
-                        origins = settings.browser_origins()
-                    except (ZhihuError, ValueError):
-                        pass  # The settings API can explain an unavailable store after login.
+                try:
+                    origins = settings.browser_origins()
+                except (ZhihuError, ValueError):
+                    pass  # The settings API can explain an unavailable store.
                 body, content_type = assets[path]
                 body = body.replace(b'<meta name="routing-origins" content="[]">',
                     ('<meta name="routing-origins" content="' + escape(json.dumps(origins), quote=True) + '">').encode())
                 return raw_response(start_response, 200, body, content_type, connect_origins=origins)
             return raw_response(start_response, 200, *assets[path])
-        methods = {'/api/extract': ('POST',), '/api/login': ('POST',), '/api/logout': ('POST',),
-                   '/api/setup': ('POST',),
+        methods = {'/api/extract': ('POST',),
                    '/api/session': ('GET',), '/api/cookie': ('GET', 'POST'),
                    '/api/cookie/test': ('POST',), '/api/cookie/remove': ('POST',),
                    '/api/settings': ('GET', 'POST')}
@@ -153,70 +128,15 @@ def create_app(*, api_key=None, extract_fn=None, max_concurrency=None,
                             [('Allow', ', '.join(methods[path]))])
         if method == 'POST' and not same_origin(environ):
             return error(start_response, 403, '不允许跨站请求。', 'forbidden_origin')
-        user = account.session_user(environ.get('HTTP_COOKIE', ''))
         if path == '/api/session':
-            return response(start_response, 200, {'ok': True, 'authenticated': bool(user),
-                            'username': user, 'account_login_enabled': account.configured,
-                            'setup_required': not account.configured})
-        if path == '/api/logout':
-            return response(start_response, 200, {'ok': True}, [account.cookie_header(clear=True)])
-        if path == '/api/login':
-            if not account.configured:
-                return error(start_response, 503, '账户登录尚未配置，请联系管理员。', 'account_not_configured')
-            if environ.get('QUERY_STRING'):
-                return error(start_response, 400, '登录信息请放在 JSON 请求体中。', 'invalid_request')
-            try:
-                data = read_json(environ)
-                if (set(data) != {'username', 'password'} or not isinstance(data['username'], str)
-                        or not isinstance(data['password'], str) or not 1 <= len(data['username']) <= 128
-                        or not 1 <= len(data['password']) <= 1024):
-                    raise ZhihuError('请填写账户名和密码。', 'invalid_request', 400)
-                if not account.login(data['username'], data['password']):
-                    return error(start_response, 401, '账户名或密码错误。', 'invalid_credentials')
-                return response(start_response, 200, {'ok': True, 'username': account.username},
-                                [account.cookie_header(account.issue_session())])
-            except LoginLimited as exc:
-                return response(start_response, 429, {'ok': False, 'error': '登录尝试过于频繁，请稍后重试。',
-                                'code': 'login_rate_limited'}, [('Retry-After', str(exc.retry_after))])
-            except ZhihuError as exc:
-                return error(start_response, exc.status, str(exc), exc.code)
-            except UnicodeError:
-                return error(start_response, 400, '账户名或密码的字符编码无效。', 'invalid_request')
-        if path == '/api/setup':
-            if account.configured:
-                return error(start_response, 409, '管理员账户已设置，请直接登录。', 'setup_unavailable')
-            if environ.get('QUERY_STRING'):
-                return error(start_response, 400, '设置信息请放在 JSON 请求体中。', 'invalid_request')
-            try:
-                data = read_json(environ)
-                if (set(data) != {'username', 'password'} or not isinstance(data['username'], str)
-                        or not isinstance(data['password'], str)):
-                    raise ZhihuError('请填写账户名和密码。', 'invalid_request', 400)
-                new_username = data['username'].strip()
-                new_password = data['password']
-                if not 1 <= len(new_username) <= 128 or any(ord(c) < 32 or ord(c) == 127 for c in new_username):
-                    raise ZhihuError('账户名无效。', 'invalid_request', 400)
-                if not 10 <= len(new_password) <= 1024:
-                    raise ZhihuError('密码至少需要 10 位。', 'invalid_request', 400)
-                with setup_lock:
-                    if account.configured:
-                        return error(start_response, 409, '管理员账户已设置，请直接登录。', 'setup_unavailable')
-                    new_hash = hash_password(new_password)
-                    new_secret = secrets.token_hex(32)
-                    try:
-                        store_account(new_username, new_hash, new_secret)
-                    except OSError:
-                        return error(start_response, 500, '账户保存失败，请检查服务目录权限。', 'setup_store_failed')
-                    account = AccountAuth(new_username, new_hash, new_secret, secure_cookie=secure_flag)
-                return response(start_response, 200, {'ok': True, 'username': new_username},
-                                [account.cookie_header(account.issue_session())])
-            except ZhihuError as exc:
-                return error(start_response, exc.status, str(exc), exc.code)
-            except (ValueError, UnicodeError):
-                return error(start_response, 400, '账户名或密码的字符编码无效。', 'invalid_request')
+            # Identity verification lives at the platform layer (the App
+            # Hub gate in front of /web/<slug>/). This app performs no
+            # verification itself: any request that reaches it has either
+            # passed the platform gate or arrived on the local port,
+            # which is trusted.
+            return response(start_response, 200, {'ok': True, 'authenticated': True,
+                            'via': 'platform', 'username': 'platform'})
         if path == '/api/settings':
-            if not user:
-                return error(start_response, 401, '请先登录账户后管理网站设置。', 'unauthorized')
             if environ.get('QUERY_STRING'):
                 return error(start_response, 400, '设置参数请放在 JSON 请求体中。', 'invalid_request')
             try:
@@ -225,8 +145,6 @@ def create_app(*, api_key=None, extract_fn=None, max_concurrency=None,
             except ZhihuError as exc:
                 return error(start_response, exc.status, str(exc), exc.code)
         if path in {'/api/cookie', '/api/cookie/test', '/api/cookie/remove'}:
-            if not user:
-                return error(start_response, 401, '请先登录账户后管理知乎 Cookie。', 'unauthorized')
             if environ.get('QUERY_STRING'):
                 return error(start_response, 400, 'Cookie 和测试参数请放在 JSON 请求体中。', 'invalid_request')
             if not slots.acquire(blocking=False):
@@ -257,15 +175,6 @@ def create_app(*, api_key=None, extract_fn=None, max_concurrency=None,
                 return error(start_response, 400, 'Cookie 或测试链接无效。', 'invalid_request')
             finally:
                 slots.release()
-        if not key and not account.configured:
-            return error(start_response, 503, '请先设置 EXTRACTOR_API_KEY。', 'api_key_not_configured')
-        auth = environ.get('HTTP_AUTHORIZATION', '')
-        if auth:
-            authorized = bool(key) and hmac.compare_digest(auth.encode('utf-8'), ('Bearer '+key).encode('utf-8'))
-        else:
-            authorized = bool(user)
-        if not authorized:
-            return error(start_response, 401, '请先登录，或提供有效的 API 访问密钥。', 'unauthorized')
         if environ.get('QUERY_STRING'):
             return error(start_response, 400, '参数请放在 JSON 请求体中。', 'invalid_request')
         try:

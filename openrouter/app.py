@@ -25,7 +25,6 @@ from urllib.request import Request, urlopen, ProxyHandler, build_opener
 from urllib.error import URLError, HTTPError
 
 import auth
-import panel_auth
 from page import PAGE_HTML
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -825,6 +824,13 @@ _account, _account_from_env = auth.load_account()
 _account_lock = threading.Lock()
 
 
+
+def _client_ip(environ):
+    fwd = environ.get("HTTP_X_FORWARDED_FOR", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return environ.get("REMOTE_ADDR", "") or "unknown"
+
 def _http_json(start_response, status, payload, extra_headers=None):
     body = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = [("Content-Type", "application/json; charset=utf-8"),
@@ -872,18 +878,12 @@ def _current_account():
 
 
 def _auth_state(environ):
+    """Identity verification lives at the platform layer (the App Hub
+    gate in front of /web/<slug>/). This app performs no verification
+    itself: any request that reaches it has either passed the
+    platform gate or arrived on the local port, which is trusted."""
     account = _current_account()
-    cookie = environ.get("HTTP_COOKIE", "")
-    if account:
-        for part in cookie.split(";"):
-            name, _, value = part.strip().partition("=")
-            if name == COOKIE_NAME and value and account.check_token(value):
-                return True, "account", account.username
-    panel_user = panel_auth.panel_username(cookie)
-    if panel_user:
-        return True, "panel", panel_user
-    return False, None, None
-
+    return True, "platform", (account.username if account else "local")
 
 def _authed(environ):
     return _auth_state(environ)[0]
@@ -930,7 +930,7 @@ def handle_session(environ, start_response):
     authed, via, username = _auth_state(environ)
     return _http_json(start_response, "200 OK", {
         "ok": True,
-        "setup_required": account is None,
+        "setup_required": False,
         "authenticated": authed,
         "via": via,
         "username": username if authed else None,
@@ -1089,10 +1089,9 @@ def application(environ, start_response):
         return _http_json(start_response, "200 OK", {"ok": True})
     if path == "/api/session" and method == "GET":
         return handle_session(environ, start_response)
-    if path == "/api/setup" and method == "POST":
-        return handle_setup(environ, start_response)
-    if path == "/api/login" and method == "POST":
-        return handle_login(environ, start_response)
+    if path in ("/api/setup", "/api/login") and method == "POST":
+        return _http_json(start_response, "404 Not Found",
+                          {"ok": False, "error": "not_found", "message": "接口不存在。"})
     if path == "/api/logout" and method == "POST":
         return _http_json(start_response, "200 OK", {"ok": True},
                           [_session_cookie(environ, "", 0)])
