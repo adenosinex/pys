@@ -56,6 +56,68 @@ DOCS_DIR = os.environ.get("NOTES_DOCS_DIR", os.path.join(_platform_data_dir(os.p
 INBOX_DIR = os.path.join(DOCS_DIR, "inbox")
 ARCHIVE_DIR = os.path.join(DOCS_DIR, "archive")
 TRASH_DIR = DOCS_DIR + "_trash"  # 保持回收站在扫描目录之外
+
+# ---------------------------------------------------------- credentials
+# Write-only API-key store in the platform data directory. Keys are
+# used internally only: the API reports whether a key is configured
+# and where it came from, never its value. An environment variable
+# always wins over the in-app store.
+
+CRED_FILE = os.path.join(os.path.dirname(DOCS_DIR), "credentials.json")
+CRED_KEYS = ("OP_API_KEY",)
+
+
+def _cred_values():
+    try:
+        with open(CRED_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        values = data.get("values", {}) if isinstance(data, dict) else {}
+        return {k: str(v) for k, v in values.items() if isinstance(v, str)}
+    except Exception:
+        return {}
+
+
+def _api_key(name):
+    env = os.getenv(name, "").strip()
+    if env:
+        return env
+    return _cred_values().get(name, "").strip()
+
+
+def _cred_status():
+    values = _cred_values()
+    out = {}
+    for name in CRED_KEYS:
+        if os.getenv(name, "").strip():
+            out[name] = {"configured": True, "source": "env"}
+        elif values.get(name, "").strip():
+            out[name] = {"configured": True, "source": "app"}
+        else:
+            out[name] = {"configured": False, "source": None}
+    return out
+
+
+def _cred_save(updates):
+    values = _cred_values()
+    for name, val in updates.items():
+        if name not in CRED_KEYS:
+            return False, "不支持的凭据：" + name
+        val = str(val or "").strip()
+        if val:
+            values[name] = val
+        else:
+            values.pop(name, None)
+    try:
+        os.makedirs(os.path.dirname(CRED_FILE), exist_ok=True)
+        tmp = CRED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"values": values}, fh, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CRED_FILE)
+    except OSError:
+        return False, "凭据保存失败。"
+    return True, ""
+
 MAX_FILES_PER_FOLDER = 100
 FILE_INDEX: dict[str, dict] = {}
 INDEX_LOCK = threading.RLock()
@@ -271,7 +333,7 @@ def update_meta_timestamp(meta: dict, created: int, status: str) -> None:
 
 
 def generate_tags_from_ai(content: str) -> list[str]:
-    api_key = os.getenv("OP_API_KEY")
+    api_key = _api_key("OP_API_KEY")
     if not api_key:
         return ["API_KEY_MISSING"]
     snippet = content[:800].strip()
@@ -719,4 +781,14 @@ def handle(method, subpath, args, json_data):
         return _normalize(get_related(seg[1]))
     if method == "GET" and len(seg) == 2 and seg[0] == "document":
         return _normalize(get_document(seg[1]))
+    if seg == ["credentials"] and method == "GET":
+        return 200, {"ok": True, "keys": _cred_status()}
+    if seg == ["credentials"] and method == "POST":
+        data = json_body()
+        if not isinstance(data, dict):
+            return 400, {"error": "请求体无效"}
+        ok, err = _cred_save(data)
+        if not ok:
+            return 400, {"error": err}
+        return 200, {"ok": True, "keys": _cred_status()}
     return 404, {"error": "接口不存在"}

@@ -237,6 +237,58 @@ def handle_links_update(environ, start_response, lid):
                  {"ok": False, "error": "not_found", "message": "链接不存在。"})
 
 
+def handle_links_export(environ, start_response):
+    payload = {"format": "links-backup", "version": 1,
+               "links": [{k: e.get(k, "") for k in ("name", "url", "note", "category")}
+                         for e in _load_links()]}
+    body = json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8")
+    start_response("200 OK", [("Content-Type", "application/json; charset=utf-8"),
+                              ("Content-Disposition", 'attachment; filename="links-backup.json"'),
+                              ("Content-Length", str(len(body)))])
+    return [body]
+
+
+def _validate_import_link(data):
+    # Imports additionally accept the app's internal relative URLs
+    # ("/web/...") that seeded data uses; the create form still
+    # requires full http(s) URLs.
+    entry, err = _validate_link(data)
+    if entry is not None:
+        return entry, None
+    name = str(data.get("name") or "").strip()
+    url = str(data.get("url") or "").strip()
+    note = str(data.get("note") or "").strip()
+    category = str(data.get("category") or "").strip()
+    if (1 <= len(name) <= 80 and url.startswith("/") and len(url) <= 2048
+            and len(note) <= 200 and len(category) <= 40):
+        return {"name": name, "url": url, "note": note, "category": category}, None
+    return None, err
+
+
+def handle_links_import(environ, start_response):
+    data = _read_json(environ, limit=4194304)
+    items = data.get("links") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return _json(start_response, "400 Bad Request",
+                     {"ok": False, "error": "bad_backup", "message": "备份格式不对。"})
+    links = _load_links()
+    seen = {e.get("url") for e in links}
+    added = skipped = 0
+    for item in items:
+        entry = None
+        if isinstance(item, dict) and len(links) < MAX_LINKS:
+            entry, _err = _validate_import_link(item)
+        if entry is None or entry["url"] in seen:
+            skipped += 1
+            continue
+        links.append({"id": secrets.token_hex(4), "created_at": time.time(), **entry})
+        seen.add(entry["url"])
+        added += 1
+    if added:
+        _save_links(links)
+    return _json(start_response, "200 OK", {"ok": True, "added": added, "skipped": skipped})
+
+
 def handle_links_delete(environ, start_response, lid):
     with _links_lock:
         links = _load_links()
@@ -278,29 +330,34 @@ PAGE = """<!DOCTYPE html>
   .tbtn.on { background: #2f6fd0; border-color: #2f6fd0; color: #fff; }
   .hintbar { display: none; font-size: 13px; opacity: .65; padding: 2px 2px 8px; }
   body.editing .hintbar { display: block; }
+  .editbar { display: none; gap: 8px; align-items: center; padding: 0 2px 10px; flex-wrap: wrap; }
+  body.editing .editbar { display: flex; }
+  #impMsg { font-size: 12px; opacity: .75; }
   h2.cat { font-size: 14px; margin: 20px 2px 10px; opacity: .75; font-weight: 600;
            display: flex; align-items: baseline; gap: 8px; }
   h2.cat .n { font-size: 12px; opacity: .6; font-weight: 400; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
-  @media (max-width: 560px) { .grid { grid-template-columns: 1fr 1fr; } }
-  .card { display: flex; gap: 10px; align-items: center; padding: 12px; border-radius: 14px;
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px 8px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: repeat(4, 1fr); } }
+  .card { display: flex; flex-direction: column; align-items: center; gap: 7px;
+          padding: 12px 4px 10px; border-radius: 16px;
           border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
           background: color-mix(in srgb, currentColor 4%, transparent);
-          text-decoration: none; color: inherit; position: relative; min-height: 64px;
+          text-decoration: none; color: inherit; position: relative;
           transition: transform .05s ease; }
-  .card:active { transform: scale(.985); }
-  .tile { flex: 0 0 auto; width: 40px; height: 40px; border-radius: 11px; color: #fff;
-          display: flex; align-items: center; justify-content: center;
-          font-size: 18px; font-weight: 700; background: hsl(var(--h, 210) 52% 44%); }
-  .meta { min-width: 0; }
-  .name { font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sub2 { font-size: 12px; opacity: .55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card:active { transform: scale(.97); }
+  .tile { flex: 0 0 auto; width: 52px; height: 52px; border-radius: 14px; color: #fff;
+          display: flex; align-items: center; justify-content: center; overflow: hidden;
+          font-size: 22px; font-weight: 700; background: hsl(var(--h, 210) 52% 44%); }
+  .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .meta { width: 100%; min-width: 0; text-align: center; }
+  .name { display: block; font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub2 { display: block; font-size: 11px; height: 15px; line-height: 15px; opacity: .55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   body.editing .card { border-style: dashed; cursor: pointer; }
   body.editing .card::after { content: "编辑"; position: absolute; top: 6px; right: 8px;
           font-size: 11px; opacity: .55; }
-  .addcard { display: none; align-items: center; justify-content: center; min-height: 64px;
-          border-radius: 14px; border: 1.5px dashed color-mix(in srgb, currentColor 30%, transparent);
-          font-size: 15px; opacity: .75; cursor: pointer; background: transparent; color: inherit; }
+  .addcard { display: none; flex-direction: column; align-items: center; justify-content: center; gap: 6px; min-height: 118px;
+          border-radius: 16px; border: 1.5px dashed color-mix(in srgb, currentColor 30%, transparent);
+          font-size: 14px; opacity: .75; cursor: pointer; background: transparent; color: inherit; }
   body.editing .addcard { display: flex; }
   .empty { opacity: .55; font-size: 14px; padding: 26px 2px; }
   footer { margin-top: 30px; font-size: 12px; opacity: .45; padding: 0 2px; }
@@ -335,6 +392,12 @@ PAGE = """<!DOCTYPE html>
   <button id="editToggle" class="tbtn" type="button">编辑</button>
 </header>
 <div class="hintbar">编辑模式：点任意卡片修改，点虚线框添加新链接；打开链接请先退出编辑模式。</div>
+<div class="editbar">
+  <button id="expBtn" class="tbtn" type="button">导出备份</button>
+  <label class="tbtn" for="impFile" style="cursor:pointer">导入备份</label>
+  <input id="impFile" type="file" accept=".json,application/json" hidden>
+  <span id="impMsg"></span>
+</div>
 <main id="board"></main>
 <div id="gate-note">这个页面由平台统一验证。请从控制台进入，或完成平台验证后刷新本页。</div>
 <footer id="foot"></footer>
@@ -394,11 +457,17 @@ function groups() {
   return order.map(c => ({cat: c, items: byCat.get(c)}));
 }
 
+function slugOf(u) { const m = String(u || "").match(/\/web\/([a-z0-9\-_]+)\//); return m ? m[1] : null; }
+function tileFallback(img) { const t = img.parentNode; t.textContent = t.dataset.letter || "?"; }
 function cardHtml(l) {
   const letter = esc(Array.from(l.name || "?")[0] || "?");
-  const sub = esc(l.note || hostOf(l.url));
-  const inner = `<span class="tile" style="--h:${hueOf(l.name || "")}">${letter}</span>` +
-    `<span class="meta"><span class="name">${esc(l.name)}</span><br>` +
+  const sub = esc(l.note || "");
+  const slug = slugOf(l.url);
+  const tileInner = slug
+    ? `<img src="/assets/logos/${slug}" alt="" loading="lazy" onerror="tileFallback(this)">`
+    : letter;
+  const inner = `<span class="tile" data-letter="${letter}" style="--h:${hueOf(l.name || "")}">${tileInner}</span>` +
+    `<span class="meta"><span class="name">${esc(l.name)}</span>` +
     `<span class="sub2">${sub}</span></span>`;
   if (editing) return `<div class="card" data-edit="${l.id}">${inner}</div>`;
   return `<a class="card" href="${esc(l.url)}" target="_blank" rel="noopener">${inner}</a>`;
@@ -476,6 +545,28 @@ $("editToggle").onclick = () => {
 };
 $("q").addEventListener("input", render);
 
+$("expBtn").onclick = async () => {
+  const r = await fetch("api/links/export");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(await r.blob());
+  a.download = "links-backup.json";
+  document.body.appendChild(a); a.click(); a.remove();
+};
+$("impFile").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    const payload = JSON.parse(await f.text());
+    const r = await fetch("api/links/import", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.message || "导入失败");
+    $("impMsg").textContent = `导入完成：新增 ${d.added}，跳过 ${d.skipped}（按网址去重）`;
+    await loadLinks();
+  } catch (err) { $("impMsg").textContent = "导入失败：" + err.message; }
+  e.target.value = "";
+});
+
 (async () => {
   const {data} = await api("api/session");
   if (!data.authenticated) { $("gate-note").style.display = "block"; return; }
@@ -510,6 +601,10 @@ def application(environ, start_response):
                 return handle_links_list(environ, start_response)
             if path == "/api/links" and method == "POST":
                 return handle_links_create(environ, start_response)
+            if path == "/api/links/export" and method == "GET":
+                return handle_links_export(environ, start_response)
+            if path == "/api/links/import" and method == "POST":
+                return handle_links_import(environ, start_response)
             lid = path[len("/api/links/"):]
             if lid and "/" not in lid:
                 if method == "POST":

@@ -373,6 +373,24 @@ tbody tr:last-child td{border-bottom:0}
         <button type="button" id="load-config" class="btn">重新读取</button>
       </form>
     </div>
+    <div class="panel">
+      <h2>API 凭据</h2>
+      <p class="muted small" style="margin:0 0 10px">热度（Rankings）数据需要 OpenRouter API Key。凭据只保存在服务器内部使用，页面永不回显已保存的值；留空保存可清除。环境变量优先于此处保存的值。</p>
+      <div class="grid2">
+        <div class="field"><label>OpenRouter API Key <span id="cred-or-status" class="muted"></span></label>
+          <input id="cred-or-key" type="password" class="input" placeholder="sk-or-…" autocomplete="off"></div>
+      </div>
+      <button type="button" id="cred-or-save" class="btn primary">保存凭据</button>
+      <button type="button" id="cred-or-clear" class="btn">清除</button>
+    </div>
+    <div class="panel">
+      <h2>数据备份与恢复</h2>
+      <p class="muted small" style="margin:0 0 10px">备份包含监控名单、系统配置与价格历史（不含凭据）。恢复会整体替换这三部分，请先导出留底。</p>
+      <button type="button" id="bak-export" class="btn primary">导出备份</button>
+      <input type="file" id="bak-file" accept=".json,application/json" style="margin:0 8px">
+      <button type="button" id="bak-import" class="btn">导入恢复</button>
+      <span id="bak-msg" class="muted small"></span>
+    </div>
   </section>
   <div class="muted small" style="text-align:center;margin:28px 0">
     价格来源：OpenRouter Official API · 热度来源：OpenRouter Rankings Daily
@@ -836,6 +854,44 @@ $("#config-form").addEventListener("submit",async e=>{
   }catch(err){notify(err.message);}
 });
 $("#load-config").addEventListener("click",loadConfig);
+
+async function loadCredStatus(){
+  try{
+    const d=await api("api/credentials");
+    const k=(d.keys||{})["OPENROUTER_API_KEY"]||{};
+    $("#cred-or-status").textContent=k.configured?("· 已配置（"+(k.source==="env"?"环境变量":"页面保存")+"）"):"· 未配置";
+  }catch(err){/* status is informational only */}
+}
+async function saveCred(clear){
+  const v=clear?"":$("#cred-or-key").value.trim();
+  if(!clear&&!v){notify("请先粘贴 API Key");return;}
+  try{
+    await send("api/credentials","POST",{OPENROUTER_API_KEY:v});
+    $("#cred-or-key").value="";
+    await loadCredStatus();
+    notify(clear?"凭据已清除":"凭据已保存，刷新后热度数据生效");
+  }catch(err){notify(err.message);}
+}
+$("#bak-export").addEventListener("click",async()=>{
+  const r=await fetch("api/backup");
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(await r.blob());a.download="openrouter-backup.json";
+  document.body.appendChild(a);a.click();a.remove();
+});
+$("#bak-import").addEventListener("click",async()=>{
+  const f=$("#bak-file").files[0];
+  if(!f){$("#bak-msg").textContent="请先选择备份文件";return;}
+  if(!confirm("恢复将替换监控名单、配置与价格历史，确定继续？"))return;
+  try{
+    const payload=JSON.parse(await f.text());
+    const d=await send("api/restore","POST",payload);
+    $("#bak-msg").textContent="已恢复 "+d.models+" 个模型"+(d.config_applied?"、配置":"")+(d.history_applied?"、历史":"");
+    await loadModels();await loadConfig();
+  }catch(err){$("#bak-msg").textContent="导入失败："+err.message;}
+});
+$("#cred-or-save").addEventListener("click",()=>saveCred(false));
+$("#cred-or-clear").addEventListener("click",()=>saveCred(true));
+loadCredStatus();
 $("#admin-token").value=state.token;
 $("#admin-token").addEventListener("change",e=>{
   state.token=e.target.value;

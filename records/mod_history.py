@@ -37,13 +37,75 @@ def _platform_data_dir(base):
     return os.path.join(base, ".runtime")
 
 RUNTIME = _platform_data_dir(BASE)
+
+# ---------------------------------------------------------- credentials
+# Write-only API-key store in the platform data directory. Keys are
+# used internally only: the API reports whether a key is configured
+# and where it came from, never its value. An environment variable
+# always wins over the in-app store.
+
+CRED_FILE = os.path.join(RUNTIME, "credentials.json")
+CRED_KEYS = ("SILICONFLOW_API_KEY", "DB_API_KEY")
+
+
+def _cred_values():
+    try:
+        with open(CRED_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        values = data.get("values", {}) if isinstance(data, dict) else {}
+        return {k: str(v) for k, v in values.items() if isinstance(v, str)}
+    except Exception:
+        return {}
+
+
+def _api_key(name):
+    env = os.getenv(name, "").strip()
+    if env:
+        return env
+    return _cred_values().get(name, "").strip()
+
+
+def _cred_status():
+    values = _cred_values()
+    out = {}
+    for name in CRED_KEYS:
+        if os.getenv(name, "").strip():
+            out[name] = {"configured": True, "source": "env"}
+        elif values.get(name, "").strip():
+            out[name] = {"configured": True, "source": "app"}
+        else:
+            out[name] = {"configured": False, "source": None}
+    return out
+
+
+def _cred_save(updates):
+    values = _cred_values()
+    for name, val in updates.items():
+        if name not in CRED_KEYS:
+            return False, "不支持的凭据：" + name
+        val = str(val or "").strip()
+        if val:
+            values[name] = val
+        else:
+            values.pop(name, None)
+    try:
+        os.makedirs(os.path.dirname(CRED_FILE), exist_ok=True)
+        tmp = CRED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"values": values}, fh, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CRED_FILE)
+    except OSError:
+        return False, "凭据保存失败。"
+    return True, ""
+
 DB_PATH = os.path.join(RUNTIME, "universal_datasmall.db")
 HISTORY_DIR = os.path.join(RUNTIME, "history")
 TRACKER_DIR = os.path.join(RUNTIME, "assert-cloud")
 
 VL_CONFIG = {
     "base_url": "https://api.siliconflow.cn/v1/chat/completions",
-    "api_key": os.getenv("SILICONFLOW_API_KEY", ""),
+    "api_key": _api_key("SILICONFLOW_API_KEY"),
     "model": "Qwen/Qwen2.5-VL-32B-Instruct",
 }
 
@@ -318,3 +380,78 @@ def tracker_sync(environ, start_response, board_type):
 def tracker_image(environ, start_response, filename):
     safe = os.path.basename(filename)
     return serve_file(start_response, os.path.join(TRACKER_DIR, safe), environ)
+
+
+# ------------------------------------------------------- backup / restore
+
+def _download_json(start_response, payload, filename):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    start_response("200 OK", [("Content-Type", "application/json; charset=utf-8"),
+                              ("Content-Disposition", 'attachment; filename="%s"' % filename),
+                              ("Content-Length", str(len(body)))])
+    return [body]
+
+
+def export_snapshots(environ, start_response):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute("SELECT * FROM snapshots ORDER BY record_time").fetchall()]
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["image_base64"] = None
+        item["image_ext"] = ".jpg"
+        full = _resolve_stored_path(row.get("filepath"))
+        if full and os.path.exists(full):
+            item["image_ext"] = os.path.splitext(full)[1] or ".jpg"
+            with open(full, "rb") as fh:
+                item["image_base64"] = base64.b64encode(fh.read()).decode("ascii")
+        items.append(item)
+    return _download_json(start_response,
+                          {"format": "snapshots-backup", "version": 1, "items": items},
+                          "snapshots-backup.json")
+
+
+def import_snapshots(environ, start_response):
+    data = read_json(environ)
+    items = data.get("items") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return json_response(start_response, {"ok": False, "error": "备份格式不对。"}, 400)
+    added = skipped = 0
+    with sqlite3.connect(DB_PATH) as conn:
+        existing = {r[0] for r in conn.execute("SELECT id FROM snapshots").fetchall()}
+        for it in items:
+            if not isinstance(it, dict) or not it.get("id"):
+                skipped += 1
+                continue
+            rid = str(it["id"])
+            if rid in existing:
+                skipped += 1
+                continue
+            safe = "".join(c for c in rid if c.isalnum() or c in "_-.") or uuid.uuid4().hex
+            ext = str(it.get("image_ext") or ".jpg")
+            if not ext.startswith(".") or len(ext) > 6:
+                ext = ".jpg"
+            stored = ""
+            blob = it.get("image_base64")
+            if blob:
+                try:
+                    raw = base64.b64decode(blob)
+                except Exception:
+                    raw = b""
+                if raw:
+                    os.makedirs(HISTORY_DIR, exist_ok=True)
+                    with open(os.path.join(HISTORY_DIR, safe + ext), "wb") as fh:
+                        fh.write(raw)
+                    stored = "history/" + safe + ext
+            conn.execute(
+                "INSERT INTO snapshots (id, event_type, filepath, bg_description, tags,"
+                " ai_model, processing_time_sec, status, record_time, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (rid, it.get("event_type") or "未命名记录", stored,
+                 it.get("bg_description") or "", it.get("tags") or "[]",
+                 it.get("ai_model"), it.get("processing_time_sec"),
+                 it.get("status") or "completed", it.get("record_time"), it.get("created_at")))
+            existing.add(rid)
+            added += 1
+    return json_response(start_response, {"ok": True, "added": added, "skipped": skipped})

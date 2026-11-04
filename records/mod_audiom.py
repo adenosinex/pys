@@ -6,6 +6,7 @@ requests became urllib, and storage moved to .runtime (vocal_data.db,
 audio_uploads/, raw_responses/). Without DB_API_KEY /
 SILICONFLOW_API_KEY in the project env, uploads and playback work
 and transcription lands in his designed failure states."""
+import base64
 import gzip
 import json
 import math
@@ -41,19 +42,81 @@ def _platform_data_dir(base):
     return os.path.join(base, ".runtime")
 
 RUNTIME = _platform_data_dir(BASE)
+
+# ---------------------------------------------------------- credentials
+# Write-only API-key store in the platform data directory. Keys are
+# used internally only: the API reports whether a key is configured
+# and where it came from, never its value. An environment variable
+# always wins over the in-app store.
+
+CRED_FILE = os.path.join(RUNTIME, "credentials.json")
+CRED_KEYS = ("SILICONFLOW_API_KEY", "DB_API_KEY")
+
+
+def _cred_values():
+    try:
+        with open(CRED_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        values = data.get("values", {}) if isinstance(data, dict) else {}
+        return {k: str(v) for k, v in values.items() if isinstance(v, str)}
+    except Exception:
+        return {}
+
+
+def _api_key(name):
+    env = os.getenv(name, "").strip()
+    if env:
+        return env
+    return _cred_values().get(name, "").strip()
+
+
+def _cred_status():
+    values = _cred_values()
+    out = {}
+    for name in CRED_KEYS:
+        if os.getenv(name, "").strip():
+            out[name] = {"configured": True, "source": "env"}
+        elif values.get(name, "").strip():
+            out[name] = {"configured": True, "source": "app"}
+        else:
+            out[name] = {"configured": False, "source": None}
+    return out
+
+
+def _cred_save(updates):
+    values = _cred_values()
+    for name, val in updates.items():
+        if name not in CRED_KEYS:
+            return False, "不支持的凭据：" + name
+        val = str(val or "").strip()
+        if val:
+            values[name] = val
+        else:
+            values.pop(name, None)
+    try:
+        os.makedirs(os.path.dirname(CRED_FILE), exist_ok=True)
+        tmp = CRED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"values": values}, fh, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CRED_FILE)
+    except OSError:
+        return False, "凭据保存失败。"
+    return True, ""
+
 DB_PATH = os.path.join(RUNTIME, "vocal_data.db")
 UPLOAD_FOLDER = os.path.join(RUNTIME, "audio_uploads")
 RAW_FOLDER = os.path.join(RUNTIME, "raw_responses")
 
 STT_CONFIG = {
-    "api_key": os.getenv("DB_API_KEY", "your-volcengine-api-key"),
+    "api_key": _api_key("DB_API_KEY"),
     "resource_id": "volc.seedasr.sauc.duration",
     "ws_url": "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream",
 }
 
 NLP_CONFIG = {
     "base_url": "https://api.siliconflow.cn/v1/chat/completions",
-    "api_key": os.getenv("SILICONFLOW_API_KEY"),
+    "api_key": _api_key("SILICONFLOW_API_KEY"),
     "model": "deepseek-ai/DeepSeek-V4-Flash",
 }
 
@@ -411,3 +474,86 @@ def get_records(environ, start_response):
         "sync_data": json.loads(r[6]) if r[6] else [],
         "created_at": r[7],
     } for r in rows if r[4] != 'uploaded'])
+
+
+# ------------------------------------------------------- backup / restore
+
+def _download_json(start_response, payload, filename):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    start_response("200 OK", [("Content-Type", "application/json; charset=utf-8"),
+                              ("Content-Disposition", 'attachment; filename="%s"' % filename),
+                              ("Content-Length", str(len(body)))])
+    return [body]
+
+
+def export_vocal(environ, start_response):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute("SELECT * FROM vocal_records ORDER BY created_at").fetchall()]
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["audio_base64"] = None
+        item["audio_ext"] = ".m4a"
+        full = _resolve_stored_path(row.get("filepath"))
+        if full and os.path.exists(full):
+            item["audio_ext"] = os.path.splitext(full)[1] or ".m4a"
+            with open(full, "rb") as fh:
+                item["audio_base64"] = base64.b64encode(fh.read()).decode("ascii")
+        items.append(item)
+    return _download_json(start_response,
+                          {"format": "vocal-backup", "version": 1, "items": items},
+                          "vocal-backup.json")
+
+
+def import_vocal(environ, start_response):
+    data = read_json(environ)
+    items = data.get("items") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return json_response(start_response, {"ok": False, "error": "备份格式不对。"}, 400)
+    added = skipped = 0
+    with sqlite3.connect(DB_PATH) as conn:
+        existing = {r[0] for r in conn.execute("SELECT id FROM vocal_records").fetchall()}
+        for it in items:
+            if not isinstance(it, dict) or not it.get("id"):
+                skipped += 1
+                continue
+            rid = str(it["id"])
+            if rid in existing:
+                skipped += 1
+                continue
+            safe = "".join(c for c in rid if c.isalnum() or c in "_-.") or uuid.uuid4().hex
+            ext = str(it.get("audio_ext") or ".m4a")
+            if not ext.startswith(".") or len(ext) > 6:
+                ext = ".m4a"
+            stored = ""
+            blob = it.get("audio_base64")
+            if blob:
+                try:
+                    raw = base64.b64decode(blob)
+                except Exception:
+                    raw = b""
+                if raw:
+                    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+                    with open(os.path.join(UPLOAD_FOLDER, safe + ext), "wb") as fh:
+                        fh.write(raw)
+                    stored = "audio_uploads/" + safe + ext
+            status = it.get("status") or "completed"
+            if status in ("pending_stt", "uploaded"):
+                status = "completed" if it.get("stt_text") else "stt_failed"
+            elif status == "pending_nlp":
+                status = "nlp_failed"
+            conn.execute(
+                "INSERT INTO vocal_records (id, filename, filepath, stt_text, sync_data,"
+                " title_with_tags, duration_sec, stt_model, nlp_model, stt_time_sec,"
+                " nlp_time_sec, processing_time_sec, status, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (rid, it.get("filename") or (safe + ext), stored,
+                 it.get("stt_text") or "", it.get("sync_data") or "[]",
+                 it.get("title_with_tags") or "", it.get("duration_sec"),
+                 it.get("stt_model"), it.get("nlp_model"), it.get("stt_time_sec"),
+                 it.get("nlp_time_sec"), it.get("processing_time_sec"),
+                 status, it.get("created_at")))
+            existing.add(rid)
+            added += 1
+    return json_response(start_response, {"ok": True, "added": added, "skipped": skipped})

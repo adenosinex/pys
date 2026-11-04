@@ -43,6 +43,145 @@ def _platform_data_dir(base):
     return os.path.join(base, ".runtime")
 
 DATA_DIR = Path(_platform_data_dir(str(BASE_DIR))) / "openrouter"
+
+# ---------------------------------------------------------- credentials
+# Write-only API-key store in the platform data directory. Keys are
+# used internally only: the API reports whether a key is configured
+# and where it came from, never its value. An environment variable
+# always wins over the in-app store.
+
+CRED_FILE = str(DATA_DIR.parent / "credentials.json")
+CRED_KEYS = ("OPENROUTER_API_KEY",)
+
+
+def _cred_values():
+    try:
+        with open(CRED_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        values = data.get("values", {}) if isinstance(data, dict) else {}
+        return {k: str(v) for k, v in values.items() if isinstance(v, str)}
+    except Exception:
+        return {}
+
+
+def _api_key(name):
+    env = os.getenv(name, "").strip()
+    if env:
+        return env
+    return _cred_values().get(name, "").strip()
+
+
+def _cred_status():
+    values = _cred_values()
+    out = {}
+    for name in CRED_KEYS:
+        if os.getenv(name, "").strip():
+            out[name] = {"configured": True, "source": "env"}
+        elif values.get(name, "").strip():
+            out[name] = {"configured": True, "source": "app"}
+        else:
+            out[name] = {"configured": False, "source": None}
+    return out
+
+
+def _cred_save(updates):
+    values = _cred_values()
+    for name, val in updates.items():
+        if name not in CRED_KEYS:
+            return False, "不支持的凭据：" + name
+        val = str(val or "").strip()
+        if val:
+            values[name] = val
+        else:
+            values.pop(name, None)
+    try:
+        os.makedirs(os.path.dirname(CRED_FILE), exist_ok=True)
+        tmp = CRED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"values": values}, fh, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CRED_FILE)
+    except OSError:
+        return False, "凭据保存失败。"
+    return True, ""
+
+
+def handle_backup(environ, start_response):
+    payload = {"format": "openrouter-backup", "version": 1,
+               "models": load_models(),
+               "config": load_config(),
+               "history": read_json(HISTORY_FILE, {})}
+    body = json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8")
+    start_response("200 OK", [("Content-Type", "application/json; charset=utf-8"),
+                              ("Content-Disposition", 'attachment; filename="openrouter-backup.json"'),
+                              ("Content-Length", str(len(body)))])
+    return [body]
+
+
+def handle_restore(environ, start_response):
+    data = _read_json(environ)
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        return _http_json(start_response, "400 Bad Request",
+                          {"ok": False, "error": "bad_backup", "message": "备份格式不对。"})
+    models, seen = [], set()
+    for item in data["models"]:
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id")
+        if not isinstance(mid, str) or not MODEL_ID_RE.fullmatch(mid) or "/" not in mid or mid in seen:
+            continue
+        seen.add(mid)
+        models.append({"id": mid, "name": str(item.get("name") or mid),
+                       "enabled": item.get("enabled") is not False})
+    if not models:
+        return _http_json(start_response, "400 Bad Request",
+                          {"ok": False, "error": "bad_backup", "message": "备份里没有有效的模型。"})
+    write_json(MODELS_FILE, {"models": models})
+    config_applied = False
+    backup_config = data.get("config")
+    if isinstance(backup_config, dict):
+        config = load_config()
+        for key, value in backup_config.items():
+            if key == "proxy":
+                if isinstance(value, str) and len(value) <= 1000:
+                    config[key] = value.strip()
+                continue
+            if key not in CONFIG_LIMITS:
+                continue
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                continue
+            low, high = CONFIG_LIMITS[key]
+            if not math.isfinite(val) or not low <= val <= high:
+                continue
+            if key in CONFIG_INTEGER_KEYS:
+                if not val.is_integer():
+                    continue
+                val = int(val)
+            config[key] = val
+        write_json(CONFIG_FILE, config)
+        config_applied = True
+    history_applied = False
+    if isinstance(data.get("history"), dict):
+        write_json(HISTORY_FILE, data["history"])
+        history_applied = True
+    return _http_json(start_response, "200 OK",
+                      {"ok": True, "models": len(models),
+                       "config_applied": config_applied, "history_applied": history_applied})
+
+
+def handle_credentials(environ, start_response, method):
+    if method == "GET":
+        return _http_json(start_response, "200 OK", {"ok": True, "keys": _cred_status()})
+    data = _read_json(environ)
+    if not isinstance(data, dict):
+        return _http_json(start_response, "400 Bad Request", {"ok": False, "error": "bad_json", "message": "请求体无效。"})
+    ok, err = _cred_save(data)
+    if not ok:
+        return _http_json(start_response, "400 Bad Request", {"ok": False, "error": "bad_key", "message": err})
+    return _http_json(start_response, "200 OK", {"ok": True, "keys": _cred_status()})
+
 SEED_DIR = BASE_DIR / "seed"
 
 MODELS_FILE = DATA_DIR / "models.json"
@@ -238,7 +377,7 @@ class RouterError(Exception):
 def api_get(url, config, auth_required=False, params=None):
     headers = {"Accept": "application/json"}
 
-    key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    key = _api_key("OPENROUTER_API_KEY")
 
     if auth_required and not key:
         raise RouterError("未配置 OPENROUTER_API_KEY")
@@ -954,6 +1093,29 @@ def handle_session(environ, start_response):
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9._~:/+@-]{1,200}$")
 
 
+
+CONFIG_LIMITS = {
+    "usd_cny_rate": (0.000001, 1000),
+    "refresh_interval_seconds": (60, 2592000),
+    "manual_refresh_cooldown_seconds": (0, 86400),
+    "api_timeout_seconds": (3, 120),
+    "provider_workers": (1, 12),
+    "history_limit": (2, 2000),
+    "low_price_ratio": (0.01, 0.99),
+    "high_price_ratio": (1.01, 100),
+    "latency_warning_ms": (100, 600000),
+    "uptime_warning_pct": (0, 100),
+}
+
+CONFIG_INTEGER_KEYS = {
+    "refresh_interval_seconds",
+    "manual_refresh_cooldown_seconds",
+    "api_timeout_seconds",
+    "provider_workers",
+    "history_limit",
+}
+
+
 def handle_config(environ, start_response, method):
     if method == "GET":
         return _http_json(start_response, "200 OK", {"settings": load_config()})
@@ -964,26 +1126,8 @@ def handle_config(environ, start_response, method):
 
     config = load_config()
 
-    limits = {
-        "usd_cny_rate": (0.000001, 1000),
-        "refresh_interval_seconds": (60, 2592000),
-        "manual_refresh_cooldown_seconds": (0, 86400),
-        "api_timeout_seconds": (3, 120),
-        "provider_workers": (1, 12),
-        "history_limit": (2, 2000),
-        "low_price_ratio": (0.01, 0.99),
-        "high_price_ratio": (1.01, 100),
-        "latency_warning_ms": (100, 600000),
-        "uptime_warning_pct": (0, 100),
-    }
-
-    integer_keys = {
-        "refresh_interval_seconds",
-        "manual_refresh_cooldown_seconds",
-        "api_timeout_seconds",
-        "provider_workers",
-        "history_limit",
-    }
+    limits = CONFIG_LIMITS
+    integer_keys = CONFIG_INTEGER_KEYS
 
     for key, value in data.items():
         if key == "proxy":
@@ -1148,6 +1292,12 @@ def application(environ, start_response):
         ok, message, code = start_refresh(manual=True)
         return _http_json(start_response, _status_line(code),
                           {"ok": ok, "message": message, "error": None if ok else message})
+    if path == "/api/credentials" and method in ("GET", "POST"):
+        return handle_credentials(environ, start_response, method)
+    if path == "/api/backup" and method == "GET":
+        return handle_backup(environ, start_response)
+    if path == "/api/restore" and method == "POST":
+        return handle_restore(environ, start_response)
     if path == "/api/config" and method in ("GET", "POST"):
         return handle_config(environ, start_response, method)
 

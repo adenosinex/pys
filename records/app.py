@@ -9,6 +9,7 @@ databases from the original project can be dropped in (via seed/ or
 directly into .runtime/) and pick up where they left off. Access is
 gated by the hub's unified login.
 """
+import json
 import os
 import re
 import shutil
@@ -16,10 +17,12 @@ import threading
 
 import auth
 import mod_audiom
+import mod_health
 import mod_history
 import mod_snippets
 import mod_stats
 import mod_store
+from health_page import HEALTH_PAGE
 from pages import PAGES
 from webutil import json_response, serve_file
 
@@ -39,6 +42,91 @@ def _platform_data_dir(base):
     return os.path.join(base, ".runtime")
 
 RUNTIME = _platform_data_dir(BASE)
+
+# ---------------------------------------------------------- credentials
+# Write-only API-key store in the platform data directory. Keys are
+# used internally only: the API reports whether a key is configured
+# and where it came from, never its value. An environment variable
+# always wins over the in-app store.
+
+CRED_FILE = os.path.join(RUNTIME, "credentials.json")
+CRED_KEYS = ("SILICONFLOW_API_KEY", "DB_API_KEY")
+
+
+def _cred_values():
+    try:
+        with open(CRED_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        values = data.get("values", {}) if isinstance(data, dict) else {}
+        return {k: str(v) for k, v in values.items() if isinstance(v, str)}
+    except Exception:
+        return {}
+
+
+def _api_key(name):
+    env = os.getenv(name, "").strip()
+    if env:
+        return env
+    return _cred_values().get(name, "").strip()
+
+
+def _cred_status():
+    values = _cred_values()
+    out = {}
+    for name in CRED_KEYS:
+        if os.getenv(name, "").strip():
+            out[name] = {"configured": True, "source": "env"}
+        elif values.get(name, "").strip():
+            out[name] = {"configured": True, "source": "app"}
+        else:
+            out[name] = {"configured": False, "source": None}
+    return out
+
+
+def _cred_save(updates):
+    values = _cred_values()
+    for name, val in updates.items():
+        if name not in CRED_KEYS:
+            return False, "不支持的凭据：" + name
+        val = str(val or "").strip()
+        if val:
+            values[name] = val
+        else:
+            values.pop(name, None)
+    try:
+        os.makedirs(os.path.dirname(CRED_FILE), exist_ok=True)
+        tmp = CRED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"values": values}, fh, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CRED_FILE)
+    except OSError:
+        return False, "凭据保存失败。"
+    return True, ""
+
+
+def handle_credentials(environ, start_response, method):
+    if method == "GET":
+        return json_response(start_response, {"ok": True, "keys": _cred_status()})
+    from webutil import read_json
+    data = read_json(environ)
+    if not isinstance(data, dict):
+        return json_response(start_response, {"ok": False, "error": "请求体无效。"}, code=400)
+    ok, err = _cred_save(data)
+    if not ok:
+        return json_response(start_response, {"ok": False, "error": err}, code=400)
+    # Take effect immediately in the modules that captured keys at import.
+    try:
+        mod_history.VL_CONFIG["api_key"] = _api_key("SILICONFLOW_API_KEY")
+    except Exception:
+        pass
+    try:
+        mod_audiom.STT_CONFIG["api_key"] = _api_key("DB_API_KEY")
+        mod_audiom.NLP_CONFIG["api_key"] = _api_key("SILICONFLOW_API_KEY")
+    except Exception:
+        pass
+    return json_response(start_response, {"ok": True, "keys": _cred_status()})
+
 SEED = os.path.join(BASE, "seed")
 STATIC_DIR = os.path.join(BASE, "static")
 COOKIE_NAME = "records_session"
@@ -73,6 +161,7 @@ def _init_storage():
     mod_history.init_db()
     mod_audiom.init_db()
     mod_store.init_db()
+    mod_health.init_db()
 
 
 _init_storage()
@@ -196,10 +285,182 @@ INDEX_HTML = """<!doctype html>
     <a class="card" href="assert"><div class="t">资产看板</div><div class="d">资产条目与凭证图</div></a>
     <a class="card" href="cloud"><div class="t">云端日常</div><div class="d">日常数据同步页</div></a>
     <a class="card" href="exercise"><div class="t">运动记录</div><div class="d">健身配置与记录</div></a>
+    <a class="card" href="health-record"><div class="t">健康记录</div><div class="d">食物、睡眠、状态与敏感项的私人记录</div></a>
   </div>
+
+  <section style="margin-top:26px;background:#161a22;border:1px solid #232a37;border-radius:12px;padding:16px 14px">
+    <div style="font-size:15px;font-weight:600;margin-bottom:4px">API 凭据</div>
+    <p style="font-size:12px;color:#8b93a7;margin:0 0 12px;line-height:1.6">历史快照的 AI 分析、录音转写与摘要用的接口密钥。只保存在服务器内部使用，页面永不回显已保存的值；保存空值可清除，环境变量优先。</p>
+    <label style="display:block;font-size:12px;color:#8b93a7;margin:10px 0 4px">SiliconFlow API Key <span id="cred-sf-status"></span></label>
+    <div style="display:flex;gap:8px">
+      <input id="cred-sf" type="password" autocomplete="off" placeholder="sk-…" style="flex:1;box-sizing:border-box;padding:9px 10px;border-radius:8px;border:1px solid #2a3242;background:#0f1116;color:#e6e8ee;font-size:14px">
+      <button id="cred-sf-save" type="button" style="padding:9px 14px;border:0;border-radius:8px;background:#2f6fd0;color:#fff;font-size:13px;cursor:pointer">保存</button>
+      <button id="cred-sf-clear" type="button" style="padding:9px 12px;border:1px solid #2a3242;border-radius:8px;background:transparent;color:#e6e8ee;font-size:13px;cursor:pointer">清除</button>
+    </div>
+    <label style="display:block;font-size:12px;color:#8b93a7;margin:12px 0 4px">火山引擎 DB_API_KEY（语音转写） <span id="cred-db-status"></span></label>
+    <div style="display:flex;gap:8px">
+      <input id="cred-db" type="password" autocomplete="off" style="flex:1;box-sizing:border-box;padding:9px 10px;border-radius:8px;border:1px solid #2a3242;background:#0f1116;color:#e6e8ee;font-size:14px">
+      <button id="cred-db-save" type="button" style="padding:9px 14px;border:0;border-radius:8px;background:#2f6fd0;color:#fff;font-size:13px;cursor:pointer">保存</button>
+      <button id="cred-db-clear" type="button" style="padding:9px 12px;border:1px solid #2a3242;border-radius:8px;background:transparent;color:#e6e8ee;font-size:13px;cursor:pointer">清除</button>
+    </div>
+    <div id="cred-msg" style="font-size:12px;color:#7fc97f;margin-top:10px;min-height:16px"></div>
+  </section>
 </div>
+<script>
+(function () {
+  function load() {
+    fetch("api/credentials", {cache: "no-store"}).then(function (r) { return r.json(); }).then(function (d) {
+      var k = d.keys || {};
+      function t(id, key) {
+        var el = document.getElementById(id); if (!el) return;
+        var s = k[key] || {};
+        el.textContent = s.configured ? ("· 已配置（" + (s.source === "env" ? "环境变量" : "页面保存") + "）") : "· 未配置";
+      }
+      t("cred-sf-status", "SILICONFLOW_API_KEY"); t("cred-db-status", "DB_API_KEY");
+    }).catch(function () {});
+  }
+  function save(key, inputId, clear) {
+    var v = clear ? "" : document.getElementById(inputId).value.trim();
+    if (!clear && !v) { document.getElementById("cred-msg").textContent = "请先粘贴 Key"; return; }
+    var body = {}; body[key] = v;
+    fetch("api/credentials", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})
+      .then(function (r) { return r.json(); }).then(function (d) {
+        document.getElementById("cred-msg").textContent = d.ok ? (clear ? "已清除" : "已保存，立即生效") : (d.error || "保存失败");
+        document.getElementById(inputId).value = "";
+        load();
+      }).catch(function () { document.getElementById("cred-msg").textContent = "保存失败"; });
+  }
+  document.getElementById("cred-sf-save").addEventListener("click", function () { save("SILICONFLOW_API_KEY", "cred-sf", false); });
+  document.getElementById("cred-sf-clear").addEventListener("click", function () { save("SILICONFLOW_API_KEY", "cred-sf", true); });
+  document.getElementById("cred-db-save").addEventListener("click", function () { save("DB_API_KEY", "cred-db", false); });
+  document.getElementById("cred-db-clear").addEventListener("click", function () { save("DB_API_KEY", "cred-db", true); });
+  load();
+})();
+</script>
 </body>
 </html>
+"""
+
+
+DATA_WIDGETS = {
+    "cloud": {"mode": "tracker", "title": "云端日常 · 数据进出口",
+              "note": "导出为 JSON 备份；导入会整体替换当前看板数据，请先导出留底。",
+              "api": "tracker_data/sync/daily", "board": "daily"},
+    "snippets": {"mode": "api", "title": "片段库 · 数据进出口",
+                 "note": "完整备份（标题+内容）。导入按标题+内容去重，不覆盖已有片段。",
+                 "export_path": "api/snippets/export", "import_path": "api/snippets/import",
+                 "filename": "snippets-backup.json"},
+    "history": {"mode": "api", "title": "历史快照 · 数据进出口",
+                "note": "完整备份（含照片文件，体积可能较大）。导入按编号去重，不覆盖已有快照。",
+                "export_path": "api/snapshots/export", "import_path": "api/snapshots/import",
+                "filename": "snapshots-backup.json"},
+    "audiom": {"mode": "api", "title": "录音备忘 · 数据进出口",
+               "note": "完整备份（含音频与转写文本，体积可能较大）。导入按编号去重，不覆盖已有录音。",
+               "export_path": "audiom/api/vocal/export", "import_path": "audiom/api/vocal/import",
+               "filename": "vocal-backup.json"},
+    "exercise": {"mode": "kv", "title": "运动记录 · 配置进出口",
+                 "note": "导出/导入运动配置（gym_cfg）。导入会覆盖当前配置。",
+                 "kv_key": "gym_cfg", "filename": "gym-cfg-backup.json"},
+}
+
+DATA_WIDGET = """
+<div id="diw" style="position:fixed;right:12px;bottom:12px;z-index:9998;font-family:system-ui,-apple-system,'PingFang SC',sans-serif">
+  <button id="diw-btn" type="button" style="padding:8px 13px;border-radius:999px;border:1px solid #3a4356;background:#1b2130;color:#dfe5ef;font-size:13px;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.35)">数据进出口</button>
+  <div id="diw-panel" hidden style="position:absolute;right:0;bottom:46px;width:290px;background:#171b24;border:1px solid #2a3242;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.5);padding:14px;color:#e6e8ee">
+    <div id="diw-title" style="font-weight:600;font-size:14px"></div>
+    <p id="diw-note" style="font-size:12px;color:#8b93a7;margin:6px 0 10px;line-height:1.55"></p>
+    <button id="diw-export" type="button" style="width:100%;padding:9px;border:0;border-radius:8px;background:#2f6fd0;color:#fff;font-size:13px;cursor:pointer">导出备份</button>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <input id="diw-file" type="file" accept=".json,application/json" style="flex:1;font-size:12px;color:#8b93a7">
+    </div>
+    <button id="diw-import" type="button" style="width:100%;padding:9px;margin-top:8px;border:1px solid #2a3242;border-radius:8px;background:transparent;color:#e6e8ee;font-size:13px;cursor:pointer">导入所选文件</button>
+    <div id="diw-msg" style="font-size:12px;color:#7fc97f;margin-top:8px;min-height:16px"></div>
+  </div>
+</div>
+<script>
+(function () {
+  var CFG = __CFG__;
+  var root = location.pathname.replace(/\\/[^/]*$/, "");
+  function $(id) { return document.getElementById(id); }
+  function msg(t) { $("diw-msg").textContent = t; }
+  function download(name, blob) {
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 400);
+  }
+  function dlJson(name, obj) { download(name, new Blob([JSON.stringify(obj, null, 1)], {type: "application/json"})); }
+  async function jget(u) { var r = await fetch(u, {cache: "no-store"}); if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }
+  async function jpost(u, body) {
+    var r = await fetch(u, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    var d = await r.json().catch(function () { return {}; });
+    if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+    return d;
+  }
+  $("diw-title").textContent = CFG.title;
+  $("diw-note").textContent = CFG.note;
+  $("diw-btn").addEventListener("click", function () { var p = $("diw-panel"); p.hidden = !p.hidden; });
+  $("diw-export").addEventListener("click", async function () {
+    try {
+      if (CFG.mode === "tracker") {
+        var d = await jget(root + "/" + CFG.api);
+        var items = Array.isArray(d) ? ((d[0] || {}).items || []) : (d.items || []);
+        dlJson(CFG.board + "-backup.json", {format: "tracker-backup", board: CFG.board, exported_at: Math.floor(Date.now() / 1000), items: items});
+        msg("已导出 " + items.length + " 条。");
+      } else if (CFG.mode === "kv") {
+        var v = await jget(root + "/api2/kv/" + CFG.kv_key);
+        dlJson(CFG.filename, {format: "kv-backup", key: CFG.kv_key, payload: v});
+        msg("配置已导出。");
+      } else {
+        var r = await fetch(root + "/" + CFG.export_path, {cache: "no-store"});
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        download(CFG.filename, await r.blob());
+        msg("备份已导出。");
+      }
+    } catch (e) { msg("导出失败：" + e.message); }
+  });
+  $("diw-import").addEventListener("click", async function () {
+    var f = $("diw-file").files[0];
+    if (!f) { msg("请先选择备份文件"); return; }
+    try {
+      var parsed = JSON.parse(await f.text());
+      if (CFG.mode === "tracker") {
+        var items = parsed.items || (Array.isArray(parsed) ? ((parsed[0] || {}).items) : null);
+        if (!Array.isArray(items)) throw new Error("备份里没有 items");
+        if (!confirm("导入将整体替换当前看板数据，确定继续？")) return;
+        await jpost(root + "/" + CFG.api, {items: items});
+        msg("导入完成（整体替换 " + items.length + " 条），刷新页面查看。");
+      } else if (CFG.mode === "kv") {
+        var payload = ("payload" in parsed) ? parsed.payload : parsed;
+        if (!confirm("导入将覆盖当前配置，确定继续？")) return;
+        await jpost(root + "/api2/kv/" + CFG.kv_key, {payload: payload});
+        msg("配置已导入，刷新页面查看。");
+      } else {
+        var d = await jpost(root + "/" + CFG.import_path, parsed);
+        msg("导入完成：新增 " + (d.added || 0) + "，跳过 " + (d.skipped || 0) + "，刷新页面查看。");
+      }
+    } catch (e) { msg("导入失败：" + e.message); }
+  });
+})();
+</script>
+"""
+
+
+HEALTH_SW = """
+const CACHE = "health-shell-v1";
+self.addEventListener("install", (e) => { self.skipWaiting(); });
+self.addEventListener("activate", (e) => { e.waitUntil(self.clients.claim()); });
+self.addEventListener("fetch", (e) => {
+  const url = new URL(e.request.url);
+  if (e.request.method === "GET" && url.pathname.endsWith("/health-record")) {
+    e.respondWith(
+      caches.open(CACHE).then((c) =>
+        fetch(e.request).then((r) => { c.put(e.request, r.clone()); return r; })
+          .catch(() => c.match(e.request))
+      )
+    );
+  }
+});
 """
 
 
@@ -229,8 +490,27 @@ def application(environ, start_response):
 
     if path == "/" and method == "GET":
         return _page_response(start_response, INDEX_HTML)
+    if path == "/health-record" and method == "GET":
+        return _page_response(start_response, HEALTH_PAGE)
+    if path == "/health-manifest.json" and method == "GET":
+        return json_response(start_response, {
+            "name": "健康记录", "short_name": "健康记录",
+            "display": "standalone", "background_color": "#0f1116",
+            "theme_color": "#0f1116", "start_url": "health-record",
+            "scope": ".", "icons": []})
+    if path == "/health-sw.js" and method == "GET":
+        body = HEALTH_SW.encode("utf-8")
+        start_response("200 OK", [("Content-Type", "text/javascript; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
     if method == "GET" and path[1:] in PAGES:
-        return _page_response(start_response, PAGES[path[1:]])
+        html = PAGES[path[1:]]
+        cfg = DATA_WIDGETS.get(path[1:])
+        if cfg:
+            widget = DATA_WIDGET.replace("__CFG__", json.dumps(cfg, ensure_ascii=False))
+            html = (html.replace("</body>", widget + "</body>", 1)
+                    if "</body>" in html else html + widget)
+        return _page_response(start_response, html)
     if method == "GET" and path.startswith("/static/"):
         rel = path[len("/static/"):]
         full = os.path.normpath(os.path.join(STATIC_DIR, rel))
@@ -257,6 +537,10 @@ def application(environ, start_response):
         return mod_store.collection_main(environ, start_response, unquote(m.group(1)))
 
     # daily + fuel
+    if path == "/api/credentials" and method in ("GET", "POST"):
+        return handle_credentials(environ, start_response, method)
+    if path.startswith("/api/health/"):
+        return mod_health.api(environ, start_response)
     if path == "/api/daily_stats" and method in ("GET", "POST"):
         return mod_stats.daily_main(environ, start_response)
     if path == "/api/daily_stats/export" and method == "GET":
@@ -277,6 +561,10 @@ def application(environ, start_response):
         return mod_stats.fuel_delete(environ, start_response, int(m.group(1)))
 
     # snippets
+    if path == "/api/snippets/export" and method == "GET":
+        return mod_snippets.export_snippets(environ, start_response)
+    if path == "/api/snippets/import" and method == "POST":
+        return mod_snippets.import_snippets(environ, start_response)
     if path == "/api/snippets/list" and method == "GET":
         return mod_snippets.list_snippets(environ, start_response)
     if path == "/api/snippets/save" and method == "POST":
@@ -289,6 +577,10 @@ def application(environ, start_response):
         return mod_snippets.delete_snippet(environ, start_response, int(m.group(1)))
 
     # history snapshots + tracker
+    if path == "/api/snapshots/export" and method == "GET":
+        return mod_history.export_snapshots(environ, start_response)
+    if path == "/api/snapshots/import" and method == "POST":
+        return mod_history.import_snapshots(environ, start_response)
     if path == "/api/snapshots" and method == "GET":
         return mod_history.list_snapshots(environ, start_response)
     if path == "/api/snapshots/upload" and method == "POST":
@@ -313,6 +605,10 @@ def application(environ, start_response):
         return mod_history.tracker_image(environ, start_response, unquote(m.group(1)))
 
     # audio memos
+    if path == "/audiom/api/vocal/export" and method == "GET":
+        return mod_audiom.export_vocal(environ, start_response)
+    if path == "/audiom/api/vocal/import" and method == "POST":
+        return mod_audiom.import_vocal(environ, start_response)
     if path == "/audiom/api/vocal" and method == "GET":
         return mod_audiom.get_records(environ, start_response)
     if path == "/audiom/api/vocal/upload" and method == "POST":
