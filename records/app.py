@@ -24,7 +24,21 @@ from pages import PAGES
 from webutil import json_response, serve_file
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-RUNTIME = os.path.join(BASE, ".runtime")
+
+def _platform_data_dir(base):
+    """Persistent data directory: the platform's DATA_DIR env var when
+    provided, else the ./data symlink the panel creates inside the
+    project folder (pointing at the central data directory), else
+    ./.runtime for standalone local runs."""
+    env = os.environ.get("DATA_DIR")
+    if env:
+        return env
+    link = os.path.join(base, "data")
+    if os.path.isdir(link):
+        return link
+    return os.path.join(base, ".runtime")
+
+RUNTIME = _platform_data_dir(BASE)
 SEED = os.path.join(BASE, "seed")
 STATIC_DIR = os.path.join(BASE, "static")
 COOKIE_NAME = "records_session"

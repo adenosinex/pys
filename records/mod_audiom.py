@@ -26,7 +26,21 @@ import websocket  # vendored websocket-client
 from webutil import json_response, read_json, parse_multipart, serve_file
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-RUNTIME = os.path.join(BASE, ".runtime")
+
+def _platform_data_dir(base):
+    """Persistent data directory: the platform's DATA_DIR env var when
+    provided, else the ./data symlink the panel creates inside the
+    project folder (pointing at the central data directory), else
+    ./.runtime for standalone local runs."""
+    env = os.environ.get("DATA_DIR")
+    if env:
+        return env
+    link = os.path.join(base, "data")
+    if os.path.isdir(link):
+        return link
+    return os.path.join(base, ".runtime")
+
+RUNTIME = _platform_data_dir(BASE)
 DB_PATH = os.path.join(RUNTIME, "vocal_data.db")
 UPLOAD_FOLDER = os.path.join(RUNTIME, "audio_uploads")
 RAW_FOLDER = os.path.join(RUNTIME, "raw_responses")
