@@ -1,0 +1,7 @@
+*
+!requirements.txt
+!parser.py
+!extractor.py
+!app.py
+!gunicorn.conf.py
+!Dockerfile

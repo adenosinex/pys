@@ -1,0 +1,3 @@
+# The extraction core, CLI and local server use only Python's standard library.
+# Linux cloud deployment needs this WSGI server (plus its transitive dependencies).
+gunicorn>=26.2,<27; sys_platform != "win32"

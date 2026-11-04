@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#0b6bcb">
+  <meta name="routing-origins" content="[]">
+  <title>链接转文本</title>
+  <link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/settings.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div id="copyHint" role="status" hidden><span class="hintIcon" aria-hidden="true">📋</span><span>正文已就绪，点击页面空白处或再次点击「一键获取」复制</span><button id="cancel-copy" class="dismiss" type="button">取消</button></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <main class="wrap">
+    <header>
+      <div class="brandline">
+        <a class="brand-logo" href="/" aria-label="链接转文本首页"><img src="/static/logo.svg" width="44" height="44" alt=""></a>
+        <div class="brand-title"><h1>链接转文本</h1><p>粘贴链接或整段文本，自动识别知乎、YouTube 和已配置的网站。支持 Markdown / 纯文本 / JSON。</p></div>
+        <div id="account" hidden><span id="account-name"></span><button id="logout" class="btn btn-ghost btn-sm" type="button">退出登录</button></div>
+      </div>
+    </header>
+    <section id="setup-panel" class="card login" aria-labelledby="setup-title" hidden>
+      <div class="cardhead"><h2 id="setup-title">首次设置 · 创建管理员账户</h2></div>
+      <form id="setup-form">
+        <label for="setup-username">账户名</label><input id="setup-username" name="username" type="text" autocomplete="username" value="xin" maxlength="128" required>
+        <label for="setup-password">设置密码</label><input id="setup-password" name="password" type="password" autocomplete="new-password" maxlength="1024" required>
+        <label for="setup-password2">再次输入密码</label><input id="setup-password2" type="password" autocomplete="new-password" maxlength="1024" required>
+        <button id="setup-button" class="btn btn-primary login-submit" type="submit">创建账户并登录</button>
+        <p class="hint">这是本服务的第一个账户，只有尚未设置账户时才会出现此页面，创建成功后入口自动关闭。密码至少 10 位。</p>
+        <p id="setup-message" class="message" role="status" aria-live="polite"></p>
+      </form>
+    </section>
+    <section id="login-panel" class="card login" aria-labelledby="login-title">
+      <div class="cardhead"><h2 id="login-title">登录后使用</h2></div>
+      <form id="login-form">
+        <label for="username">账户名</label><input id="username" name="username" type="text" autocomplete="username" value="xin" maxlength="128" required>
+        <label for="password">密码</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024" required>
+        <button id="login-button" class="btn btn-primary login-submit" type="submit">登录</button>
+        <p id="login-message" class="message" role="status" aria-live="polite"></p>
+      </form>
+    </section>
+    <section id="workspace" hidden>
+      <nav class="shortcut-bar" aria-label="快捷链接"><div id="shortcut-links" class="shortcut-links"></div><button id="open-settings" class="btn btn-ghost btn-sm" type="button">＋ 链接与设置</button></nav>
+      <div class="zenbar"><label class="zenSwitch" id="zenSwitch" for="zenMode"><input type="checkbox" id="zenMode"><span class="dot" aria-hidden="true"></span><span>无感模式</span><span class="sub">复制链接 → 点页面空白处提取 → 再点一次复制</span></label></div>
+      <form id="extract-form" class="card">
+        <div class="cardhead"><h2>① 粘贴链接或文本</h2></div>
+        <div class="labelrow"><label for="url">链接 / 含链接的文本</label><span class="spacer"></span><button id="pasteBtn" class="btn btn-ghost btn-sm" type="button">📋 一键粘贴</button></div>
+        <textarea id="url" name="url" rows="3" maxlength="65536" placeholder="直接粘贴整段文字也行，例如：&#10;看到一篇讲得很清楚的文章 https://www.zhihu.com/question/28696373/answer/2835848212 推荐你看看"></textarea>
+        <p class="hint input-hint">自动识别知乎文章、回答、问题与 YouTube 链接；在页面下方添加网站规则，即可扩展支持其他网站。</p>
+        <div class="links" id="links" hidden><div class="linkshead" id="linkCount"></div><div class="chips" id="linkChips"></div></div>
+        <div class="row format-row"><div><label for="format">输出格式</label><select id="format"><option value="text" selected>纯文本（推荐，喂 LLM / 检索）</option><option value="markdown">Markdown（含格式）</option><option value="json">JSON（含元数据）</option></select></div><div class="image-options"><label class="image-option"><input id="keep-images" type="checkbox" checked>保留图片链接</label></div></div>
+        <div class="actions"><button id="extract-button" class="btn btn-primary" type="submit">提取文本</button><button id="oneClick" class="btn btn-ghost" type="button">⚡ 一键获取</button><button id="download" class="btn btn-ghost" type="button" disabled>下载</button><button id="reset" class="btn btn-ghost" type="button">清空</button><button id="cancel-extract" class="btn btn-ghost" type="button" hidden>取消请求</button><span id="status" class="status" role="status">就绪</span></div>
+        <p class="hint quick-hint">「一键获取」会读取剪贴板中的链接并立即提取；完成后再次点击即可复制正文。Ctrl / ⌘ + Enter 可提取输入框中的链接。</p>
+      </form>
+      <div id="extract-message" class="message extract-message" role="status" aria-live="polite"></div>
+      <section id="result" class="result" hidden aria-labelledby="result-heading"><div class="card"><div class="cardhead reshead"><h2 id="result-heading">② 提取结果</h2><span class="spacer"></span><a id="result-source" class="btn btn-ghost btn-sm" target="_blank" rel="noopener noreferrer" hidden>打开原文 ↗</a><button id="copy" class="btn btn-primary btn-sm" type="button" disabled>一键复制</button></div><div class="meta"><div>标题<b id="result-title"></b></div><div>作者 / 日期<b id="result-meta"></b></div></div><pre id="content" tabindex="0" aria-label="提取的内容"></pre></div></section>
+      <details id="cookie-panel" class="card cookiewrap">
+        <summary><span>知乎 Cookie</span><span id="cookie-badge" class="badge" data-state="unchecked">读取状态中</span><span class="chev" aria-hidden="true">▾</span></summary>
+        <div class="cookiebody"><div class="cookie-links">
+          <label>获取 Cookie 的页面（可修改，自动保存到本机浏览器）<input id="cookie-help-url" type="url" value="https://www.zhihu.com/commercial_api/banners_v3"><a id="cookie-help-link" class="hint" href="https://www.zhihu.com/commercial_api/banners_v3" target="_blank" rel="noopener noreferrer">点击打开知乎页面，登录后在开发者工具中获取 Cookie ↗</a></label>
+          <label>Cookie 测试回答（可修改，自动保存到本机浏览器）<input id="cookie-test-url" type="url" value="https://www.zhihu.com/question/30311473/answer/2093279761095209383"><a id="cookie-test-link" class="hint" href="https://www.zhihu.com/question/30311473/answer/2093279761095209383" target="_blank" rel="noopener noreferrer">点击查看测试回答 ↗</a></label>
+        </div><form id="cookie-form"><label class="sr-only" for="cookie-input">知乎 Cookie 请求头</label><textarea id="cookie-input" rows="3" maxlength="32768" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴整行 Cookie：d_c0=…; z_c0=…（留空则用服务器已保存的）"></textarea><p class="hint cookie-help">浏览器登录知乎 → <code>F12</code> → Network → 刷新 → 点任意请求 → Headers → 复制 <code>Cookie</code> 整行，务必含 <code>d_c0</code> 和 <code>z_c0</code>。输入后自动预验证，保存后其他浏览器可直接复用；已保存的 Cookie 不会回显。</p><div class="actions"><button id="save-cookie" class="btn btn-primary" type="submit">保存到服务器并自动测试</button><button id="test-cookie" class="btn btn-ghost" type="button" disabled>重新测试 Cookie</button><button id="remove-cookie" class="btn btn-ghost" type="button" disabled>删除服务器 Cookie</button></div><p id="cookie-message" class="message cookie-test-status" role="status" aria-live="polite"></p></form></div>
+      </details>
+      <details id="settings-panel" class="card cookiewrap">
+        <summary><span>链接与分流设置</span><span class="badge" id="settings-badge">读取中</span><span class="chev" aria-hidden="true">▾</span></summary>
+        <form id="settings-form" class="cookiebody">
+          <fieldset id="settings-fields" disabled>
+            <div class="settings-heading"><h3>快捷链接</h3><button id="add-shortcut" class="btn btn-ghost btn-sm" type="button">＋ 添加链接</button></div>
+            <p class="hint">将常用页面放在顶部，点击即可在新标签页打开。</p>
+            <div id="shortcut-editors" class="settings-list"></div>
+            <div class="settings-heading routes-heading"><h3>网站分流</h3><div class="settings-actions"><button id="youtube-preset" class="btn btn-ghost btn-sm" type="button">添加 YouTube 预设</button><button id="add-route" class="btn btn-ghost btn-sm" type="button">＋ 添加规则</button></div></div>
+            <p class="hint">填写网站域名和局域网 IP:端口即可，浏览器会将链接直接发送到该节点。节点统一接收 POST /extract、JSON 参数 url，并返回纯文本；知乎无需单独配置。</p>
+            <p id="network-hint" class="hint"></p>
+            <div id="route-editors" class="settings-list"></div>
+            <div class="actions"><button id="save-settings" class="btn btn-primary" type="submit">保存链接与规则</button><button id="reload-settings" class="btn btn-ghost" type="button">重新载入</button></div>
+            <p class="hint">无需节点密钥。局域网节点需允许本网站跨域访问；首次连接时，请允许浏览器访问本地网络。修改节点地址后页面会自动刷新，以应用连接权限。</p>
+          </fieldset>
+          <p id="settings-message" class="message" role="status" aria-live="polite"></p>
+        </form>
+      </details>
+    </section>
+    <footer>链接转文本 · 支持 Markdown / TXT / JSON</footer>
+    <noscript><p>请启用 JavaScript 后使用登录和提取功能。</p></noscript>
+  </main>
+</body>
+</html>
