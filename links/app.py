@@ -359,7 +359,7 @@ function esc(s) { const d = document.createElement("div"); d.textContent = s ?? 
 
 async function refresh() {
   const {data} = await api("api/session");
-  if (data.setup_required) {
+  if (!data.authenticated && data.setup_required) {
     $("setup-panel").hidden = false; $("login-panel").hidden = true; $("workspace").hidden = true;
     return;
   }
