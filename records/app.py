@@ -19,6 +19,7 @@ import auth
 import mod_audiom
 import mod_health
 import mod_history
+import mod_manuals
 import mod_snippets
 import mod_stats
 import mod_store
@@ -159,6 +160,7 @@ def _init_storage():
     mod_stats.init_db()
     mod_snippets.init_db()
     mod_history.init_db()
+    mod_manuals.init_db()
     mod_audiom.init_db()
     mod_store.init_db()
     mod_health.init_db()
@@ -279,6 +281,7 @@ INDEX_HTML = """<!doctype html>
     <a class="card" href="fuel"><div class="t">加油记录</div><div class="d">油量与里程，自动算油耗</div></a>
     <a class="card" href="history"><div class="t">历史快照</div><div class="d">生活切片照片，可选 AI 背景分析</div></a>
     <a class="card" href="audiom"><div class="t">录音备忘</div><div class="d">录音转文字与摘要（需转写接口）</div></a>
+    <a class="card" href="manuals"><div class="t">智能说明书</div><div class="d">说明书照片 AI 识别与标签（需 SiliconFlow 密钥）</div></a>
     <a class="card" href="snippets"><div class="t">片段库</div><div class="d">代码与文本片段</div></a>
     <a class="card" href="product"><div class="t">产品追踪</div><div class="d">通用追踪看板</div></a>
     <a class="card" href="supplies"><div class="t">日常物资</div><div class="d">物资清单与状态</div></a>
@@ -361,6 +364,19 @@ DATA_WIDGETS = {
     "exercise": {"mode": "kv", "title": "运动记录 · 配置进出口",
                  "note": "导出/导入运动配置（gym_cfg）。导入会覆盖当前配置。",
                  "kv_key": "gym_cfg", "filename": "gym-cfg-backup.json"},
+    "assert": {"mode": "tracker", "title": "资产看板 · 数据进出口",
+               "note": "导出为 JSON 备份；导入会整体替换当前看板数据，请先导出留底。",
+               "api": "tracker_data/sync/assets", "board": "assets"},
+    "product": {"mode": "store", "title": "产品追踪 · 数据进出口",
+                "note": "导出全部快照历史（通用存储）。导入会逐条追加快照，不去重，请先导出留底。",
+                "collection": "data_tracking", "filename": "data-tracking-backup.json"},
+    "supplies": {"mode": "store", "title": "日常物资 · 数据进出口",
+                 "note": "导出全部快照历史（通用存储）。导入会逐条追加快照，不去重，请先导出留底。",
+                 "collection": "daily_supplies", "filename": "supplies-backup.json"},
+    "manuals": {"mode": "api", "title": "智能说明书 · 数据进出口",
+                "note": "完整备份（含图片文件，体积可能较大）。导入按编号去重，不覆盖已有说明书。",
+                "export_path": "api/manuals/export", "import_path": "api/manuals/import",
+                "filename": "manuals-backup.json"},
 }
 
 DATA_WIDGET = """
@@ -411,6 +427,10 @@ DATA_WIDGET = """
         var v = await jget(root + "/api2/kv/" + CFG.kv_key);
         dlJson(CFG.filename, {format: "kv-backup", key: CFG.kv_key, payload: v});
         msg("配置已导出。");
+      } else if (CFG.mode === "store") {
+        var rows = await jget(root + "/api2/" + CFG.collection);
+        dlJson(CFG.filename, {format: "store-backup", collection: CFG.collection, exported_at: Math.floor(Date.now() / 1000), items: rows});
+        msg("已导出 " + rows.length + " 条快照。");
       } else {
         var r = await fetch(root + "/" + CFG.export_path, {cache: "no-store"});
         if (!r.ok) throw new Error("HTTP " + r.status);
@@ -435,6 +455,16 @@ DATA_WIDGET = """
         if (!confirm("导入将覆盖当前配置，确定继续？")) return;
         await jpost(root + "/api2/kv/" + CFG.kv_key, {payload: payload});
         msg("配置已导入，刷新页面查看。");
+      } else if (CFG.mode === "store") {
+        var sitems = Array.isArray(parsed) ? parsed : (parsed.items || []);
+        if (!sitems.length) throw new Error("备份里没有快照");
+        if (!confirm("导入将逐条追加 " + sitems.length + " 条快照（不去重），确定继续？")) return;
+        for (var i = 0; i < sitems.length; i++) {
+          var row = Object.assign({}, sitems[i]);
+          delete row._time;
+          await jpost(root + "/api2/" + CFG.collection, row);
+        }
+        msg("导入完成：追加 " + sitems.length + " 条快照，刷新页面查看。");
       } else {
         var d = await jpost(root + "/" + CFG.import_path, parsed);
         msg("导入完成：新增 " + (d.added || 0) + "，跳过 " + (d.skipped || 0) + "，刷新页面查看。");
@@ -625,6 +655,30 @@ def application(environ, start_response):
     if m and method == "DELETE":
         from urllib.parse import unquote
         return mod_audiom.delete_record(environ, start_response, unquote(m.group(1)))
+
+    # smart manuals (AI OCR)
+    if path == "/api/manuals" and method == "GET":
+        return mod_manuals.manuals_list(environ, start_response)
+    if path == "/api/manuals/upload" and method == "POST":
+        return mod_manuals.manuals_upload(environ, start_response)
+    if path == "/api/manuals/start" and method == "POST":
+        return mod_manuals.manuals_start(environ, start_response)
+    if path == "/api/manuals/retry" and method == "POST":
+        return mod_manuals.manuals_retry(environ, start_response)
+    if path == "/api/manuals/reanalyze" and method == "POST":
+        return mod_manuals.manuals_reanalyze(environ, start_response)
+    if path == "/api/manuals/export" and method == "GET":
+        return mod_manuals.manuals_export(environ, start_response)
+    if path == "/api/manuals/import" and method == "POST":
+        return mod_manuals.manuals_import(environ, start_response)
+    m = re.fullmatch(r"/api/manuals/img/([^/]+)", path)
+    if m and method == "GET":
+        from urllib.parse import unquote
+        return mod_manuals.manuals_img(environ, start_response, unquote(m.group(1)))
+    m = re.fullmatch(r"/api/manuals/([^/]+)", path)
+    if m and method == "DELETE":
+        from urllib.parse import unquote
+        return mod_manuals.manuals_delete(environ, start_response, unquote(m.group(1)))
 
     return json_response(start_response,
                          {"ok": False, "error": "not_found", "message": "接口不存在。"}, 404)

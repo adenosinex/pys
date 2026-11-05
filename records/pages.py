@@ -7034,4 +7034,544 @@ const PLANS = {
 </script>
 </body>
 </html>''',
+    'manuals': r'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<script>window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");</script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>智能说明书智库 限制分类</title>
+    <script src="static/cdn/tailwindcss3.4.js"></script>
+    <script src="static/cdn/marked.min.js"></script>
+    <link rel="stylesheet" href="static/cdn/viewer.min.css">
+    <style>
+        /* 基础与组件样式 */
+        .manual-img { 
+            transition: transform 0.3s ease; 
+            cursor: zoom-in;
+            /* 占位符样式 */
+            background: linear-gradient(45deg, #f0f0f0, #e0e0e0);
+        }
+        .prose table { border-collapse: collapse; width: 100%; margin: 1em 0; border: 1px solid #e5e7eb; }
+        .prose th, .prose td { border: 1px solid #e5e7eb; padding: 0.5rem; text-align: left; }
+        .prose th { background-color: #f9fafb; }
+        .custom-scrollbar::-webkit-scrollbar { height: 6px; width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 4px; }
+        .filter-tag { transition: all 0.2s ease-in-out; }
+        
+        /* 移动端视图控制 */
+        @media (max-width: 767px) {
+            #modalBody[data-view="text"] #modalImgContainer,
+            #modalBody[data-view="image"] #modalTextContainer { display: none; }
+        }
+
+        /* 覆盖 Viewer.js 移动端默认隐藏旋转按钮的策略 */
+        .viewer-rotate-left.viewer-hide-md-down,
+        .viewer-rotate-right.viewer-hide-md-down { display: block !important; }
+        .viewer-toolbar > ul > li { width: 32px !important; height: 32px !important; margin: 0 3px !important; }
+    </style>
+
+<style>
+  #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+  #authGate.show{display:flex}
+  #authGate .card{width:min(92vw,360px);background:#161a22;border:1px solid #232a37;border-radius:14px;padding:22px 20px;display:flex;flex-direction:column;gap:10px;color:#e6e8ee}
+  #authGate h2{margin:0 0 4px;font-size:16px}
+  #authGate p{margin:0;font-size:12px;color:#8b93a7;line-height:1.5}
+  #authGate .hint-row{font-size:14px}
+  #authGate .hint-row b{color:#ffd479;font-size:16px}
+  #authGate input{background:#0f1116;border:1px solid #232a37;color:inherit;padding:10px 12px;border-radius:10px;font:inherit;outline:none;width:100%;box-sizing:border-box}
+  #authGate input:focus{border-color:#3d6ea8}
+  #authGate .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+  #authGate .word-btn{flex:1 1 30%;background:#0f1116;color:#e6e8ee;border:1px solid #2b3444;border-radius:10px;padding:9px 4px;font:inherit;cursor:pointer}
+  #authGate .word-btn.sel{border-color:#2f6fd0;background:#1b2a44;color:#fff}
+  #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
+  #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
+</style>
+</head>
+<body class="bg-gray-50 min-h-screen font-sans">
+
+    <nav class="bg-white shadow-sm border-b border-gray-200 px-4 md:px-6 py-4 sticky top-0 z-40">
+        <div class="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center gap-4 justify-between">
+            <div class="flex items-center justify-between flex-1">
+                <h1 class="text-xl font-bold text-gray-800 tracking-tight flex-shrink-0 mr-6">📚 智能说明书</h1>
+                <button onclick="UploadCtrl.open()" class="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-2 px-4 rounded-full shadow-md transition-all flex items-center gap-1 shrink-0 md:order-last">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>批量录入
+                </button>
+                <div class="hidden md:block flex-1 max-w-xl mx-4">
+                    <input type="text" id="searchPc" class="w-full bg-gray-100 border-transparent focus:bg-white focus:border-blue-500 rounded-xl px-4 py-2.5 text-sm transition-all shadow-sm outline-none" placeholder="🔍 搜索全文或文件名..." oninput="handleSearch(this.value)">
+                </div>
+            </div>
+            <div class="md:hidden w-full">
+                <input type="text" id="searchMobile" class="w-full bg-gray-100 border-transparent focus:bg-white focus:border-blue-500 rounded-xl px-4 py-2.5 text-sm transition-all shadow-sm outline-none" placeholder="🔍 搜索全文或文件名..." oninput="handleSearch(this.value)">
+            </div>
+        </div>
+        <div class="max-w-7xl mx-auto mt-4 flex gap-2 items-center flex-wrap" id="tagFilterContainer"></div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-4 md:px-6 py-6">
+        <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-4 md:p-5 mb-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+            <div class="flex items-center gap-3">
+                <div class="bg-blue-50 p-2.5 rounded-xl text-blue-600 hidden sm:block">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                </div>
+                <div>
+                    <h3 class="text-sm font-bold text-gray-800">整体识别进度</h3>
+                    <p class="text-xs text-gray-500 mt-0.5">队列: <span id="queueCount" class="font-bold text-gray-700">0</span> | 执行中: <span id="processingCount" class="font-bold text-blue-600 animate-pulse">0</span></p>
+                </div>
+            </div>
+            <div class="flex items-center gap-3 sm:border-l sm:pl-6 border-gray-100 w-full sm:w-auto">
+                <div class="text-xs text-gray-500 font-mono bg-gray-50 px-3 py-2 rounded-lg w-full">
+                    最新耗时 -> 👁️ OCR: <span id="lastOcrTime" class="text-gray-800 font-bold">--</span> | 🧠 NLP: <span id="lastNlpTime" class="text-gray-800 font-bold">--</span>
+                </div>
+            </div>
+        </div>
+        <div id="gallery" class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 md:gap-6"></div>
+    </main>
+
+    <div id="uploadModal" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-[70] hidden flex items-center justify-center p-4">
+        <div class="bg-white w-full max-w-md rounded-3xl overflow-hidden flex flex-col shadow-2xl">
+            <div class="p-5 border-b flex justify-between items-center bg-gray-50/50">
+                <h3 class="font-bold text-gray-800 flex items-center gap-2">上传说明书</h3>
+                <button onclick="UploadCtrl.close()" class="text-gray-400 hover:text-gray-900 text-2xl leading-none">&times;</button>
+            </div>
+            <div class="p-6">
+                <div class="border-2 border-dashed border-blue-200 bg-blue-50/50 rounded-2xl p-8 text-center hover:bg-blue-50 hover:border-blue-400 transition-all cursor-pointer mb-4" onclick="$('fileInput').click()">
+                    <svg class="mx-auto h-12 w-12 text-blue-400 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
+                    <p class="text-sm font-semibold text-gray-700">点击选择图片</p>
+                    <input type="file" id="fileInput" accept="image/*" multiple class="hidden" onchange="UploadCtrl.handleSelect()">
+                </div>
+                <div id="fileListContainer" class="max-h-40 overflow-y-auto mb-4 hidden pr-1 custom-scrollbar">
+                    <ul id="fileList" class="space-y-2"></ul>
+                </div>
+                <button onclick="UploadCtrl.confirm()" id="btnConfirmStart" class="w-full bg-gray-300 text-gray-500 font-bold py-3.5 px-4 rounded-xl shadow-lg transition-all flex justify-center items-center disabled:opacity-50" disabled>等待选择...</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="tagsModal" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] hidden flex items-end md:items-center justify-center sm:p-4">
+        <div class="bg-white w-full max-w-3xl rounded-t-3xl sm:rounded-3xl flex flex-col shadow-2xl overflow-hidden">
+            <div class="p-5 border-b flex justify-between items-center bg-gray-50/50">
+                <h3 class="font-bold text-gray-800">全部分类字典</h3>
+                <button onclick="toggleModal('tagsModal', false)" class="text-gray-400 hover:text-gray-900 text-2xl leading-none">&times;</button>
+            </div>
+            <div class="p-6 overflow-y-auto max-h-[60vh] custom-scrollbar">
+                <div id="allTagsGrid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3"></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="detailModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-[80] hidden flex items-center justify-center md:p-4 transition-all">
+        <div class="bg-white w-full h-full md:h-[90vh] md:max-w-6xl md:rounded-3xl overflow-hidden flex flex-col shadow-2xl">
+            <div class="p-4 border-b flex justify-between items-center bg-gray-50/90 z-10">
+                <h3 class="font-bold text-gray-800 flex items-center gap-2 truncate pr-4">
+                    <svg class="w-4 h-4 text-blue-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                    <span id="modalTitle" class="truncate max-w-[200px] md:max-w-md"></span>
+                </h3>
+                <div class="flex items-center gap-3">
+                    <button onclick="copyDetailText()" id="copyBtnPc" class="text-xs font-bold text-blue-600 bg-white px-3 py-1.5 hover:bg-blue-50 rounded-lg border border-blue-200 transition-all hidden md:block">📋 复制</button>
+                    <button onclick="toggleModal('detailModal', false)" class="text-gray-500 hover:text-gray-900 bg-gray-200 hover:bg-gray-300 rounded-full w-8 h-8 flex items-center justify-center transition-colors">&times;</button>
+                </div>
+            </div>
+            <div class="md:hidden flex bg-gray-100 p-2 gap-2 border-b">
+                <button onclick="DetailCtrl.setView('text')" id="btnViewText" class="flex-1 py-1.5 bg-white shadow rounded-lg text-sm font-bold text-blue-600 transition-all">📄 识别文档</button>
+                <button onclick="DetailCtrl.setView('image')" id="btnViewImg" class="flex-1 py-1.5 text-gray-500 hover:bg-gray-200 rounded-lg text-sm font-bold transition-all">🖼️ 原始图片</button>
+            </div>
+            <div id="modalBody" data-view="text" class="flex-1 flex flex-col md:flex-row overflow-hidden bg-white">
+                <div id="modalImgContainer" class="w-full md:w-5/12 lg:w-1/2 h-full bg-gray-900 flex items-center justify-center border-r border-gray-200">
+                    <img id="modalDetailImg" src="" class="max-w-full max-h-full object-contain cursor-zoom-in">
+                </div>
+                <div id="modalTextContainer" class="w-full md:w-7/12 lg:w-1/2 h-full overflow-y-auto p-5 md:p-8 custom-scrollbar">
+                    <div id="modalContent" class="prose prose-blue prose-sm md:prose-base max-w-none text-gray-700 selection:bg-blue-100"></div>
+                </div>
+            </div>
+            <div class="md:hidden p-3 bg-gray-50 border-t flex justify-end" id="mobileFooter">
+                <button onclick="copyDetailText()" id="copyBtnMobile" class="text-sm font-bold text-white bg-blue-600 px-6 py-2.5 rounded-xl shadow w-full transition-all">📋 复制全文</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/viewerjs/1.11.3/viewer.min.js"></script>
+    <script>
+        // ================= 1. 状态与工具库 =================
+        const $ = id => document.getElementById(id);
+        const formatSec = v => v ? parseFloat(v).toFixed(2) + 's' : '--';
+        const toggleModal = (id, show) => { $(id).classList.toggle('hidden', !show); document.body.style.overflow = show ? 'hidden' : 'auto'; };
+        const apiCall = async (url, opts) => (await fetch(url, opts)).json();
+
+        let state = {
+            viewer: null, modalViewer: null, poll: null, searchTimeout: null,
+            data: [], activeTag: '全部', validIds: [],
+            // 新增滚动懒加载核心参数
+            filteredData: [], 
+            renderIndex: 0, 
+            chunkSize: 10, 
+            scrollObserver: null,
+            imageObserver: null
+        };
+
+        // 防抖搜索
+        const handleSearch = (val) => {
+            clearTimeout(state.searchTimeout);
+            state.searchTimeout = setTimeout(() => {
+                $('searchPc').value = $('searchMobile').value = val;
+                renderGallery();
+            }, 300);
+        };
+
+        // ================= 2. 图像处理引擎 =================
+        const calcHash = async file => {
+            const hashBuffer = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+            return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+        };
+
+        const compressImg = file => new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onerror = () => reject(new Error("读取失败"));
+            reader.onload = e => {
+                const img = new Image();
+                img.onerror = () => reject(new Error("解码失败"));
+                img.onload = () => {
+                    const MAX = 2048, MIN = 800;
+                    let w = img.width, h = img.height;
+                    
+                    if (h <= w * 2) {
+                        if (w > h && w > MAX) { h = Math.round(h * MAX / w); w = MAX; }
+                        else if (h > MAX) { w = Math.round(w * MAX / h); h = MAX; }
+                    } else {
+                        if (w < MIN) { h = Math.round(h * MIN / w); w = MIN; }
+                        if (h > MAX * 1.5) { w = Math.round(w * MAX * 1.5 / h); h = Math.round(MAX * 1.5); }
+                    }
+
+                    const cvs = document.createElement('canvas');
+                    cvs.width = w; cvs.height = h;
+                    const ctx = cvs.getContext('2d', { willReadFrequently: true });
+                    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+                    ctx.drawImage(img, 0, 0, w, h);
+
+                    const ext = (file.name.match(/\.[^/.]+$/) || ['.jpg'])[0];
+                    cvs.toBlob(b => b ? resolve(new File([b], file.name.replace(/\.[^/.]+$/, ext), { type: b.type })) : reject(new Error("转Blob失败")), 'image/webp', 0.85);
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        });
+
+        // ================= 3. 图片预加载与懒加载机制 =================
+        const initImageObserver = () => {
+            if (!state.imageObserver) {
+                state.imageObserver = new IntersectionObserver((entries, observer) => {
+                    entries.forEach(entry => {
+                        if (entry.isIntersecting) {
+                            const img = entry.target;
+                            const realSrc = img.dataset.src;
+                            const tempImg = new Image();
+                            tempImg.onload = () => {
+                                img.src = realSrc;
+                                img.classList.remove('lazy-loading');
+                                img.classList.add('loaded');
+                                observer.unobserve(img);
+                            };
+                            tempImg.onerror = () => {
+                                img.src = 'static/cdn/placeholder.svg';
+                                img.classList.remove('lazy-loading');
+                                observer.unobserve(img);
+                            };
+                            tempImg.src = realSrc;
+                        }
+                    });
+                }, { rootMargin: '50px', threshold: 0.01 });
+            }
+
+            // 对新添加的未观察的图片进行监听
+            document.querySelectorAll('.lazy-loading:not(.observed)').forEach(img => {
+                img.classList.add('observed');
+                state.imageObserver.observe(img);
+            });
+        };
+
+        // ================= 4. UI 与渲染逻辑 (分块渲染) =================
+        const renderTags = () => {
+            let total = 0, counts = {};
+            state.data.forEach(i => {
+                if (i.status === 'completed') {
+                    total++;
+                    (i.tags?.length ? i.tags : ['未分类']).forEach(t => counts[t] = (counts[t] || 0) + 1);
+                }
+            });
+
+            const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+            const top = sorted.slice(0, 5);
+            const activeCls = "bg-gray-900 text-white shadow-md", normalCls = "bg-white text-gray-600 border-gray-200 hover:bg-gray-100";
+            const getCls = t => state.activeTag === t ? activeCls : normalCls;
+
+            let topHtml = `<span class="filter-tag cursor-pointer px-4 py-1.5 rounded-full text-xs font-bold border ${getCls('全部')}" onclick="setFilter('全部')">全部 (${total})</span>`;
+            top.forEach(([t, c]) => topHtml += `<span class="filter-tag cursor-pointer px-4 py-1.5 rounded-full text-[11px] font-bold border ${getCls(t)}" onclick="setFilter('${t}')">${t} <span class="opacity-60 ml-0.5">${c}</span></span>`);
+            if (sorted.length > 5) topHtml += `<button onclick="toggleModal('tagsModal', true)" class="px-3 py-1.5 rounded-full text-[11px] font-bold border bg-blue-50 text-blue-600 border-blue-100">更多 (${sorted.length})</button>`;
+            $('tagFilterContainer').innerHTML = topHtml;
+
+            const gridCls = t => state.activeTag === t ? "bg-blue-600 text-white" : "bg-gray-50 text-gray-700 hover:bg-gray-100";
+            let gridHtml = `<div class="cursor-pointer px-4 py-3 rounded-2xl text-sm font-bold border flex justify-between items-center ${gridCls('全部')}" onclick="setFilter('全部'); toggleModal('tagsModal', false);"><span>全部档案</span> <span class="bg-black/10 px-2 py-0.5 rounded-full text-xs">${total}</span></div>`;
+            sorted.forEach(([t, c]) => gridHtml += `<div class="cursor-pointer px-4 py-3 rounded-2xl text-sm font-bold border flex justify-between items-center ${gridCls(t)}" onclick="setFilter('${t}'); toggleModal('tagsModal', false);"><span class="truncate pr-2">${t}</span><span class="bg-black/10 px-2 py-0.5 rounded-full text-xs">${c}</span></div>`);
+            $('allTagsGrid').innerHTML = gridHtml;
+        };
+
+        const renderGallery = () => {
+            const kw = $('searchPc').value.toLowerCase();
+            
+            // 过滤并存储到 state.filteredData 以备分块渲染
+            state.filteredData = state.data.filter(i => {
+                const text = (i.ocr_text || "") + (i.tags?.join(' ') || "") + (i.filename || "");
+                return text.toLowerCase().includes(kw) && (state.activeTag === '全部' || i.tags?.includes(state.activeTag));
+            });
+
+            // 检查整体是否有处于处理中状态的数据用于轮询判断
+            const needPoll = state.filteredData.some(i => ['pending', 'pending_ocr', 'processing_ocr', 'pending_nlp', 'processing_nlp'].includes(i.status));
+
+            // 初始化渲染状态，清空画板
+            state.renderIndex = 0;
+            $('gallery').innerHTML = '';
+            
+            // 开始渲染第一块 DOM
+            renderNextChunk();
+            
+            return needPoll;
+        };
+
+        const renderNextChunk = () => {
+            if (state.renderIndex >= state.filteredData.length) return;
+
+            // 截取接下来 10 条数据
+            const chunk = state.filteredData.slice(state.renderIndex, state.renderIndex + state.chunkSize);
+            
+            const html = chunk.map(i => {
+                const sMap = { 'pending': '排队中...', 'pending_ocr': '准备提取...', 'processing_ocr': '👁️ 提取中...', 'pending_nlp': '等待分类...', 'processing_nlp': '🧠 分类中...' };
+                const fMap = { 'failed': '❌ 失败', 'ocr_failed': '❌ 提取失败', 'nlp_failed': '⚠️ 分类失败' };
+                const overlay = sMap[i.status] ? `<div class="absolute inset-0 bg-black/60 backdrop-blur flex items-center justify-center text-xs text-white font-bold animate-pulse tracking-widest">${sMap[i.status]}</div>` : 
+                                fMap[i.status] ? `<div class="absolute inset-0 bg-red-900/60 backdrop-blur flex items-center justify-center text-xs text-white font-bold tracking-widest">${fMap[i.status]}</div>` : '';
+                
+                const tags = (i.tags || []).map(t => `<span class="bg-gray-100 text-gray-600 text-[9px] px-1.5 py-0.5 rounded border truncate max-w-[60px]">${t}</span>`).join('');
+                const disabled = !['completed', 'nlp_failed'].includes(i.status) ? 'disabled' : '';
+
+                return `
+                <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden flex flex-col group relative hover:shadow-xl hover:-translate-y-1 transition-all gallery-item">
+                    <button class="absolute top-2 left-2 z-10 opacity-0 group-hover:opacity-100 bg-white/90 shadow rounded-full p-2 text-red-500 hover:bg-red-50" onclick="DocCtrl.del('${i.id}')" title="删除"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg></button>
+                    <button class="absolute top-2 right-12 z-10 opacity-0 group-hover:opacity-100 bg-white/90 shadow rounded-full p-2 text-purple-600 hover:bg-purple-50" onclick="DocCtrl.reanalyze('${i.id}')" title="重分类"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"/></svg></button>
+                    <button class="absolute top-2 right-2 z-10 opacity-0 group-hover:opacity-100 bg-white/90 shadow rounded-full p-2 text-blue-500 hover:bg-blue-50" onclick="DocCtrl.retry('${i.id}')" title="全量重试"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg></button>
+                    <div class="relative h-32 sm:h-44 overflow-hidden bg-gray-50">
+                        <img data-src="${API_BASE + '/' + i.url}" class="w-full h-full object-cover lazy-loading manual-img">
+                        ${overlay}
+                    </div>
+                    <div class="p-3 sm:p-4 flex-1 flex flex-col">
+                        <div class="text-[11px] font-bold text-gray-700 truncate mb-2">📄 ${i.filename}</div>
+                        <div class="flex flex-wrap gap-1 mb-2 h-6 overflow-hidden">${tags}</div>
+                        <button onclick="DetailCtrl.show('${i.id}')" class="mt-auto w-full py-2 bg-blue-50/50 hover:bg-blue-600 hover:text-white text-blue-600 text-[11px] font-bold rounded-xl border border-blue-100 transition-all disabled:opacity-50" ${disabled}>查看文档</button>
+                        <div class="mt-3 pt-3 border-t text-[9px] text-gray-400 flex justify-between font-mono"><span>👁️ ${formatSec(i.metrics?.ocr_sec)}</span><span>🧠 ${formatSec(i.metrics?.nlp_sec)}</span></div>
+                    </div>
+                </div>`;
+            }).join('');
+
+            // 向画板追加新DOM
+            $('gallery').insertAdjacentHTML('beforeend', html);
+            state.renderIndex += state.chunkSize;
+
+            // 重新初始化懒加载图片监听和 Viewer 预览控件
+            initImageObserver();
+            
+            if (state.viewer) state.viewer.destroy();
+            state.viewer = new Viewer($('gallery'), { 
+                filter: img => img.classList.contains('manual-img'),
+                navbar: true, title: true, 
+                toolbar: { zoomIn: 1, zoomOut: 1, oneToOne: 1, reset: 1, rotateLeft: 1, rotateRight: 1 } 
+            });
+
+            // 核心：设置滑动触底触发下一块渲染
+            if (state.scrollObserver) state.scrollObserver.disconnect();
+            if (state.renderIndex < state.filteredData.length) {
+                state.scrollObserver = new IntersectionObserver((entries) => {
+                    if (entries[0].isIntersecting) {
+                        state.scrollObserver.disconnect();
+                        renderNextChunk();
+                    }
+                }, { rootMargin: '300px' }); // 距离底部300px提前触发，保证丝滑
+                
+                const children = $('gallery').children;
+                if (children.length > 0) {
+                    // 监听当前已渲染的最后一张卡片
+                    state.scrollObserver.observe(children[children.length - 1]);
+                }
+            }
+        };
+
+        const updateStats = () => {
+            $('queueCount').innerText = state.data.filter(m => m.status.startsWith('pending')).length;
+            $('processingCount').innerText = state.data.filter(m => m.status.startsWith('processing')).length;
+            const completed = state.data.filter(m => m.status === 'completed');
+            if (completed.length) {
+                $('lastOcrTime').innerText = formatSec(completed[0].metrics?.ocr_sec);
+                $('lastNlpTime').innerText = formatSec(completed[0].metrics?.nlp_sec);
+            }
+        };
+
+        // ================= 5. 控制与交互流 =================
+        const setFilter = t => { state.activeTag = t; renderTags(); renderGallery(); };
+        const pollCtrl = () => { clearInterval(state.poll); state.poll = setInterval(async () => { if (!(await loadData())) clearInterval(state.poll); }, 3000); };
+        
+        const loadData = async () => {
+            state.data = await apiCall(API_BASE + '/api/manuals');
+            renderTags(); updateStats(); return renderGallery();
+        };
+
+        const UploadCtrl = {
+            open: () => { toggleModal('uploadModal', true); $('fileListContainer').classList.add('hidden'); UploadCtrl.setBtn(false, '等待选择...'); },
+            close: () => toggleModal('uploadModal', false),
+            setBtn: (enabled, txt) => { const b = $('btnConfirmStart'); b.disabled = !enabled; b.innerHTML = txt; b.className = enabled ? "w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3.5 px-4 rounded-xl shadow-lg transition-all" : "w-full bg-gray-300 text-gray-500 font-bold py-3.5 px-4 rounded-xl cursor-not-allowed"; },
+            handleSelect: async () => {
+                const files = $('fileInput').files; if(!files.length) return;
+                $('fileListContainer').classList.remove('hidden'); $('fileList').innerHTML = ''; state.validIds = [];
+                UploadCtrl.setBtn(false, `<span class="animate-pulse">校验处理中...</span>`);
+
+                Array.from(files).forEach((f, i) => $('fileList').innerHTML += `<li id="fi-${i}" class="bg-blue-50 p-2.5 rounded-xl border border-blue-200 flex justify-between items-center"><span class="text-xs truncate max-w-[200px]">${f.name}</span><span id="fs-${i}" class="text-[10px] text-blue-500 animate-pulse">校验中...</span></li>`);
+
+                for (let i = 0; i < files.length; i++) {
+                    const li = $(`fi-${i}`), s = $(`fs-${i}`);
+                    try {
+                        const fd = new FormData();
+                        fd.append('file', await compressImg(files[i]));
+                        fd.append('original_hash', await calcHash(files[i]));
+                        fd.append('original_filename', files[i].name);
+                        const res = await fetch(API_BASE + '/api/manuals/upload', { method: 'POST', body: fd }).then(r => r.json());
+                        
+                        if(res.status === 'duplicate') { li.className = "bg-amber-50 p-2.5 rounded-xl border border-amber-200 flex justify-between"; s.className = "text-[10px] text-amber-600 font-bold bg-amber-100 px-2 rounded"; s.innerText = "🔁 拦截"; } 
+                        else if (res.status === 'success') { li.className = "bg-green-50 p-2.5 rounded-xl border border-green-300 flex justify-between"; s.className = "text-[10px] text-green-600 font-bold bg-green-100 px-2 rounded"; s.innerText = "✅ 就绪"; state.validIds.push(res.id); }
+                    } catch(e) { li.className = "bg-red-50 p-2.5 rounded-xl border border-red-300 flex justify-between"; s.className = "text-[10px] text-red-600 font-bold bg-red-100 px-2 rounded"; s.innerText = "❌ 失败"; }
+                }
+                state.validIds.length ? UploadCtrl.setBtn(true, `🚀 开始数字化 (${state.validIds.length} 张)`) : setTimeout(UploadCtrl.close, 2000);
+                $('fileInput').value = '';
+            },
+            confirm: async () => {
+                if(!state.validIds.length) return;
+                UploadCtrl.setBtn(false, `<span class="animate-pulse">推送中...</span>`);
+                await fetch(API_BASE + '/api/manuals/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ids: state.validIds}) });
+                UploadCtrl.close(); loadData(); pollCtrl();
+            }
+        };
+
+        const DocCtrl = {
+            del: async (id) => { if(confirm("⚠️ 永久删除此说明书？")) { event.stopPropagation(); await fetch(API_BASE + `/api/manuals/${id}`, { method: 'DELETE' }); loadData(); }},
+            retry: async (id) => { event.stopPropagation(); await fetch(API_BASE + '/api/manuals/retry', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id}) }); loadData(); pollCtrl(); },
+            reanalyze: async (id) => { event.stopPropagation(); await fetch(API_BASE + '/api/manuals/reanalyze', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id}) }); loadData(); pollCtrl(); }
+        };
+
+        const DetailCtrl = {
+            show: id => {
+                const item = state.data.find(m => m.id === id); if (!item) return;
+                $('modalTitle').innerText = item.filename;
+                $('modalContent').innerHTML = marked.parse(item.ocr_text || "提取中...");
+                $('modalDetailImg').dataset.src = API_BASE + '/' + item.url;
+                DetailCtrl.setView('text');
+                
+                const tempImg = new Image();
+                tempImg.onload = () => { $('modalDetailImg').src = API_BASE + '/' + item.url; };
+                tempImg.onerror = () => { $('modalDetailImg').src = 'static/cdn/placeholder.svg'; };
+                tempImg.src = API_BASE + '/' + item.url;
+                
+                if(state.modalViewer) state.modalViewer.destroy();
+                state.modalViewer = new Viewer($('modalDetailImg'), { 
+                    navbar: false, title: false, 
+                    toolbar: { zoomIn: 1, zoomOut: 1, oneToOne: 1, reset: 1, rotateLeft: 1, rotateRight: 1 }
+                });
+                toggleModal('detailModal', true);
+            },
+            setView: v => {
+                $('modalBody').setAttribute('data-view', v);
+                const active = "flex-1 py-1.5 bg-white shadow rounded-lg text-sm font-bold text-blue-600",
+                      normal = "flex-1 py-1.5 text-gray-500 hover:bg-gray-200 rounded-lg text-sm font-bold";
+                $('btnViewImg').className = v === 'image' ? active : normal;
+                $('btnViewText').className = v === 'text' ? active : normal;
+                $('mobileFooter').classList.toggle('hidden', v === 'image');
+            }
+        };
+
+        const copyDetailText = () => {
+            navigator.clipboard.writeText($('modalContent').innerText);
+            ['copyBtnPc', 'copyBtnMobile'].forEach(id => { if($(id)) $(id).innerText = "✅ 已复制"; });
+            setTimeout(() => { if($('copyBtnPc')) $('copyBtnPc').innerText = "📋 复制"; if($('copyBtnMobile')) $('copyBtnMobile').innerText = "📋 复制全文"; }, 2000);
+        };
+
+        // ================= 6. 初始化 =================
+        loadData();
+    </script>
+
+<div id="authGate">
+  <div class="card">
+    <h2>记录台 · 验证</h2>
+    <p>弱服务独立验证：看提示词，想起同一行的三个词，输入中间的词，再点中最后一个词。有控制台会话时刷新即可直接进入，不必过这一关。</p>
+    <div class="hint-row">提示：<b id="chHint">…</b></div>
+    <input id="chInput" placeholder="输入中间的词" maxlength="64" autocomplete="off">
+    <div class="btn-row" id="chButtons"></div>
+    <div class="err" id="authErr"></div>
+    <button id="chGo" type="button">进入</button>
+  </div>
+</div>
+<script>
+(function(){
+  "use strict";
+  var BASE = window.API_BASE || location.pathname.replace(/\/[^/]*$/, "");
+  var cid = null, selToken = null;
+  function loadChallenge(){
+    document.getElementById("authErr").textContent = "";
+    document.getElementById("chInput").value = "";
+    selToken = null;
+    fetch(BASE + "/api/challenge", {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        cid = d.challenge_id;
+        document.getElementById("chHint").textContent = d.hint;
+        var box = document.getElementById("chButtons");
+        box.innerHTML = "";
+        (d.buttons || []).forEach(function(b){
+          var btn = document.createElement("button");
+          btn.type = "button"; btn.className = "word-btn"; btn.textContent = b.label;
+          btn.addEventListener("click", function(){
+            selToken = b.token;
+            Array.prototype.forEach.call(box.children, function(c){ c.classList.remove("sel"); });
+            btn.classList.add("sel");
+          });
+          box.appendChild(btn);
+        });
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "挑战加载失败，请刷新重试"; });
+  }
+  function showGate(){
+    document.getElementById("authGate").classList.add("show");
+    loadChallenge();
+  }
+  fetch(BASE + "/api/session", {cache:"no-store"})
+    .then(function(r){ return r.json(); })
+    .then(function(s){ if(!s.authenticated) showGate(); })
+    .catch(function(){ showGate(); });
+  document.getElementById("chGo").addEventListener("click", function(){
+    if(!cid){ return; }
+    if(!selToken){ document.getElementById("authErr").textContent = "请先点中正确的词按钮"; return; }
+    fetch(BASE + "/api/challenge", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({challenge_id: cid, token: selToken,
+                            input: document.getElementById("chInput").value})
+    }).then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
+      .then(function(res){
+        if(res.ok){ location.reload(); }
+        else{
+          document.getElementById("authErr").textContent = (res.d && res.d.message) || "验证失败，请重试";
+          loadChallenge();
+        }
+      })
+      .catch(function(){ document.getElementById("authErr").textContent = "网络错误，请重试"; });
+  });
+  document.getElementById("chInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); document.getElementById("chGo").click(); }
+  });
+})();
+</script>
+</body>
+</html>''',
 }
