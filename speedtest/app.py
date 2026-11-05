@@ -1414,6 +1414,7 @@ async function pingTest(){
 async function downStep(n,onprog){
   const t0=performance.now();let got=0,firstT=0,firstB=0;
   const r=await fetch("api/dl?bytes="+n,{cache:"no-store"});
+  if(!r.ok)throw new Error("下载被拒（HTTP "+r.status+"）");
   const rd=r.body.getReader();
   while(true){
     const {done,value}=await rd.read();
@@ -1452,7 +1453,9 @@ function upStep(n){
     const t0=performance.now();
     const x=new XMLHttpRequest();
     x.open("POST","api/up");
-    x.onload=()=>{const secs=(performance.now()-t0)/1000;
+    x.onload=()=>{if(x.status!==200){
+        rej(new Error("上传被拒（HTTP "+x.status+"）"));return;}
+      const secs=(performance.now()-t0)/1000;
       res({mbps:n*8/secs/1e6,bytes:n});};
     x.onerror=()=>rej(new Error("上传中断"));
     x.send(new Blob(parts));

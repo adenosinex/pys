@@ -40,6 +40,7 @@ def _state_dir():
 _state = _state_dir()
 os.environ.setdefault("COOKIE_STATE_FILE", os.path.join(_state, "cookie-state.json"))
 os.environ.setdefault("APP_SETTINGS_FILE", os.path.join(_state, "site-settings.json"))
+os.environ.setdefault("BILI_COOKIE_STATE_FILE", os.path.join(_state, "bili-cookie-state.json"))
 
 try:
     from app import app as _inner_app

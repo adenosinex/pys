@@ -27,6 +27,8 @@ import html
 import http.client
 import json
 import os
+import queue
+import random
 import re
 import secrets
 import shutil
@@ -57,14 +59,18 @@ DB_PATH = os.path.join(DATA_DIR, "vidlib.db")
 THUMB_DIR = os.path.join(DATA_DIR, "thumbs")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 STAGING_DIR = os.path.join(RUNTIME_DIR, "staging")
+CACHE_DIR = os.path.join(RUNTIME_DIR, "cache")
 CRED_PATH = os.path.join(DATA_DIR, "credentials.json")
-for _d in (DATA_DIR, THUMB_DIR, BACKUP_DIR, STAGING_DIR):
+for _d in (DATA_DIR, THUMB_DIR, BACKUP_DIR, STAGING_DIR, CACHE_DIR):
     os.makedirs(_d, exist_ok=True)
 
 PUBLIC_VIDEO_BASE = os.environ.get("VIDLIB_PUBLIC_BASE",
                                    "https://debi.su7.dpdns.org")
 CHUNK_BYTES = 8 * 1024 * 1024
 STAGING_BUDGET = 4 * 1024 * 1024 * 1024
+SHORT_MAX_BYTES = 32 * 1024 * 1024
+FULL_HASH_MAX = 32 * 1024 * 1024
+CACHE_BUDGET_BYTES = 1 * 1024 * 1024 * 1024
 DISK_MIN_FREE = 6 * 1024 * 1024 * 1024
 ORPHAN_GRACE = 7 * 24 * 3600
 VIDEO_EXTS = {"mp4", "mkv", "webm", "mov", "m4v", "avi", "ts", "flv",
@@ -174,6 +180,23 @@ def init_db():
                          row["source"], row["play_pos"], row["play_count"],
                          row["created_at"], row["updated_at"]))
             conn.execute("ALTER TABLE videos RENAME TO videos_legacy")
+        _ecols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(entries)")}
+        if "seen_at" not in _ecols:
+            conn.execute(
+                "ALTER TABLE entries ADD COLUMN seen_at "
+                "REAL DEFAULT 0")
+            conn.execute(
+                "UPDATE entries SET seen_at = updated_at "
+                "WHERE play_count > 0")
+        if "mark" not in _ecols:
+            conn.execute(
+                "ALTER TABLE entries ADD COLUMN mark "
+                "INTEGER NOT NULL DEFAULT 0")
+        if "mark_at" not in _ecols:
+            conn.execute(
+                "ALTER TABLE entries ADD COLUMN mark_at "
+                "REAL DEFAULT 0")
 
 
 init_db()
@@ -416,6 +439,29 @@ def _sha256_file(path):
     return h.hexdigest()
 
 
+_SAMPLE = 1024 * 1024
+
+
+def _file_digest(path):
+    """Dedupe key for a staged file. Up to FULL_HASH_MAX the
+    file is hashed in full (exact dedupe). Above that, a
+    sampled digest - the size plus the first, middle and last
+    1 MiB - keeps ingest CPU flat (~0.03 s) instead of ~7 s
+    per GiB on this single-core box. A false duplicate would
+    need the same size AND identical content at all three
+    sample points."""
+    size = os.path.getsize(path)
+    if size <= FULL_HASH_MAX:
+        return _sha256_file(path)
+    h = hashlib.sha256()
+    h.update(str(size).encode())
+    with open(path, "rb") as fh:
+        for off in (0, (size - _SAMPLE) // 2, size - _SAMPLE):
+            fh.seek(off)
+            h.update(fh.read(_SAMPLE))
+    return h.hexdigest()
+
+
 def _probe(path):
     try:
         out = subprocess.run(
@@ -563,6 +609,38 @@ def insert_entry(hash_, title, folder, tags="", source=""):
         return cur.lastrowid
 
 
+def _mark_filename(row):
+    name = row["title"] or row["hash"]
+    if row["ext"]:
+        name += "." + row["ext"]
+    return name
+
+
+def _sync_mark_files():
+    """Rewrite likes.txt / dislikes.txt in DATA_DIR from the DB:
+    one line per marked entry, "<hash>  <original filename>",
+    in the order the marks were made.  Best-effort export; the
+    entries table stays the source of truth."""
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT e.hash AS hash, e.title AS title, "
+                "f.ext AS ext, e.mark AS mark FROM entries e "
+                "JOIN files f ON f.hash = e.hash "
+                "WHERE e.mark IN (1, 2) "
+                "ORDER BY e.mark_at ASC, e.id ASC").fetchall()
+        for mark, fname in ((1, "likes.txt"), (2, "dislikes.txt")):
+            lines = ["%s  %s" % (r["hash"], _mark_filename(r))
+                     for r in rows if r["mark"] == mark]
+            path = os.path.join(DATA_DIR, fname)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write("".join(line + "\n" for line in lines))
+            os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 def delete_entry(entry_id):
     with _db() as conn:
         row = conn.execute("SELECT hash FROM entries WHERE id = ?",
@@ -576,12 +654,138 @@ def delete_entry(entry_id):
             conn.execute(
                 "UPDATE files SET orphaned_at = ? WHERE hash = ? "
                 "AND orphaned_at = 0", (time.time(), row["hash"]))
+    _sync_mark_files()
     return True
 
 
 def _local_path(file_row):
     return os.path.join(STAGING_DIR,
                         file_row["hash"] + "." + (file_row["ext"] or "mp4"))
+
+
+_warm_lock = threading.Lock()
+_warm_queue = queue.Queue()
+_warm_pending = set()
+_warm_started = False
+
+
+def _cache_path(file_row):
+    return os.path.join(
+        CACHE_DIR,
+        file_row["hash"] + "." + (file_row["ext"] or "mp4"))
+
+
+def _cache_file(file_row):
+    p = _cache_path(file_row)
+    return p if os.path.exists(p) else None
+
+
+def _cache_enforce():
+    """Threshold maintenance: while the cache is UNDER the budget
+    nothing is touched at all. Only when over budget, evict LRU
+    (oldest mtime first) in one batch down to 90% of the budget,
+    so the cache does not hover at the line being nudged file by
+    file."""
+    try:
+        files, total = [], 0
+        for name in os.listdir(CACHE_DIR):
+            if name.endswith(".tmp"):
+                continue
+            p = os.path.join(CACHE_DIR, name)
+            try:
+                st = os.stat(p)
+            except Exception:
+                continue
+            files.append((st.st_mtime, st.st_size, p))
+            total += st.st_size
+        if total <= CACHE_BUDGET_BYTES:
+            return
+        target = CACHE_BUDGET_BYTES * 9 // 10
+        files.sort()
+        for _mt, size, p in files:
+            if total <= target:
+                break
+            try:
+                os.unlink(p)
+                total -= size
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _cache_keep_local(file_row, local):
+    """After archiving, keep a short video's local copy in the
+    cache instead of deleting it: the feed's fast path."""
+    try:
+        if (int(file_row["size"] or 0) <= SHORT_MAX_BYTES
+                and os.path.exists(local)):
+            os.replace(local, _cache_path(file_row))
+            _cache_enforce()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _cache_download(file_row):
+    tmp = _cache_path(file_row) + ".tmp"
+    try:
+        url = resolve_loopback_url(file_row)
+        with urllib.request.urlopen(url, timeout=300) as resp, \
+                open(tmp, "wb") as fh:
+            shutil.copyfileobj(resp, fh, 262144)
+        if os.path.getsize(tmp) == int(file_row["size"] or 0):
+            os.replace(tmp, _cache_path(file_row))
+        else:
+            os.unlink(tmp)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+
+def _warm_loop():
+    """One background worker draining the warm queue sequentially
+    (batched updates: no parallel Drive pulls competing with
+    playback). Cache maintenance runs once per drained batch."""
+    while True:
+        file_row = _warm_queue.get()
+        with _warm_lock:
+            _warm_pending.discard(file_row["hash"])
+        try:
+            if not _cache_file(file_row):
+                _cache_download(file_row)
+        except Exception:
+            pass
+        if _warm_queue.empty():
+            _cache_enforce()
+
+
+def _cache_warm(file_row):
+    """Queue an archived short video for background caching.
+    Callers only enqueue; the single worker downloads in order."""
+    global _warm_started
+    if file_row["status"] != "archived":
+        return
+    if int(file_row["size"] or 0) > SHORT_MAX_BYTES:
+        return
+    if _cache_file(file_row):
+        return
+    h = file_row["hash"]
+    with _warm_lock:
+        if h in _warm_pending:
+            return
+        _warm_pending.add(h)
+        start = not _warm_started
+        _warm_started = True
+    _warm_queue.put({"hash": h, "ext": file_row["ext"],
+                     "size": file_row["size"],
+                     "gpath": file_row["gpath"],
+                     "status": "archived"})
+    if start:
+        threading.Thread(target=_warm_loop, daemon=True).start()
 
 
 def ingest_staged_file(staged_path, display_name, folder=None, tags="",
@@ -594,7 +798,7 @@ def ingest_staged_file(staged_path, display_name, folder=None, tags="",
     if os.path.getsize(staged_path) == 0:
         os.unlink(staged_path)
         raise ValueError("空文件（0 字节），已忽略。")
-    digest = _sha256_file(staged_path)
+    digest = _file_digest(staged_path)
     orig = display_name or "video.mp4"
     ext = ""
     if "." in orig:
@@ -641,7 +845,37 @@ _uploads_lock = threading.Lock()
 UPLOAD_CHUNK = 8 * 1024 * 1024
 
 
-def upload_init(name, size, title, tags, source):
+def _merge_chute(tags, relpath):
+    """Append the folder-path tag derived from a relative path
+    (the DAV chute convention), if any."""
+    chute = ""
+    if relpath:
+        segs = [seg for seg in str(relpath).replace("\\", "/")
+                .split("/") if seg][:-1]
+        chute = "/".join(segs)[:120]
+    if chute:
+        tags = ((tags + ",") if tags else "") + chute
+    return tags
+
+
+def register_dup(digest, name, tags, source):
+    """Create an entry for an already-stored file without any
+    upload (the client-side precheck's fast path). Mirrors the
+    duplicate branch of ingest_staged_file."""
+    if get_file(digest) is None:
+        return None
+    title = os.path.splitext(name or "")[0] or digest[:8]
+    now = time.time()
+    with _db() as conn:
+        conn.execute(
+            "UPDATE files SET dup_count = dup_count + 1, "
+            "orphaned_at = 0, updated_at = ? WHERE hash = ?",
+            (now, digest))
+    return insert_entry(digest, title, _folder_of(now), tags, source)
+
+
+def upload_init(name, size, title, tags, source, relpath=""):
+    tags = _merge_chute(tags, relpath)
     size = int(size or 0)
     if size <= 0:
         raise ValueError("文件大小无效。")
@@ -696,6 +930,148 @@ def upload_complete(uid):
 
 # ------------------------------------------------------------- worker
 
+# ------------------------------------------- Drive direct verify
+# Verifying an upload through AList means listing the whole
+# /videos folder (1500+ objects and growing) once per check -
+# several listings per archived file, each costing many seconds,
+# and the listing still lags a just-finished upload, so files
+# were re-uploaded or written off as unconfirmable. The Drive
+# API answers the same question with one targeted name query,
+# so verification goes straight there. AList keeps its link-
+# source role (uploads and signed URLs) untouched.
+
+_DRIVE = {"token": "", "at": 0.0}
+_DRIVE_LOCK = threading.Lock()
+
+
+class _DriveError(Exception):
+    pass
+
+
+def _drive_token():
+    with _DRIVE_LOCK:
+        if _DRIVE["token"] and time.time() - _DRIVE["at"] < 3000:
+            return _DRIVE["token"]
+        refresh = _cred("google_refresh_token")
+        client_id = _cred("google_client_id")
+        client_secret = _cred("google_client_secret")
+        if not (refresh and client_id and client_secret):
+            raise _DriveError("谷歌凭据未配置完整。")
+        body = urllib.parse.urlencode({
+            "client_id": client_id, "client_secret": client_secret,
+            "refresh_token": refresh,
+            "grant_type": "refresh_token"}).encode()
+        req = urllib.request.Request(
+            "https://oauth2.googleapis.com/token", data=body,
+            headers={"Content-Type":
+                     "application/x-www-form-urlencoded"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8",
+                                                     "replace"))
+        except Exception as exc:
+            raise _DriveError("谷歌令牌刷新失败：%s" % str(exc)[:100])
+        token = data.get("access_token")
+        if not token:
+            raise _DriveError("谷歌令牌刷新失败：无 access_token。")
+        _DRIVE["token"] = token
+        _DRIVE["at"] = time.time()
+        return token
+
+
+def _drive_list(q):
+    """One Drive files.list call; returns the files array."""
+    params = urllib.parse.urlencode({
+        "q": q, "fields": "files(id,name,size)", "spaces": "drive",
+        "pageSize": "10"})
+    url = "https://www.googleapis.com/drive/v3/files?" + params
+    for attempt in (1, 2):
+        req = urllib.request.Request(
+            url, headers={"Authorization": "Bearer " + _drive_token()})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8",
+                                                     "replace"))
+            return data.get("files") or []
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401 and attempt == 1:
+                with _DRIVE_LOCK:
+                    _DRIVE["token"] = ""
+                continue
+            raise _DriveError("Drive 查询失败：HTTP %s" % exc.code)
+        except _DriveError:
+            raise
+        except Exception as exc:
+            raise _DriveError("Drive 查询失败：%s" % str(exc)[:100])
+    return []
+
+
+def _drive_videos_dir():
+    """Drive id of the /videos folder under the configured root
+    folder, cached in kv. None when it cannot be determined;
+    callers then query by the (globally unique) hash name alone."""
+    cached = kv_get("drive_videos_dir_id")
+    if cached:
+        return cached
+    root = _cred("google_root_folder_id")
+    if not root:
+        return None
+    q = ("name = 'videos' and '%s' in parents and "
+         "mimeType = 'application/vnd.google-apps.folder' "
+         "and trashed = false" % root)
+    try:
+        files = _drive_list(q)
+    except _DriveError:
+        return None
+    if not files:
+        return None
+    folder_id = files[0].get("id")
+    if folder_id:
+        kv_set("drive_videos_dir_id", folder_id)
+    return folder_id
+
+
+def _remote_size_drive(remote_path):
+    """Targeted Drive lookup for one object: its size, or None
+    when absent. Raises _DriveError when the API itself fails,
+    so the caller can fall back to the AList listing."""
+    _, _, name = remote_path.rpartition("/")
+    base_q = "name = '%s' and trashed = false" % name
+    folder = _drive_videos_dir()
+    files = []
+    if folder:
+        files = _drive_list(base_q + " and '%s' in parents" % folder)
+        if not files:
+            # A parent-constrained miss proves nothing while the
+            # cached folder id could be stale; ask once more by
+            # name alone and drop the cached id if that hits.
+            files = _drive_list(base_q)
+            if files:
+                kv_set("drive_videos_dir_id", "")
+    else:
+        files = _drive_list(base_q)
+    for item in files:
+        if item.get("name") == name:
+            try:
+                return int(item.get("size") or 0)
+            except Exception:
+                return 0
+    return None
+
+
+def _remote_size_fast(remote_path):
+    """Size of a remote object, or None when absent. Primary
+    source is a targeted Drive API query; when the Drive API is
+    unavailable (credentials, network), fall back to the old
+    refreshed AList listing so archiving degrades instead of
+    breaking."""
+    try:
+        return _remote_size_drive(remote_path)
+    except _DriveError:
+        return _remote_size(remote_path)
+
+
+
 def _remote_size(remote_path):
     """Size of a remote object, or None when absent. Deliberately
     reads a refreshed folder listing: AList's fs/get resolves
@@ -724,12 +1100,12 @@ def _archive_one(row):
     # Idempotent: a matching object already on Drive (e.g. an
     # earlier attempt whose upload landed but whose bookkeeping
     # failed) is adopted, never uploaded again.
-    remote_size = _remote_size(remote)
+    remote_size = _remote_size_fast(remote)
     if remote_size is None:
         ALIST.upload_file(local, remote)
         for attempt in range(6):
-            time.sleep(2 if attempt == 0 else 5)
-            remote_size = _remote_size(remote)
+            time.sleep((1, 2, 3, 5, 5, 5)[attempt])
+            remote_size = _remote_size_fast(remote)
             if remote_size is not None:
                 break
     if remote_size is None:
@@ -742,10 +1118,11 @@ def _archive_one(row):
             "UPDATE files SET status = 'archived', gpath = ?, error = '', "
             "updated_at = ? WHERE hash = ?",
             (remote, time.time(), row["hash"]))
-    try:
-        os.unlink(local)
-    except Exception:
-        pass
+    if not _cache_keep_local(row, local):
+        try:
+            os.unlink(local)
+        except Exception:
+            pass
 
 
 def _reap_orphans():
@@ -766,6 +1143,9 @@ def _reap_orphans():
             local = _local_path(row)
             if os.path.exists(local):
                 os.unlink(local)
+            cached = _cache_path(row)
+            if os.path.exists(cached):
+                os.unlink(cached)
             thumb = os.path.join(THUMB_DIR, row["hash"] + ".jpg")
             if os.path.exists(thumb):
                 os.unlink(thumb)
@@ -813,11 +1193,11 @@ def _maybe_backup_db():
         kv_set("last_backup_error", str(exc)[:200])
 
 
-def _worker_loop():
+def _worker_loop(maintain=True):
     while True:
         try:
             now = time.time()
-            for name in os.listdir(STAGING_DIR):
+            for name in os.listdir(STAGING_DIR) if maintain else []:
                 if name.endswith(".part"):
                     p = os.path.join(STAGING_DIR, name)
                     try:
@@ -866,11 +1246,12 @@ def _worker_loop():
                                 "error = ?, updated_at = ? WHERE hash = ?",
                                 (new_status, retries, str(exc)[:300],
                                  time.time(), row["hash"]))
-                _reap_orphans()
-                _maybe_backup_db()
+                if maintain:
+                    _reap_orphans()
+                    _maybe_backup_db()
         except Exception:
             pass
-        time.sleep(5)
+        time.sleep(2)
 
 
 def _ensure_worker():
@@ -879,7 +1260,16 @@ def _ensure_worker():
         if _worker_started:
             return
         _worker_started = True
-    threading.Thread(target=_worker_loop, daemon=True).start()
+    # Three archivers in parallel (the per-file claim is atomic,
+    # so workers cannot take the same file); only the primary
+    # runs the periodic maintenance (orphan reaping, backups,
+    # stale-part sweeping).
+    threading.Thread(target=_worker_loop, args=(True,),
+                     daemon=True).start()
+    threading.Thread(target=_worker_loop, args=(False,),
+                     daemon=True).start()
+    threading.Thread(target=_worker_loop, args=(False,),
+                     daemon=True).start()
 
 
 # --------------------------------------------------------- play links
@@ -1003,10 +1393,533 @@ def _page(title, body, extra_head="", base_href=""):
                body)).encode("utf-8")
 
 
+
+FEED_PAGE = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>刷视频 · 视频库</title>__BASE_TAG__
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#000;color:#eee;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden}
+a{color:#9ec1ff;text-decoration:none}
+#bar{position:fixed;top:0;left:0;right:0;z-index:20;display:flex;gap:6px;align-items:center;padding:calc(8px + env(safe-area-inset-top)) 10px 8px;background:rgba(10,10,12,.62);backdrop-filter:blur(8px);transition:transform .28s ease,opacity .28s ease}
+#bar .home{font-size:15px;padding:6px 4px;white-space:nowrap}
+#bar input{flex:1;min-width:0;background:#1c1e24;color:#eee;border:1px solid #34363e;border-radius:8px;padding:7px 9px;font-size:14px}
+#bar select{background:#1c1e24;color:#eee;border:1px solid #34363e;border-radius:8px;padding:7px 4px;font-size:14px}
+#bar button{background:#2f6fd0;color:#fff;border:0;border-radius:8px;padding:7px 12px;font-size:14px}
+#bar button.ico{background:#1c1e24;border:1px solid #34363e;padding:7px 9px;color:#eee}
+body.chrome-off #bar{transform:translateY(-110%);opacity:0;pointer-events:none}
+#peek{position:fixed;top:calc(8px + env(safe-area-inset-top));right:10px;z-index:21;width:40px;height:40px;border-radius:50%;background:rgba(20,20,26,.55);border:1px solid rgba(255,255,255,.22);color:#eee;font-size:19px;line-height:1;backdrop-filter:blur(6px);opacity:.55;transition:opacity .28s;cursor:pointer}
+body:not(.chrome-off) #peek{opacity:0;pointer-events:none}
+#feed{height:100vh;height:100dvh;overflow-y:auto;scroll-snap-type:y mandatory;scrollbar-width:none}
+#feed::-webkit-scrollbar{display:none}
+.slide{height:100vh;height:100dvh;scroll-snap-align:start;scroll-snap-stop:always;position:relative;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden}
+.slide .bgimg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(26px) brightness(.55);transform:scale(1.25)}
+.slide video{position:relative;width:100%;height:100%;background:transparent}
+.slide video.fit-cover{object-fit:cover}
+.slide video.fit-contain{object-fit:contain}
+.meta{position:absolute;left:0;right:76px;bottom:34px;padding:0 14px;pointer-events:none;z-index:5;text-shadow:0 1px 4px rgba(0,0,0,.8)}
+.meta .ttl{font-size:16px;font-weight:600;line-height:1.35;word-break:break-word;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;pointer-events:auto}
+.meta .ttl.open{display:block}
+.meta .sub{font-size:12.5px;color:#dfe2e8;margin-top:5px;line-height:1.5;word-break:break-all}
+.badge{display:inline-block;background:#2f6fd0;border-radius:4px;padding:0 5px;font-size:11px;color:#fff}
+.badge.gray{background:#4a4d55}
+.rail{position:absolute;right:10px;bottom:96px;z-index:6;display:flex;flex-direction:column;gap:14px;align-items:center}
+.rail button{width:46px;height:46px;border-radius:50%;border:1px solid rgba(255,255,255,.25);background:rgba(18,18,22,.55);color:#fff;font-size:19px;backdrop-filter:blur(6px);cursor:pointer}
+.rail button.on{background:#2f6fd0;border-color:#2f6fd0}
+.rail button.like.on{background:#e5484d;border-color:#e5484d}
+.rail button.dislike.on{background:#5a5b63;border-color:#5a5b63}
+.seenflag{display:inline-block;width:15px;color:rgba(255,255,255,.42);font-size:11px;vertical-align:2px;visibility:hidden}
+.seenflag.show{visibility:visible}
+.rail .lab{font-size:10.5px;color:#dfe2e8;text-align:center;margin-top:-10px;text-shadow:0 1px 3px rgba(0,0,0,.9)}
+.seek{position:absolute;left:0;right:0;bottom:0;height:30px;z-index:7;touch-action:none;cursor:pointer}
+.seek .track{position:absolute;left:0;right:0;bottom:0;height:3px;background:rgba(255,255,255,.22);transition:height .15s}
+.seek .buf{position:absolute;left:0;bottom:0;height:100%;background:rgba(255,255,255,.35);width:0}
+.seek .fill{position:absolute;left:0;bottom:0;height:100%;background:#e8442e;width:0}
+.seek .knob{position:absolute;bottom:-5px;width:13px;height:13px;border-radius:50%;background:#e8442e;transform:translateX(-50%);display:none}
+.seek.scrub .track{height:8px}
+.seek.scrub .knob{display:block}
+.seek .tbub{position:absolute;bottom:22px;transform:translateX(-50%);background:rgba(12,12,16,.85);border-radius:6px;padding:4px 9px;font-size:13px;display:none;white-space:nowrap}
+.seek.scrub .tbub{display:block}
+.slide .flash{position:absolute;top:38%;left:0;right:0;text-align:center;font-size:17px;color:#fff;text-shadow:0 1px 6px rgba(0,0,0,.9);opacity:0;transition:opacity .18s;pointer-events:none;z-index:8}
+.flash.show{opacity:1}
+.boost{position:absolute;top:calc(52px + env(safe-area-inset-top));left:50%;transform:translateX(-50%);background:rgba(12,12,16,.8);border-radius:999px;padding:5px 14px;font-size:13px;display:none;z-index:8}
+.boost.show{display:block}
+.endcard{flex-direction:column;gap:14px;text-align:center;padding:20px;color:#c9ccd4;font-size:15px;line-height:1.7}
+.endcard button{background:#2f6fd0;color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:15px}
+#toast{position:fixed;left:50%;bottom:120px;transform:translateX(-50%);background:rgba(20,20,24,.9);padding:8px 16px;border-radius:999px;font-size:13.5px;display:none;z-index:30}
+@media(min-width:760px){#feed{max-width:540px;margin:0 auto}#bar{max-width:540px;left:50%;right:auto;transform:translateX(-50%);width:100%}body.chrome-off #bar{transform:translateX(-50%) translateY(-110%)}#peek{right:calc(50% - 260px)}}
+</style></head>
+<body class="chrome-off">
+<div id="bar">
+  <a class="home" href="./">← 图库</a>
+  <input id="q" type="search" placeholder="搜索标题 / 标签 / 来源">
+  <select id="mode"><option value="random">随机</option><option value="new">最新</option></select>
+  <select id="seenf"><option value="unseen">未看</option><option value="all">全部</option><option value="seen">已看</option></select>
+  <select id="markf"><option value="">标记:全部</option><option value="liked">❤ 喜欢</option><option value="disliked">不喜欢</option></select>
+  <button id="go">筛选</button>
+  <button id="bsound" class="ico" title="声音">🔇</button>
+  <button id="bdetail" class="ico" title="详情">⤢</button>
+  <button id="bfull" class="ico" title="全屏">⛶</button>
+</div>
+<button id="peek" title="筛选与设置">⚙</button>
+<div id="feed"></div>
+<div id="toast"></div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const feedEl=$("feed");
+let items=[],seed=Math.floor(Math.random()*1e9),offset=0,total=0,
+    loading=false,done=false,endCardShown=false;
+let cur=-1,muted=true;
+const blobs=new Map();let blobBytes=0;
+const inflight=new Map();
+const BLOB_BUDGET=80*1024*1024;
+const CACHE_NAME="vidlib-feed-v1";
+let storeOK=("caches" in window);
+function manifest(){try{return JSON.parse(
+  localStorage.getItem("vidlibFeedCache")||"{}");}catch(e){return{};}}
+function saveManifest(m){try{
+  localStorage.setItem("vidlibFeedCache",JSON.stringify(m));}catch(e){}}
+function regBlob(it,b){
+  const u=URL.createObjectURL(b);
+  if(!blobs.has(it.id))blobBytes+=it.size;
+  blobs.set(it.id,u);
+  const m=manifest();
+  m[it.id]={size:it.size,at:Date.now(),stream:it.stream};
+  saveManifest(m);
+  evictIfNeeded();
+  return u;}
+/* Policy (user-settled): under the budget NOTHING is evicted.
+   Only when over budget, evict in one batch - farthest from the
+   current slide first - down to 70% of the budget. */
+function evictIfNeeded(){
+  if(blobBytes<=BLOB_BUDGET)return;
+  const m=manifest();
+  const order=items.map((x,i)=>({id:x.id,d:Math.abs(i-cur)}))
+    .sort((a,b)=>b.d-a.d);
+  for(const o of order){
+    if(blobBytes<=BLOB_BUDGET*0.7)break;
+    if(cur>=0&&items[cur]&&o.id===items[cur].id)continue;
+    const it=items.find(x=>x.id===o.id);
+    const u=blobs.get(o.id);
+    if(u){URL.revokeObjectURL(u);blobs.delete(o.id);
+      if(it)blobBytes-=it.size;
+      const k=items.findIndex(x=>x.id===o.id);
+      const v=slideVideo(k);if(v)delete v.dataset.forId;}
+    if(m[o.id]){const st=m[o.id].stream;delete m[o.id];
+      if(storeOK)caches.open(CACHE_NAME)
+        .then(c=>c.delete(st)).catch(()=>{});}}
+  saveManifest(m);}
+async function pruneStore(){
+  const m=manifest();let tot=0;
+  for(const k in m)tot+=m[k].size;
+  if(tot<=BLOB_BUDGET)return;
+  let c=null;
+  if(storeOK)c=await caches.open(CACHE_NAME).catch(()=>null);
+  const keys=Object.keys(m).sort((a,b)=>m[a].at-m[b].at);
+  for(const k of keys){
+    if(tot<=BLOB_BUDGET*0.7)break;
+    tot-=m[k].size;
+    if(c)await c.delete(m[k].stream).catch(()=>{});
+    delete m[k];}
+  saveManifest(m);}
+function fetchShort(it){
+  if(blobs.has(it.id))return Promise.resolve(blobs.get(it.id));
+  if(inflight.has(it.id))return inflight.get(it.id);
+  const p=(async()=>{
+    if(storeOK){
+      try{const c=await caches.open(CACHE_NAME);
+        const hit=await c.match(it.stream);
+        if(hit)return regBlob(it,await hit.blob());
+      }catch(e){storeOK=false;}}
+    const r=await fetch(it.stream);
+    if(!r.ok)throw new Error("fetch failed");
+    const b=await r.blob();
+    if(storeOK){
+      try{const c=await caches.open(CACHE_NAME);
+        await c.put(it.stream,new Response(b.slice(0),
+          {headers:{"Content-Type":b.type||"video/mp4"}}));
+      }catch(e){}}
+    return regBlob(it,b);})();
+  inflight.set(it.id,p);
+  p.catch(()=>{}).finally(()=>inflight.delete(it.id));
+  return p;}
+const seenSent=new Set();
+let progTimer=null,wakeLock=null;
+
+function fmtDur(s){s=Math.max(0,Math.round(s||0));
+  const m=Math.floor(s/60);return m+":"+String(s%60).padStart(2,"0");}
+function fmtSize(b){return (b/1048576).toFixed(1)+" MiB";}
+function toast(t){const el=$("toast");el.textContent=t;
+  el.style.display="block";setTimeout(()=>el.style.display="none",1800);}
+async function jpost(u,obj){try{await fetch(u,{method:"POST",
+  headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(obj)});}catch(e){}}
+
+/* ---------- sound + top-bar actions ---------- */
+/* Autoplay rules force videos to start muted; the intent is sound
+   ON, so the first tap on the feed unlocks audio for the session.
+   A deliberate tap on the bar's sound button always wins. */
+let soundTouched=false;
+function setMuted(m){
+  muted=m;
+  document.querySelectorAll("#feed video").forEach(x=>x.muted=m);
+  $("bsound").textContent=m?"🔇":"🔊";
+  if(!m){const v=slideVideo(cur);
+    if(v&&v.paused)v.play().catch(()=>{});}
+}
+feedEl.addEventListener("pointerdown",()=>{
+  if(soundTouched)return;soundTouched=true;setMuted(false);});
+$("bsound").onclick=()=>{soundTouched=true;setMuted(!muted);};
+$("bdetail").onclick=()=>{
+  if(cur>=0&&items[cur])location.href="watch/"+items[cur].id;};
+document.addEventListener("keydown",e=>{
+  if(e.ctrlKey||e.metaKey||e.altKey)return;
+  const k=e.key.toLowerCase();
+  if(k!=="z"&&k!=="x")return;
+  const ae=document.activeElement;
+  if(ae&&/INPUT|TEXTAREA|SELECT/.test(ae.tagName))return;
+  const sec=slideEl(cur);if(!sec)return;
+  const b=sec.querySelector(k==="z"?".rail button.like"
+                                   :".rail button.dislike");
+  if(b)b.click();});
+$("bfull").onclick=()=>{
+  const el=document.documentElement,v=slideVideo(cur);
+  if(document.fullscreenElement)document.exitFullscreen();
+  else if(el.requestFullscreen)el.requestFullscreen().catch(()=>{});
+  else if(v&&v.webkitEnterFullscreen)v.webkitEnterFullscreen();};
+
+/* ---------- chrome (top bar): collapsed by default ---------- */
+/* The bar NEVER shows on its own - not on touch, not on pause.
+   The gear toggles it; while open, it re-hides after 4 s, and
+   interacting with the bar itself re-arms that timer. */
+let barTimer=null;
+function showBar(){
+  document.body.classList.remove("chrome-off");
+  clearTimeout(barTimer);
+  barTimer=setTimeout(
+    ()=>document.body.classList.add("chrome-off"),4000);
+}
+function hideBar(){
+  clearTimeout(barTimer);
+  document.body.classList.add("chrome-off");
+}
+$("peek").onclick=()=>{
+  if(document.body.classList.contains("chrome-off"))showBar();
+  else hideBar();};
+$("bar").addEventListener("pointerdown",()=>{
+  if(!document.body.classList.contains("chrome-off"))showBar();});
+
+/* ---------- feed engine ---------- */
+const io=new IntersectionObserver(es=>{
+  es.forEach(en=>{
+    const idx=+en.target.dataset.idx;
+    if(en.isIntersecting&&en.intersectionRatio>=0.6)activate(idx);
+    else if(!en.isIntersecting)deactivate(idx);
+  });
+},{root:feedEl,threshold:[0,0.6]});
+
+function slideEl(idx){return feedEl.children[idx]||null;}
+function slideVideo(idx){const s=slideEl(idx);
+  return s?s.querySelector("video"):null;}
+
+function addSlide(it,idx){
+  const sec=document.createElement("section");
+  sec.className="slide";sec.dataset.idx=idx;
+  const bg=document.createElement("img");
+  bg.className="bgimg";bg.src=it.thumb;bg.alt="";
+  const v=document.createElement("video");
+  v.playsInline=true;v.setAttribute("playsinline","");
+  v.preload="none";v.poster=it.thumb;v.muted=muted;
+  v.className=(it.height>=it.width&&it.height>0)?"fit-cover":"fit-contain";
+  const flash=document.createElement("div");flash.className="flash";
+  const boost=document.createElement("div");boost.className="boost";
+  boost.textContent="2 倍速播放中";
+  const meta=document.createElement("div");meta.className="meta";
+  const tags=it.tags?it.tags.split(/[,，、\s]+/).filter(Boolean)
+    .map(t=>"#"+t).join(" "):"";
+  meta.innerHTML='<div class="ttl"></div><div class="sub"></div>';
+  const ttl=meta.querySelector(".ttl");
+  const sflag=document.createElement("span");
+  sflag.className="seenflag"+(it.seen?" show":"");
+  sflag.textContent="✓";
+  ttl.appendChild(sflag);
+  ttl.appendChild(document.createTextNode(it.title));
+  ttl.onclick=()=>ttl.classList.toggle("open");
+  meta.querySelector(".sub").innerHTML=
+    (tags?tags+" · ":"")+fmtDur(it.duration)+" · "+fmtSize(it.size)+" · "+
+
+    (it.cached?' <span class="badge">本地缓存</span>':"");
+  const rail=document.createElement("div");rail.className="rail";
+  function railBtn(txt,lab,fn){
+    const b=document.createElement("button");b.textContent=txt;
+    b.onclick=e=>{e.stopPropagation();fn(b);};
+    const l=document.createElement("div");l.className="lab";
+    l.textContent=lab;rail.appendChild(b);rail.appendChild(l);
+    return [b,l];}
+  const [bLike]=railBtn("❤","喜欢",b=>{
+    const nm=it.mark===1?0:1;it.mark=nm;
+    jpost("api/mark",{id:it.id,mark:nm});
+    b.classList.toggle("on",nm===1);
+    if(nm===1)bDislike.classList.toggle("on",false);
+  });
+  bLike.classList.add("like");
+  bLike.classList.toggle("on",it.mark===1);
+  const [bDislike]=railBtn("👎","不喜欢",b=>{
+    if(it.mark===2){
+      it.mark=0;jpost("api/mark",{id:it.id,mark:0});
+      b.classList.toggle("on",false);return;}
+    it.mark=2;jpost("api/mark",{id:it.id,mark:2});
+    b.classList.toggle("on",true);
+    bLike.classList.toggle("on",false);
+    if(!it.seen)markSeen(sec,it,true);
+    const nx=slideEl(idx+1);
+    if(nx)nx.scrollIntoView({behavior:"smooth"});
+    else toast("已标记不喜欢（已是最后一条）");
+  });
+  bDislike.classList.add("dislike");
+  bDislike.classList.toggle("on",it.mark===2);
+  const seek=document.createElement("div");seek.className="seek";
+  seek.innerHTML='<div class="tbub"></div><div class="track">'+
+    '<div class="buf"></div><div class="fill"></div></div>'+
+    '<div class="knob"></div>';
+  attachSeek(seek,v,it);
+  attachGestures(v,flash,boost);
+  v.addEventListener("timeupdate",()=>{
+    if(seek.classList.contains("scrub"))return;
+    const f=seek.querySelector(".fill"),bf=seek.querySelector(".buf"),
+          kb=seek.querySelector(".knob");
+    if(v.duration>0){
+      const p=v.currentTime/v.duration*100;
+      f.style.width=p+"%";kb.style.left=p+"%";}
+    try{if(v.buffered.length&&v.duration>0)
+      bf.style.width=(v.buffered.end(v.buffered.length-1)
+        /v.duration*100)+"%";}catch(e){}
+    if(v.currentTime>=3&&!seenSent.has(it.id))markSeen(sec,it,true);
+  });
+  v.addEventListener("play",()=>{
+    if(navigator.wakeLock&&!wakeLock)
+      navigator.wakeLock.request("screen").then(w=>wakeLock=w)
+        .catch(()=>{});});
+  v.addEventListener("ended",()=>{
+    if(!seenSent.has(it.id))markSeen(sec,it,true);
+    const nx=slideEl(idx+1);
+    if(nx)nx.scrollIntoView({behavior:"smooth"});
+  });
+  sec.appendChild(bg);sec.appendChild(v);sec.appendChild(flash);
+  sec.appendChild(boost);sec.appendChild(meta);sec.appendChild(rail);
+  sec.appendChild(seek);
+  feedEl.appendChild(sec);io.observe(sec);
+}
+
+function markSeen(sec,it,ns){
+  it.seen=ns;
+  if(ns)seenSent.add(it.id);else seenSent.delete(it.id);
+  jpost("api/seen",{id:it.id,seen:ns});
+  const fl=sec.querySelector(".seenflag");
+  if(fl)fl.classList.toggle("show",ns);
+}
+
+function attachSeek(seek,v,it){
+  const fill=seek.querySelector(".fill"),knob=seek.querySelector(".knob"),
+        bub=seek.querySelector(".tbub");
+  let scrubbing=false,wasPlaying=false;
+  function ratio(e){const r=seek.getBoundingClientRect();
+    return Math.min(1,Math.max(0,(e.clientX-r.left)/r.width));}
+  function show(e){const p=ratio(e);
+    fill.style.width=(p*100)+"%";knob.style.left=(p*100)+"%";
+    bub.style.left=(p*100)+"%";
+    if(v.duration>0)bub.textContent=fmtDur(p*v.duration)
+      +" / "+fmtDur(v.duration);
+    return p;}
+  seek.addEventListener("pointerdown",e=>{
+    if(!v.duration)return;
+    scrubbing=true;wasPlaying=!v.paused;
+    seek.classList.add("scrub");
+    try{seek.setPointerCapture(e.pointerId);}catch(err){}
+    v.pause();show(e);e.preventDefault();e.stopPropagation();});
+  seek.addEventListener("pointermove",e=>{
+    if(scrubbing)show(e);});
+  function finish(e){
+    if(!scrubbing)return;scrubbing=false;
+    seek.classList.remove("scrub");
+    const p=ratio(e);
+    if(v.duration>0){v.currentTime=p*v.duration;
+      jpost("api/progress",{id:it.id,pos:v.currentTime});}
+    if(wasPlaying)v.play().catch(()=>{});}
+  seek.addEventListener("pointerup",finish);
+  seek.addEventListener("pointercancel",finish);
+}
+
+function attachGestures(v,flash,boost){
+  let downT=0,downX=0,downY=0,lastTap=0,lpTimer=null,boosted=false,
+      tapTimer=null;
+  function showFlash(t){flash.textContent=t;
+    flash.classList.add("show");
+    setTimeout(()=>flash.classList.remove("show"),550);}
+  v.addEventListener("pointerdown",e=>{
+    downT=Date.now();downX=e.clientX;downY=e.clientY;boosted=false;
+    clearTimeout(lpTimer);
+    lpTimer=setTimeout(()=>{boosted=true;v.playbackRate=2;
+      boost.classList.add("show");},420);});
+  v.addEventListener("pointerup",e=>{
+    clearTimeout(lpTimer);
+    if(boosted){v.playbackRate=1;boost.classList.remove("show");return;}
+    const dt=Date.now()-downT,
+          moved=Math.hypot(e.clientX-downX,e.clientY-downY);
+    if(dt>320||moved>12)return;
+    const now=Date.now(),rect=v.getBoundingClientRect(),
+          x=(e.clientX-rect.left)/rect.width;
+    if(now-lastTap<300){
+      clearTimeout(tapTimer);lastTap=0;
+      if(v.duration>0){
+        if(x<0.4){v.currentTime=Math.max(0,v.currentTime-10);
+          showFlash("⟲ 快退 10 秒");}
+        else if(x>0.6){v.currentTime=Math.min(v.duration,
+          v.currentTime+10);showFlash("快进 10 秒 ⟳");}
+        else{v.currentTime=0;showFlash("从头播放");}
+      }
+      return;}
+    lastTap=now;
+    tapTimer=setTimeout(()=>{
+      if(v.paused)v.play().catch(()=>{});else v.pause();
+    },290);});
+  v.addEventListener("pointercancel",()=>{clearTimeout(lpTimer);
+    if(boosted){v.playbackRate=1;boost.classList.remove("show");}});
+}
+
+function addEndCard(){
+  if(endCardShown)return;endCardShown=true;
+  const sec=document.createElement("section");
+  sec.className="slide endcard";sec.dataset.idx=items.length;
+  sec.innerHTML=items.length?"<div>— 刷完了 —</div>"
+    :"<div>没有符合条件的视频。</div>";
+  if($("seenf").value==="unseen"){
+    const b=document.createElement("button");
+    b.textContent="看全部视频（随机）";
+    b.onclick=()=>{$("seenf").value="all";reset();};
+    sec.appendChild(b);}
+  const b2=document.createElement("button");
+  b2.textContent="再随机一轮";b2.onclick=()=>reset();
+  sec.appendChild(b2);
+  feedEl.appendChild(sec);
+}
+
+function setSrc(idx){
+  const it=items[idx],v=slideVideo(idx);if(!v)return;
+  if(v.dataset.forId==String(it.id))return;
+  v.dataset.forId=String(it.id);
+  function seekPos(){
+    if(it.pos>5&&(!it.duration||it.pos<it.duration-10)){
+      v.addEventListener("loadedmetadata",()=>{
+        try{v.currentTime=it.pos;}catch(e){}},{once:true});}}
+  if(!it.short){v.src=it.stream;seekPos();return;}
+  if(idx===0&&it.cached){
+    /* Session opener: the server already holds this file in its
+       local cache, so stream it at once for a fast start instead
+       of waiting for a full blob download first. */
+    v.src=it.stream;seekPos();return;}
+  /* Short: play ONLY from the (persistent) blob cache - never
+     start a parallel stream download of the same file. Fall
+     back to streaming only if the blob takes >3 s or fails. */
+  let fell=false;
+  const timer=setTimeout(()=>{
+    if(v.dataset.forId==String(it.id)&&!v.src){
+      fell=true;v.src=it.stream;seekPos();
+      if(idx===cur)v.play().catch(()=>{});}},3000);
+  fetchShort(it).then(u=>{
+    clearTimeout(timer);
+    if(v.dataset.forId!=String(it.id)||fell)return;
+    v.src=u;seekPos();
+    if(idx===cur)v.play().catch(()=>{});})
+  .catch(()=>{clearTimeout(timer);
+    if(v.dataset.forId==String(it.id)&&!v.src){
+      v.src=it.stream;seekPos();
+      if(idx===cur)v.play().catch(()=>{});}});
+}
+
+function activate(idx){
+  if(idx===cur||idx>=items.length)return;
+  if(cur>=0)deactivate(cur);
+  cur=idx;const v=slideVideo(idx);if(!v)return;
+  setSrc(idx);v.muted=muted;
+  v.play().catch(()=>{});
+  clearInterval(progTimer);
+  progTimer=setInterval(()=>{const cv=slideVideo(cur);
+    if(cv&&!cv.paused)jpost("api/progress",
+      {id:items[cur].id,pos:cv.currentTime});},10000);
+  prefetchAround(idx);
+  if(idx>=items.length-3)loadMore();
+}
+
+function deactivate(idx){
+  const v=slideVideo(idx);if(!v)return;
+  if(!v.paused){v.pause();
+    if(idx<items.length)jpost("api/progress",
+      {id:items[idx].id,pos:v.currentTime});}
+}
+
+function prefetchAround(idx){
+  for(let j=idx+1;j<=Math.min(idx+2,items.length-1);j++){
+    const it=items[j];
+    if(it.short)fetchShort(it).catch(()=>{});
+    else if(j===idx+1){
+      const v=slideVideo(j);
+      if(v&&v.dataset.forId!==String(it.id)){
+        v.preload="auto";setSrc(j);v.pause();}}
+  }
+}
+
+async function loadMore(){
+  if(loading||done)return;loading=true;
+  try{
+    const qs=new URLSearchParams({mode:$("mode").value,
+      seen:$("seenf").value,mark:$("markf").value,q:$("q").value.trim(),
+      seed:seed,offset:offset,limit:12});
+    const d=await (await fetch("api/feed?"+qs)).json();
+    total=d.total;
+    d.items.forEach(it=>{items.push(it);addSlide(it,items.length-1);});
+    offset+=d.items.length;
+    if(d.done)done=true;
+    if(done)addEndCard();
+    if(cur<0&&items.length)activate(0);
+  }catch(e){toast("加载失败，检查网络");}
+  loading=false;
+}
+
+function reset(){
+  items=[];offset=0;total=0;done=false;endCardShown=false;cur=-1;
+  seed=Math.floor(Math.random()*1e9);seenSent.clear();
+  feedEl.innerHTML="";feedEl.scrollTop=0;
+  loadMore();
+}
+
+$("go").onclick=()=>{reset();};
+$("q").addEventListener("keydown",e=>{if(e.key==="Enter")reset();});
+$("mode").onchange=reset;
+$("seenf").onchange=reset;
+$("markf").onchange=reset;
+document.addEventListener("visibilitychange",()=>{
+  if(document.hidden){const v=slideVideo(cur);
+    if(v&&!v.paused)v.pause();}});
+pruneStore();
+loadMore();
+</script>
+</body></html>
+"""
+
+
+def page_feed(base_href=""):
+    base_tag = ('<base href="%s">' % _esc(base_href)) \
+        if base_href else ""
+    return FEED_PAGE.replace("__BASE_TAG__", base_tag).encode("utf-8")
+
+
 _ENTRY_COLS = (
     "SELECT e.id AS id, e.hash AS hash, e.title AS title, "
     "e.folder AS folder, e.tags AS tags, e.source AS source, "
     "e.play_pos AS play_pos, e.play_count AS play_count, "
+    "e.seen_at AS seen_at, e.mark AS mark, e.mark_at AS mark_at, "
     "e.created_at AS created_at, f.ext AS ext, f.size AS size, "
     "f.duration AS duration, f.width AS width, f.height AS height, "
     "f.status AS status, f.gpath AS gpath, f.error AS error "
@@ -1017,6 +1930,7 @@ def page_wall(params, base_href=""):
     q = (params.get("q") or "").strip()
     dur = params.get("dur") or ""
     kind = params.get("kind") or ""
+    markf = params.get("mark") or ""
     tag = (params.get("tag") or "").strip()
     page = max(1, int(params.get("page") or 1))
     where, args = [], []
@@ -1035,6 +1949,10 @@ def page_wall(params, base_href=""):
         where.append("f.duration >= 300 AND f.duration < 1800")
     elif dur == "3":
         where.append("f.duration >= 1800")
+    if markf == "liked":
+        where.append("e.mark = 1")
+    elif markf == "disliked":
+        where.append("e.mark = 2")
     if kind in ("video", "image"):
         exts = sorted(VIDEO_EXTS if kind == "video" else IMAGE_EXTS)
         where.append("LOWER(f.ext) IN (%s)" % ",".join("?" * len(exts)))
@@ -1083,7 +2001,9 @@ def page_wall(params, base_href=""):
                {"image": " · 图片",
                 "other": " · 文件(.%s)" % (r["ext"] or "?")}.get(
                     _kind(r["ext"]), "")
-               + ((" · " + _esc(r["tags"])) if r["tags"] else "")))
+               + ((" · " + _esc(r["tags"])) if r["tags"] else "")
+               + (" · ❤ 喜欢" if (r["mark"] or 0) == 1 else
+                  " · 不喜欢" if (r["mark"] or 0) == 2 else "")))
     pages = (total + per - 1) // per
     pager = ""
     if pages > 1:
@@ -1110,7 +2030,12 @@ def page_wall(params, base_href=""):
         '<option value="video"%s>视频</option>'
         '<option value="image"%s>图片</option>'
         '<option value="other"%s>其他</option></select>'
+        '<select name="mark">'
+        '<option value="">全部标记</option>'
+        '<option value="liked"%s>❤ 喜欢</option>'
+        '<option value="disliked"%s>不喜欢</option></select>'
         '<button type="submit">搜索</button></form>'
+        '<a class="btn" href="feed">刷视频</a>'
         '<a class="btn" href="upload">上传</a>'
         '<a class="btn ghost" href="admin">管理</a></div>'
         '<div style="margin-bottom:12px;font-size:13px">共 %d 个条目 %s</div>'
@@ -1140,6 +2065,8 @@ def page_wall(params, base_href=""):
            ' selected' if kind == "video" else '',
            ' selected' if kind == "image" else '',
            ' selected' if kind == "other" else '',
+           ' selected' if markf == "liked" else '',
+           ' selected' if markf == "disliked" else '',
            total, ("· 标签：" + tag_links) if tag_links else "",
            "".join(cards) or '<div class="empty">还没有视频。点右上角「上传」添加第一个。</div>',
            pager))
@@ -1254,130 +2181,378 @@ def page_watch(entry, base_href=""):
     return _page(entry["title"], body, base_href=base_href)
 
 
-def page_upload(base_href=""):
-    body = (
-        '<div class="topbar"><a class="btn ghost" href="./">← 返回</a>'
-        '<h1>上传文件</h1></div>'
-        '<div class="panel" id="dz"><div style="display:grid;gap:9px">'
-        '<input type="file" id="files" multiple>'
-        '<div style="color:#8b94a7;font-size:13px">也可以把文件直接拖到这个面板里松手。</div>'
-        '<input type="text" id="tags" placeholder="标签（应用于本批，逗号分隔）" maxlength="200">'
-        '<input type="text" id="source" placeholder="来源（应用于本批）" maxlength="120">'
-        '<span><button id="go" type="button">开始上传</button> '
-        '<span class="msg" id="msg"></span></span>'
-        '<div id="sum" style="display:none">'
-        '<div class="progress"><i id="sumbi"></i></div>'
-        '<div id="sumtx" style="font-size:13px;margin-top:5px"></div></div>'
-        '<div id="list" style="display:grid;gap:10px"></div>'
-        '</div>'
-        '<p style="color:#8b94a7;font-size:12.5px;line-height:1.7">'
-        '分片上传（8MB/片）：最多 3 个文件并行、每个文件 3 片并行，失败分片自动重试 3 次。'
-        '速度为近几秒的实时速度，不是全程平均。文件先到服务器暂存区，后台算哈希去重、'
-        '抽缩略图，再自动归档到谷歌硬盘并删除本地副本；同哈希重复上传只新增一个条目，'
-        '不重复占谷歌空间。暂存区预算 %s，归档跟不上时请稍后再传。</p></div>'
-        '<script>'
-        'const CH=8*1024*1024,PARF=3,PARC=3;'
-        'const listEl=document.getElementById("list");'
-        'const jobs=[];let samples=[],timer=null,cursor=0,workers=0;'
-        'function fmtB(b){if(b>=1048576)return (b/1048576).toFixed(2)+" MB";'
-        'if(b>=1024)return (b/1024).toFixed(1)+" KB";return b+" B";}'
-        'function fmtS(b){return fmtB(b)+"/s";}'
-        'function fmtEta(s){if(!isFinite(s))return "";if(s<60)return "约 "+Math.ceil(s)+" 秒";'
-        'if(s<3600)return "约 "+Math.ceil(s/60)+" 分钟";return "约 "+(s/3600).toFixed(1)+" 小时";}'
-        'function jpost(u,b){return fetch(u,{method:"POST",'
-        'headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}).then(r=>r.json());}'
-        'function jobLoaded(j){let t=j.acked;for(const v of j.liveMap.values())t+=v;'
-        'return Math.min(j.file.size,t);}'
-        'function totals(){let l=0,s=0;for(const j of jobs){s+=j.file.size;'
-        'l+=j.done?j.file.size:jobLoaded(j);}return [l,s];}'
-        'function tick(){const now=Date.now();const tt=totals();'
-        'samples.push([now,tt[0]]);'
-        'while(samples.length>2&&now-samples[0][0]>6000)samples.shift();'
-        'let sp=0;if(samples.length>1){const o=samples[0],dt=(now-o[0])/1000;'
-        'if(dt>=1)sp=(tt[0]-o[1])/dt;}'
-        'document.getElementById("sumbi").style.width=(tt[1]?(tt[0]/tt[1]*100):0)+"%%";'
-        'let tx="已传 "+fmtB(tt[0])+" / "+fmtB(tt[1])+" · 当前速度 "+fmtS(sp);'
-        'if(sp>0&&tt[0]<tt[1])tx+=" · 剩余 "+fmtB(tt[1]-tt[0])+" · "+fmtEta((tt[1]-tt[0])/sp);'
-        'document.getElementById("sumtx").textContent=tx;'
-        'for(const j of jobs){if(j.state==="up"){const p=j.file.size?jobLoaded(j)/j.file.size:0;'
-        'j.barEl.style.width=(p*100)+"%%";'
-        'j.stEl.textContent="上传中 "+Math.round(p*100)+"%% · "+fmtB(jobLoaded(j))+" / "+fmtB(j.file.size);}}}'
-        'function sendChunk(job,idx){const f=job.file,off=idx*CH,'
-        'end=Math.min(f.size,off+CH),blob=f.slice(off,end);let tries=0;'
-        'const attempt=()=>new Promise((res,rej)=>{const x=new XMLHttpRequest();'
-        'x.open("PUT","api/uploads/"+job.uid+"/chunk?offset="+off);'
-        'x.upload.onprogress=e=>{job.liveMap.set(idx,e.loaded);};'
-        'x.onload=()=>{try{const d=JSON.parse(x.responseText);'
-        'if(d.ok)res();else rej(new Error(d.message||"分片被拒绝"));}'
-        'catch(_){rej(new Error("分片响应异常"));}};'
-        'x.onerror=()=>rej(new Error("网络错误"));x.send(blob);});'
-        'const go=()=>attempt().catch(e=>{tries++;'
-        'if(tries<3)return new Promise(r=>setTimeout(r,1000)).then(go);throw e;});'
-        'return go();}'
-        'async function runJob(job){const f=job.file;job.state="init";'
-        'job.stEl.textContent="初始化…";'
-        'let init;try{init=await jpost("api/uploads/init",{name:f.name,size:f.size,'
-        'title:f.name.replace(/\\.[^.]+$/,""),'
-        'tags:document.getElementById("tags").value,'
-        'source:document.getElementById("source").value});}catch(e){init=null;}'
-        'if(!init||!init.ok){job.state="fail";job.done=true;'
-        'job.stEl.textContent="失败："+((init&&init.message)||"网络错误");showRetry(job);return;}'
-        'job.uid=init.uid;job.state="up";job.acked=0;job.liveMap.clear();'
-        'const n=Math.ceil(f.size/CH);let next=0,active=0,failed=null;'
-        'await new Promise(fin=>{const launch=()=>{'
-        'if(failed){if(!active)fin();return;}'
-        'while(active<PARC&&next<n){const idx=next++;active++;'
-        'sendChunk(job,idx).then(()=>{active--;'
-        'job.acked+=Math.min(CH,f.size-idx*CH);job.liveMap.delete(idx);'
-        'if(next>=n&&!active)fin();else launch();})'
-        '.catch(e=>{active--;job.liveMap.delete(idx);if(!failed)failed=e;'
-        'if(!active)fin();else launch();});}'
-        'if(!n)fin();};launch();});'
-        'if(failed){job.state="fail";job.done=true;'
-        'job.stEl.textContent="失败："+failed.message;showRetry(job);return;}'
-        'job.state="fin";job.stEl.textContent="入库中…";'
-        'let done;try{done=await jpost("api/uploads/"+job.uid+"/complete",{});}catch(e){done=null;}'
-        'job.done=true;'
-        'if(done&&done.ok){job.state="ok";job.barEl.style.width="100%%";'
-        'job.stEl.textContent=done.duplicate?"内容已存在，已新增条目（不重复占空间）":"已入库，等待归档";}'
-        'else{job.state="fail";job.stEl.textContent="失败："+((done&&done.message)||"网络错误");showRetry(job);}}'
-        'function showRetry(job){if(job.retryBtn)return;'
-        'const b=document.createElement("button");b.type="button";'
-        'b.className="ghost";b.textContent="重试";b.style.marginLeft="8px";'
-        'b.onclick=()=>{b.remove();job.retryBtn=null;job.done=false;'
-        'job.barEl.style.width="0%%";runJob(job);};'
-        'job.stEl.after(b);job.retryBtn=b;}'
-        'async function worker(){workers++;'
-        'while(cursor<jobs.length){const j=jobs[cursor++];'
-        'if(j.state==="queue")await runJob(j);}'
-        'workers--;if(!workers){clearInterval(timer);timer=null;tick();'
-        'document.getElementById("msg").textContent="本批处理完";}}'
-        'function pump(){document.getElementById("sum").style.display="";'
-        'if(!timer){samples=[];timer=setInterval(tick,500);}'
-        'while(workers<PARF)worker();}'
-        'function enqueue(fs){for(const f of fs){'
-        'const row=document.createElement("div");'
-        'row.innerHTML="<div style=\'font-size:13.5px;margin-bottom:5px\'>"+'
-        'f.name.replace(/</g,"&lt;")+" · "+fmtB(f.size)+" · '
-        '<span class=\'st\'>排队</span></div><div class=\'progress\'><i></i></div>";'
-        'listEl.appendChild(row);'
-        'jobs.push({file:f,row:row,stEl:row.querySelector(".st"),'
-        'barEl:row.querySelector("i"),acked:0,liveMap:new Map(),'
-        'state:"queue",done:false,retryBtn:null});}'
-        'if(fs.length)pump();}'
-        'document.getElementById("go").onclick=()=>{'
-        'const fs=[...document.getElementById("files").files];'
-        'if(!fs.length){document.getElementById("msg").textContent="先选择文件";return;}'
-        'document.getElementById("msg").textContent="";enqueue(fs);};'
-        'const dz=document.getElementById("dz");'
-        'dz.addEventListener("dragover",e=>{e.preventDefault();dz.style.outline="2px dashed #4f7cff";});'
-        'dz.addEventListener("dragleave",()=>{dz.style.outline="";});'
-        'dz.addEventListener("drop",e=>{e.preventDefault();dz.style.outline="";'
-        'document.getElementById("msg").textContent="";'
-        'enqueue([...e.dataTransfer.files]);});'
-        '</script>' % _fmt_size(STAGING_BUDGET))
-    return _page("上传", body, base_href=base_href)
+UPLOAD_PAGE = r"""<div class="topbar"><a class="btn ghost" href="./">← 返回</a><h1>上传文件</h1></div>
+<div class="panel" id="dz"><div style="display:grid;gap:9px">
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+<button type="button" id="pickf">选择文件</button>
+<button type="button" id="pickd">选择文件夹</button>
+<input type="file" id="files" multiple hidden>
+<input type="file" id="dir" webkitdirectory hidden>
+<span id="picked" style="font-size:13px;color:#8b94a7"></span>
+</div>
+<div style="color:#8b94a7;font-size:13px">也可以把文件或整个文件夹拖到这个面板里松手。文件夹上传会保留目录路径并自动变成标签（和 WebDAV 拖文件夹一致，如 trip/day1）；0 字节和系统文件（.DS_Store、Thumbs.db 等）会自动跳过。</div>
+<input type="text" id="tags" placeholder="标签（应用于本批，逗号分隔）" maxlength="200">
+<input type="text" id="source" placeholder="来源（应用于本批）" maxlength="120">
+<span><button id="go" type="button">开始上传</button> <span class="msg" id="msg"></span></span>
+<div id="sum" style="display:none">
+<div class="progress"><i id="sumbi"></i></div>
+<div id="sumtx" style="font-size:13px;margin-top:5px"></div><div style="margin-top:6px"><button type="button" id="pausebtn" class="ghost">暂停全部</button></div><div id="alert" style="display:none;margin-top:8px;font-size:13.5px;color:#ffb86b;line-height:1.6"></div></div>
+<div id="list-active" style="display:grid;gap:10px"></div>
+<div id="list-queue" style="display:grid;gap:10px"></div>
+<div id="queue-more" style="font-size:13px;color:#8b94a7;display:none"></div>
+<details id="list-done-wrap" style="display:none">
+<summary id="done-sum" style="font-size:13.5px;cursor:pointer;color:#c9ccd4"></summary>
+<div id="list-done" style="display:grid;gap:10px;margin-top:8px"></div>
+</details>
+</div>
+<p style="color:#8b94a7;font-size:12.5px;line-height:1.7">分片上传（8MB/片）：最多 3 个文件并行、每个文件 3 片并行，失败分片自动重试 3 次。速度为近几秒的实时速度，不是全程平均。文件先到服务器暂存区，后台算哈希去重、抽缩略图，再自动归档到谷歌硬盘并删除本地副本；同哈希重复上传只新增一个条目，不重复占谷歌空间。排队中的文件可点 ✕ 取消，上传中的也可中止（已传分片作废）。暂存区预算 __BUDGET__，归档跟不上时请稍后再传。</p></div>
+<script>
+const CH=8*1024*1024,PARF=3,PARC=3;
+const elActive=document.getElementById("list-active");
+const elQueue=document.getElementById("list-queue");
+const elDone=document.getElementById("list-done");
+const elDoneWrap=document.getElementById("list-done-wrap");
+const elDoneSum=document.getElementById("done-sum");
+const elQMore=document.getElementById("queue-more");
+function layout(){
+  let qShown=0,qHidden=0,doneN=0,okN=0,dupN=0,canN=0;
+  for(const j of jobs){
+    if(j.state==="ok"||j.state==="cancel"){
+      elDone.appendChild(j.row);j.row.style.display="";
+      doneN++;if(j.state==="ok"){if(j.dup)dupN++;else okN++;}
+      else canN++;}
+    else if(j.state==="queue"){
+      elQueue.appendChild(j.row);
+      if(qShown<5){j.row.style.display="";qShown++;}
+      else{j.row.style.display="none";qHidden++;}}
+    else{elActive.appendChild(j.row);j.row.style.display="";}}
+  elQMore.style.display=qHidden?"":"none";
+  elQMore.textContent=qHidden?("…还有 "+qHidden+" 个文件排队中"):"";
+  elDoneWrap.style.display=doneN?"":"none";
+  elDoneSum.textContent="已结束 "+doneN+" 个（完成 "+okN+
+    " · 已存在 "+dupN+" · 已取消 "+canN+"）";}
+const jobs=[];let samples=[],timer=null,cursor=0,workers=0;
+const JUNK=new Set([".ds_store","thumbs.db","desktop.ini","ehthumbs.db"]);
+const FULL_HASH=32*1024*1024,SMP=1024*1024;
+const batchDone=new Map();
+async function digestOf(f){
+  if(!(window.crypto&&crypto.subtle))throw new Error("no webcrypto");
+  const hex=b=>[...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("");
+  if(f.size<=FULL_HASH)
+    return hex(await crypto.subtle.digest("SHA-256",await f.arrayBuffer()));
+  const pre=new TextEncoder().encode(String(f.size));
+  const all=new Uint8Array(pre.length+3*SMP);
+  all.set(pre,0);
+  all.set(new Uint8Array(await f.slice(0,SMP).arrayBuffer()),pre.length);
+  const midOff=Math.floor((f.size-SMP)/2);
+  all.set(new Uint8Array(await f.slice(midOff,midOff+SMP).arrayBuffer()),pre.length+SMP);
+  all.set(new Uint8Array(await f.slice(f.size-SMP).arrayBuffer()),pre.length+2*SMP);
+  return hex(await crypto.subtle.digest("SHA-256",all));}
+let pausedAll=false,pauseReason="",consecFails=0,probeTimer=null;
+function noteNetOk(){consecFails=0;}
+function noteNetFail(){consecFails++;
+  if(consecFails>=3&&!pausedAll)setPaused(true,"auto");}
+function setPaused(on,reason){
+  pausedAll=on;pauseReason=on?(reason||"manual"):"";
+  const bn=document.getElementById("alert");
+  const pb=document.getElementById("pausebtn");
+  if(on){
+    bn.style.display="";
+    bn.textContent=pauseReason==="auto"
+      ?"⚠ 检测到网络异常，已自动暂停。已传分片都保留在服务器上，不会丢进度；网络恢复后会自动继续，你也可以点「继续」立即试一次。"
+      :"已手动暂停。已传分片保留在服务器上，点「继续」后从断点接着传。";
+    pb.textContent="继续";
+    if(pauseReason==="auto")startProbe();
+  }else{
+    bn.style.display="none";pb.textContent="暂停全部";
+    stopProbe();
+    for(const j of jobs)if(j._launchChunks)j._launchChunks();
+    pump();}
+  layout();}
+async function probeOnce(){
+  try{const c=await jpost("api/uploads/check",{digest:"0".repeat(64)});
+    return !!(c&&c.ok);}catch(e){return false;}}
+function startProbe(){stopProbe();let okCount=0;
+  probeTimer=setInterval(async()=>{
+    if(await probeOnce()){okCount++;
+      if(okCount>=2)setPaused(false);}
+    else okCount=0;},20000);}
+function stopProbe(){if(probeTimer){clearInterval(probeTimer);
+  probeTimer=null;}}
+document.getElementById("pausebtn").onclick=()=>{
+  if(pausedAll)setPaused(false);else setPaused(true,"manual");};
+window.addEventListener("online",()=>{
+  if(pausedAll&&pauseReason==="auto")
+    probeOnce().then(ok=>{if(ok)setPaused(false);});});
+function isJunk(name,size){const n=(name||"").toLowerCase();
+  return size<=0||JUNK.has(n)||n.startsWith("._");}
+function fmtB(b){if(b>=1048576)return (b/1048576).toFixed(2)+" MB";
+  if(b>=1024)return (b/1024).toFixed(1)+" KB";return b+" B";}
+function fmtS(b){return fmtB(b)+"/s";}
+function fmtEta(s){if(!isFinite(s))return "";if(s<60)return "约 "+Math.ceil(s)+" 秒";
+  if(s<3600)return "约 "+Math.ceil(s/60)+" 分钟";return "约 "+(s/3600).toFixed(1)+" 小时";}
+function jpost(u,b){return fetch(u,{method:"POST",
+  headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}).then(r=>r.json());}
+function jobLoaded(j){let t=j.acked;for(const v of j.liveMap.values())t+=v;
+  return Math.min(j.file.size,t);}
+function totals(){let l=0,s=0;for(const j of jobs){s+=j.file.size;
+  l+=(j.done&&j.state!=="cancel")?j.file.size:jobLoaded(j);}return [l,s];}
+function counts(){const c={ok:0,dup:0,fail:0,up:0,q:0,cancel:0};
+  for(const j of jobs){
+    if(j.state==="ok"){if(j.dup)c.dup++;else c.ok++;}
+    else if(j.state==="fail")c.fail++;
+    else if(j.state==="cancel")c.cancel++;
+    else if(j.state==="queue")c.q++;else c.up++;}
+  return c;}
+function tick(){layout();const now=Date.now();const tt=totals();
+  samples.push([now,tt[0]]);
+  while(samples.length>2&&now-samples[0][0]>6000)samples.shift();
+  let sp=0;if(samples.length>1){const o=samples[0],dt=(now-o[0])/1000;
+  if(dt>=1)sp=(tt[0]-o[1])/dt;}
+  document.getElementById("sumbi").style.width=(tt[1]?(tt[0]/tt[1]*100):0)+"%";
+  const c=counts();
+  let tx="已传 "+fmtB(tt[0])+" / "+fmtB(tt[1])+" · 当前速度 "+fmtS(sp);
+  if(sp>0&&tt[0]<tt[1])tx+=" · 剩余 "+fmtB(tt[1]-tt[0])+" · "+fmtEta((tt[1]-tt[0])/sp);
+  tx+="　完成 "+(c.ok+c.dup)+"（新 "+c.ok+" · 已存在 "+c.dup+"）";
+  if(c.up)tx+=" · 上传中 "+c.up;
+  if(c.q)tx+=" · 排队 "+c.q;
+  if(c.fail)tx+=" · 失败 "+c.fail;
+  if(c.cancel)tx+=" · 已取消 "+c.cancel;
+  document.getElementById("sumtx").textContent=tx;
+  for(const j of jobs){if(j.state==="up"){const p=j.file.size?jobLoaded(j)/j.file.size:0;
+  j.barEl.style.width=(p*100)+"%";
+  j.stEl.textContent=(pausedAll?"已暂停 · ":"上传中 ")+Math.round(p*100)+"% · "+fmtB(jobLoaded(j))+" / "+fmtB(j.file.size);}}}
+function sendChunk(job,idx){const f=job.file,off=idx*CH,
+  end=Math.min(f.size,off+CH),blob=f.slice(off,end);let tries=0;
+  const attempt=()=>new Promise((res,rej)=>{const x=new XMLHttpRequest();
+  job.xhrs.add(x);
+  x.open("PUT","api/uploads/"+job.uid+"/chunk?offset="+off);
+  x.upload.onprogress=e=>{job.liveMap.set(idx,e.loaded);};
+  x.onload=()=>{job.xhrs.delete(x);try{const d=JSON.parse(x.responseText);
+  if(d.ok)res();else rej(new Error(d.message||"分片被拒绝"));}
+  catch(_){rej(new Error("分片响应异常"));}};
+  x.onabort=()=>{job.xhrs.delete(x);rej(new Error("已取消"));};
+  x.onerror=()=>{job.xhrs.delete(x);const er=new Error("网络错误");
+  er.net=true;rej(er);};
+  x.send(blob);});
+  const go=()=>attempt().catch(e=>{if(job.cancelled)throw e;
+  if(pausedAll&&e.net){const er=new Error("已暂停");er.paused=true;throw er;}
+  tries++;
+  if(tries<3)return new Promise(r=>setTimeout(r,1000)).then(go);throw e;});
+  return go();}
+async function runJob(job){const f=job.file;
+  if(job.cancelled){job.state="cancel";job.done=true;
+  job.stEl.textContent="已取消";return;}
+  job.state="init";job.stEl.textContent="本地校验是否已存在…";
+  let digest=null;
+  try{digest=await digestOf(f);}catch(e){digest=null;}
+  job.digestCache=digest;
+  if(digest){
+    let exists=batchDone.has(digest);
+    if(!exists){
+      try{const c=await jpost("api/uploads/check",{digest:digest});
+        exists=!!(c&&c.ok&&c.exists);}catch(e){exists=false;}}
+    if(exists){
+      let reg=null;
+      try{reg=await jpost("api/uploads/register",{digest:digest,
+        name:f.name,tags:document.getElementById("tags").value,
+        source:document.getElementById("source").value,
+        relpath:job.rel});}catch(e){reg=null;}
+      if(reg&&reg.ok){
+        job.done=true;job.state="ok";job.dup=true;
+        job.barEl.style.width="100%";hideX(job);
+        job.stEl.textContent="已存在，秒传（跳过上传）";
+        return;}}}
+  job.stEl.textContent="初始化…";
+  const base=job.rel.split("/").pop();
+  let init;try{init=await jpost("api/uploads/init",{name:f.name,size:f.size,
+  title:base.replace(/\.[^.]+$/,""),
+  tags:document.getElementById("tags").value,
+  source:document.getElementById("source").value,
+  relpath:job.rel});}catch(e){init=null;}
+  if(!init){noteNetFail();job.state="queue";
+  job.stEl.textContent="初始化遇网络异常，恢复后自动重试";layout();return;}
+  if(!init.ok){job.state="fail";job.done=true;
+  job.stEl.textContent="失败："+(init.message||"网络错误");showRetry(job);return;}
+  job.uid=init.uid;job.state="up";job.acked=0;job.liveMap.clear();
+  job.next=0;job.active=0;job.retryChunks=[];job.failed=null;
+  job.sessionLost=false;job.phase="chunks";
+  await waitChunks(job);
+  await afterChunks(job);}
+function launchChunks(job){
+  const n=Math.ceil(job.file.size/CH);
+  if(!job.failed&&!job.cancelled){
+    while(job.active<PARC&&!pausedAll){
+      let idx;
+      if(job.retryChunks.length)idx=job.retryChunks.shift();
+      else if(job.next<n)idx=job.next++;
+      else break;
+      job.active++;
+      sendChunk(job,idx).then(()=>{job.active--;noteNetOk();
+        job.acked+=Math.min(CH,job.file.size-idx*CH);
+        job.liveMap.delete(idx);launchChunks(job);})
+      .catch(e=>{job.active--;job.liveMap.delete(idx);
+        if(job.cancelled){}
+        else if(e.paused){job.retryChunks.push(idx);}
+        else if(e.net){job.retryChunks.push(idx);noteNetFail();}
+        else if((e.message||"").indexOf("会话不存在")>=0){
+          job.sessionLost=true;job.failed=e;}
+        else job.failed=e;
+        launchChunks(job);});}}
+  if(!job.active&&(job.failed||job.cancelled||
+      (job.next>=n&&!job.retryChunks.length))){
+    if(job._finChunks){const fin=job._finChunks;
+      job._finChunks=null;fin();}}}
+function waitChunks(job){
+  return new Promise(fin=>{job._finChunks=fin;
+    job._launchChunks=()=>launchChunks(job);launchChunks(job);});}
+async function afterChunks(job){
+  if(job.cancelled){job.state="cancel";job.done=true;
+    job.stEl.textContent="已取消";layout();return;}
+  if(job.failed){job.done=true;job.state="fail";
+    job.stEl.textContent="失败："+job.failed.message+"（已传进度保留，可点继续）";
+    showRetry(job);layout();return;}
+  await finishJob(job);}
+async function finishJob(job){
+  job.phase="fin";job.state="fin";job.stEl.textContent="入库中…";
+  let done;try{done=await jpost("api/uploads/"+job.uid+"/complete",{});}
+  catch(e){done=null;}
+  if(done&&done.ok){job.done=true;job.state="ok";
+    job.dup=!!done.duplicate;
+    if(job.digestCache)batchDone.set(job.digestCache,true);
+    job.barEl.style.width="100%";hideX(job);
+    job.stEl.textContent=done.duplicate?"内容已存在，已新增条目（不重复占空间）":"已入库，等待归档";
+    layout();return;}
+  if(!done&&job.digestCache){
+    let landed=false;
+    try{const c=await jpost("api/uploads/check",{digest:job.digestCache});
+      landed=!!(c&&c.ok&&c.exists);}catch(e){landed=false;}
+    if(landed){job.done=true;job.state="ok";
+      job.barEl.style.width="100%";hideX(job);
+      job.stEl.textContent="已入库（响应丢失后经校验确认）";
+      layout();return;}}
+  if(!done)noteNetFail();
+  job.done=true;job.state="fail";
+  job.stEl.textContent="失败："+((done&&done.message)||"网络错误")+"（可点继续重试入库）";
+  showRetry(job);layout();}
+function resumeJob(job){
+  if(job.retryBtn){job.retryBtn.remove();job.retryBtn=null;}
+  job.done=false;job.cancelled=false;
+  if(job.sessionLost||!job.uid){
+    job.uid=null;job.sessionLost=false;job.failed=null;
+    job.acked=0;job.next=0;job.retryChunks=[];job.liveMap.clear();
+    job.barEl.style.width="0%";runJob(job);return;}
+  if(job.phase==="fin"){job.failed=null;finishJob(job);return;}
+  job.failed=null;job.state="up";
+  job.stEl.textContent="继续上传…";
+  (async()=>{await waitChunks(job);await afterChunks(job);})();}
+function hideX(job){if(job.xBtn)job.xBtn.style.display="none";}
+function showRetry(job){hideX(job);if(job.retryBtn)return;
+  const b=document.createElement("button");b.type="button";
+  b.className="ghost";b.textContent="继续";b.style.marginLeft="8px";
+  b.onclick=()=>{b.remove();job.retryBtn=null;resumeJob(job);};
+  job.stEl.after(b);job.retryBtn=b;}
+function cancelJob(job){
+  if(job.state==="queue"){job.cancelled=true;job.state="cancel";
+  job.done=true;job.stEl.textContent="已取消";hideX(job);layout();}
+  else if(job.state==="up"||job.state==="init"){job.cancelled=true;
+  for(const x of[...job.xhrs])x.abort();
+  job.stEl.textContent="取消中…";
+  if(job._launchChunks)job._launchChunks();}}
+async function worker(){workers++;
+  for(;;){
+    if(pausedAll)break;
+    const j=jobs.find(x=>x.state==="queue");
+    if(!j)break;
+    await runJob(j);}
+  workers--;if(!workers){clearInterval(timer);timer=null;tick();
+  const c=counts();
+  document.getElementById("msg").textContent=
+    (c.q||c.up)?"已暂停（进度保留）":"本批处理完";}}
+function pump(){document.getElementById("sum").style.display="";
+  if(!timer){samples=[];timer=setInterval(tick,500);}
+  let need=jobs.filter(j=>j.state==="queue").length;
+  while(workers<PARF&&need>0){worker();need--;}}
+function esc(t){return t.replace(/</g,"&lt;");}
+function enqueue(pairs){
+  let skipped=0,added=0;
+  for(const pr of pairs){
+    if(isJunk(pr.f.name,pr.f.size)){skipped++;continue;}
+    const row=document.createElement("div");
+    const dir=pr.rel.slice(0,pr.rel.length-pr.f.name.length);
+    row.innerHTML="<div style='font-size:13.5px;margin-bottom:5px'>"+
+    (dir?"<span style='color:#8b94a7'>"+esc(dir)+"</span>":"")+
+    esc(pr.f.name)+" · "+fmtB(pr.f.size)+" · <span class='st'>排队</span></div>"+
+    "<div class='progress'><i></i></div>";
+    const xb=document.createElement("button");xb.type="button";
+    xb.className="ghost";xb.textContent="✕";xb.title="取消";
+    xb.style.marginLeft="8px";
+    row.querySelector("div").appendChild(xb);
+    elQueue.appendChild(row);
+    const job={file:pr.f,rel:pr.rel,row:row,
+    stEl:row.querySelector(".st"),barEl:row.querySelector("i"),
+    xBtn:xb,acked:0,liveMap:new Map(),xhrs:new Set(),
+    state:"queue",done:false,cancelled:false,dup:false,retryBtn:null,
+    uid:null,next:0,active:0,retryChunks:[],failed:null,
+    sessionLost:false,phase:"",digestCache:null,
+    _finChunks:null,_launchChunks:null};
+    xb.onclick=()=>cancelJob(job);
+    jobs.push(job);added++;}
+  if(skipped)document.getElementById("msg").textContent=
+    "已跳过 "+skipped+" 个空文件 / 系统文件";
+  if(added){layout();pump();}}
+function pickedPairs(){
+  const out=[];
+  for(const f of document.getElementById("files").files)
+    out.push({f:f,rel:f.webkitRelativePath||f.name});
+  for(const f of document.getElementById("dir").files)
+    out.push({f:f,rel:f.webkitRelativePath||f.name});
+  return out;}
+function pickedNote(){const p=pickedPairs();
+  let s=0;for(const x of p)s+=x.f.size;
+  document.getElementById("picked").textContent=
+    p.length?("已选 "+p.length+" 个文件 · "+fmtB(s)):"";}
+document.getElementById("pickf").onclick=()=>document.getElementById("files").click();
+document.getElementById("pickd").onclick=()=>document.getElementById("dir").click();
+document.getElementById("files").addEventListener("change",pickedNote);
+document.getElementById("dir").addEventListener("change",pickedNote);
+document.getElementById("go").onclick=()=>{
+  const pairs=pickedPairs();
+  if(!pairs.length){document.getElementById("msg").textContent="先选择文件或文件夹";return;}
+  document.getElementById("msg").textContent="";
+  document.getElementById("files").value="";
+  document.getElementById("dir").value="";
+  document.getElementById("picked").textContent="";
+  enqueue(pairs);};
+async function collectFromDrop(dt){
+  const items=[...(dt.items||[])].filter(i=>i.kind==="file");
+  const entries=items.map(i=>i.webkitGetAsEntry&&i.webkitGetAsEntry()).filter(Boolean);
+  if(!entries.length)
+    return [...dt.files].map(f=>({f:f,rel:f.webkitRelativePath||f.name}));
+  const out=[];
+  async function walk(en,path){
+    if(en.isFile){const f=await new Promise(r=>en.file(r));
+      out.push({f:f,rel:path+en.name});}
+    else if(en.isDirectory){const rd=en.createReader();let batch;
+      do{batch=await new Promise(r=>rd.readEntries(r));
+        for(const c of batch)await walk(c,path+en.name+"/");
+      }while(batch.length);}}
+  for(const en of entries)await walk(en,"");
+  return out;}
+const dz=document.getElementById("dz");
+dz.addEventListener("dragover",e=>{e.preventDefault();dz.style.outline="2px dashed #4f7cff";});
+dz.addEventListener("dragleave",()=>{dz.style.outline="";});
+dz.addEventListener("drop",async e=>{e.preventDefault();dz.style.outline="";
+  document.getElementById("msg").textContent="";
+  enqueue(await collectFromDrop(e.dataTransfer));});
+</script>
+"""
 
+
+def page_upload(base_href=""):
+    body = UPLOAD_PAGE.replace(
+        "__BUDGET__", _fmt_size(STAGING_BUDGET))
+    return _page("上传", body, base_href=base_href)
 
 def _admin_data():
     data = {"alist_ok": False, "alist_error": "", "storage": None,
@@ -2228,6 +3403,13 @@ def application(environ, start_response):
                                   ("Content-Length", str(len(body)))])
         return [body]
 
+    if path == "/feed" and method == "GET":
+        body = page_feed(base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Cache-Control", "no-cache"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
     if path == "/upload" and method == "GET":
         body = page_upload(base_href)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
@@ -2256,9 +3438,15 @@ def application(environ, start_response):
 
     if path.startswith("/file/") and method == "GET":
         file_row = get_file(path[len("/file/"):])
-        if file_row is None or file_row["status"] == "archived":
+        if file_row is None:
             start_response("404 Not Found", [("Content-Type", "text/plain")])
             return [b"not found"]
+        if file_row["status"] == "archived":
+            cached = _cache_file(file_row)
+            if cached:
+                return _serve_file_range(environ, start_response, cached,
+                                         _mime_for(file_row["ext"]))
+            return _dav_stream_archived(environ, start_response, file_row)
         local = _local_path(file_row)
         if not os.path.exists(local):
             start_response("404 Not Found", [("Content-Type", "text/plain")])
@@ -2274,6 +3462,10 @@ def application(environ, start_response):
         with _db() as conn:
             conn.execute("UPDATE entries SET play_count = play_count + 1 "
                          "WHERE id = ?", (entry["id"],))
+            conn.execute(
+                "UPDATE entries SET seen_at = ? WHERE id = ? "
+                "AND (seen_at IS NULL OR seen_at = 0)",
+                (time.time(), entry["id"]))
         file_row = get_file(entry["hash"])
         if entry["f_status"] == "archived":
             try:
@@ -2287,6 +3479,135 @@ def application(environ, start_response):
         return _json(start_response, "200 OK",
                      {"ok": True, "url": "file/" + entry["hash"],
                       "archived": False, "pos": entry["play_pos"] or 0})
+
+    if path == "/api/feed" and method == "GET":
+        mode = params.get("mode") or "random"
+        seen_f = params.get("seen") or "unseen"
+        mark_f = params.get("mark") or ""
+        q = (params.get("q") or "").strip()
+        try:
+            seed = int(params.get("seed") or 0)
+        except Exception:
+            seed = 0
+        try:
+            offset = max(0, int(params.get("offset") or 0))
+        except Exception:
+            offset = 0
+        try:
+            limit = min(20, max(1, int(params.get("limit") or 12)))
+        except Exception:
+            limit = 12
+        where, args = [], []
+        if q:
+            where.append(
+                "(e.title LIKE ? OR e.tags LIKE ? OR e.source LIKE ?)")
+            like = "%" + q + "%"
+            args += [like, like, like]
+        if seen_f == "unseen":
+            where.append("(e.seen_at IS NULL OR e.seen_at = 0)")
+        elif seen_f == "seen":
+            where.append("(e.seen_at IS NOT NULL AND e.seen_at > 0)")
+        if mark_f == "liked":
+            where.append("e.mark = 1")
+        elif mark_f == "disliked":
+            where.append("e.mark = 2")
+        elif mark_f != "any":
+            where.append("e.mark != 2")
+        sql = _ENTRY_COLS
+        if where:
+            sql += "WHERE " + " AND ".join(where) + " "
+        sql += "ORDER BY e.id ASC"
+        with _db() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        rows = [r for r in rows if _kind(r["ext"]) == "video"]
+        total = len(rows)
+        if mode == "random":
+            pool = [r for r in rows if _cache_file(r)]
+            random.Random(seed).shuffle(rows)
+            if pool:
+                # Fake-random opener: the first slot is drawn from
+                # the server-cache pool (deterministic for a given
+                # seed, so pagination stays stable) and starts
+                # instantly; the genuinely shuffled rest buffers
+                # behind it.  A thin pool is topped up in the
+                # background with random archived shorts.
+                pick = pool[seed % len(pool)]
+                rows.remove(pick)
+                rows.insert(0, pick)
+                if offset == 0 and len(pool) < 3:
+                    extra = [r for r in rows[1:]
+                             if r["status"] == "archived"
+                             and (r["size"] or 0) <= SHORT_MAX_BYTES
+                             and not _cache_file(r)]
+                    random.Random(seed + 7).shuffle(extra)
+                    for r in extra[:3 - len(pool)]:
+                        _cache_warm(r)
+        else:
+            rows.sort(key=lambda r: (-(r["created_at"] or 0),
+                                     -(r["id"] or 0)))
+        page_rows = rows[offset:offset + limit]
+        items = []
+        for r in page_rows:
+            items.append({
+                "id": r["id"], "title": r["title"], "tags": r["tags"],
+                "source": r["source"], "duration": r["duration"] or 0,
+                "size": r["size"] or 0, "ext": r["ext"],
+                "width": r["width"] or 0, "height": r["height"] or 0,
+                "seen": bool(r["seen_at"]), "pos": r["play_pos"] or 0,
+                "mark": r["mark"] or 0,
+                "thumb": "thumb/" + r["hash"],
+                "stream": "file/" + r["hash"],
+                "short": (r["size"] or 0) <= SHORT_MAX_BYTES,
+                "cached": bool(_cache_file(r)),
+            })
+        for r in page_rows[:4]:
+            if r["status"] == "archived":
+                _cache_warm(r)
+        return _json(start_response, "200 OK",
+                     {"ok": True, "items": items, "total": total,
+                      "done": offset + len(page_rows) >= total})
+
+    if path == "/api/seen" and method == "POST":
+        data = _read_json(environ)
+        entry = get_entry(data.get("id"))
+        if entry is not None:
+            with _db() as conn:
+                conn.execute(
+                    "UPDATE entries SET seen_at = ? WHERE id = ?",
+                    (time.time() if data.get("seen") else 0,
+                     entry["id"]))
+        return _json(start_response, "200 OK", {"ok": True})
+
+    if path == "/api/mark" and method == "POST":
+        data = _read_json(environ)
+        entry = get_entry(data.get("id"))
+        if entry is None:
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "message": "视频不存在。"})
+        try:
+            mark = int(data.get("mark"))
+        except Exception:
+            mark = -1
+        if mark not in (0, 1, 2):
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False, "message": "标记值无效。"})
+        now = time.time()
+        with _db() as conn:
+            if mark == 2:
+                conn.execute(
+                    "UPDATE entries SET mark = 2, mark_at = ?, "
+                    "seen_at = CASE WHEN seen_at IS NULL OR "
+                    "seen_at = 0 THEN ? ELSE seen_at END, "
+                    "updated_at = ? WHERE id = ?",
+                    (now, now, now, entry["id"]))
+            else:
+                conn.execute(
+                    "UPDATE entries SET mark = ?, mark_at = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (mark, now if mark else 0, now, entry["id"]))
+        _sync_mark_files()
+        return _json(start_response, "200 OK",
+                     {"ok": True, "mark": mark})
 
     if path == "/api/progress" and method == "POST":
         data = _read_json(environ)
@@ -2313,6 +3634,7 @@ def application(environ, start_response):
                 (title, (data.get("tags") or "")[:200],
                  (data.get("source") or "")[:120],
                  time.time(), entry["id"]))
+        _sync_mark_files()
         return _json(start_response, "200 OK", {"ok": True})
 
     if path == "/api/entries/delete" and method == "POST":
@@ -2324,12 +3646,38 @@ def application(environ, start_response):
         delete_entry(entry["id"])
         return _json(start_response, "200 OK", {"ok": True})
 
+    if path == "/api/uploads/check" and method == "POST":
+        data = _read_json(environ)
+        digest = (data.get("digest") or "").strip().lower()
+        exists = (re.fullmatch(r"[a-f0-9]{64}", digest) is not None
+                  and get_file(digest) is not None)
+        return _json(start_response, "200 OK",
+                     {"ok": True, "exists": exists})
+
+    if path == "/api/uploads/register" and method == "POST":
+        data = _read_json(environ)
+        digest = (data.get("digest") or "").strip().lower()
+        if re.fullmatch(r"[a-f0-9]{64}", digest) is None:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False, "message": "digest 无效。"})
+        tags = _merge_chute(data.get("tags") or "",
+                            data.get("relpath") or "")
+        entry_id = register_dup(digest, data.get("name") or "",
+                                tags, data.get("source") or "")
+        if entry_id is None:
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "message": "文件不存在。"})
+        return _json(start_response, "200 OK",
+                     {"ok": True, "entry_id": entry_id,
+                      "duplicate": True})
+
     if path == "/api/uploads/init" and method == "POST":
         data = _read_json(environ)
         try:
             uid = upload_init(data.get("name") or "", data.get("size") or 0,
                               data.get("title") or "", data.get("tags") or "",
-                              data.get("source") or "")
+                              data.get("source") or "",
+                              data.get("relpath") or "")
         except ValueError as exc:
             return _json(start_response, "400 Bad Request",
                          {"ok": False, "message": str(exc)})

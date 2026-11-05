@@ -19,7 +19,7 @@
     <header>
       <div class="brandline">
         <a class="brand-logo" href="/" aria-label="链接转文本首页"><img src="/static/logo.svg" width="44" height="44" alt=""></a>
-        <div class="brand-title"><h1>链接转文本</h1><p>粘贴链接或整段文本，自动识别知乎、YouTube 和已配置的网站。支持 Markdown / 纯文本 / JSON。</p></div>
+        <div class="brand-title"><h1>链接转文本</h1><p>粘贴链接或整段文本，自动识别知乎、YouTube、抖音、B站和已配置的网站：视频有字幕时直接输出字幕文本，没有字幕时给出音视频直链。支持 Markdown / 纯文本 / JSON。</p></div>
       </div>
     </header>
     <section id="workspace">
@@ -29,7 +29,7 @@
         <div class="cardhead"><h2>① 粘贴链接或文本</h2></div>
         <div class="labelrow"><label for="url">链接 / 含链接的文本</label><span class="spacer"></span><button id="pasteBtn" class="btn btn-ghost btn-sm" type="button">📋 一键粘贴</button></div>
         <textarea id="url" name="url" rows="3" maxlength="65536" placeholder="直接粘贴整段文字也行，例如：&#10;看到一篇讲得很清楚的文章 https://www.zhihu.com/question/28696373/answer/2835848212 推荐你看看"></textarea>
-        <p class="hint input-hint">自动识别知乎文章、回答、问题与 YouTube 链接；在页面下方添加网站规则，即可扩展支持其他网站。</p>
+        <p class="hint input-hint">自动识别知乎文章、回答、问题、YouTube 链接，以及抖音 / B站短视频（有字幕优先输出字幕，其次保声音）；在页面下方添加网站规则，即可扩展支持其他网站。</p>
         <div class="links" id="links" hidden><div class="linkshead" id="linkCount"></div><div class="chips" id="linkChips"></div></div>
         <div class="row format-row"><div><label for="format">输出格式</label><select id="format"><option value="text" selected>纯文本（推荐，喂 LLM / 检索）</option><option value="markdown">Markdown（含格式）</option><option value="json">JSON（含元数据）</option></select></div><div class="image-options"><label class="image-option"><input id="keep-images" type="checkbox" checked>保留图片链接</label></div></div>
         <div class="actions"><button id="extract-button" class="btn btn-primary" type="submit">提取文本</button><button id="oneClick" class="btn btn-ghost" type="button">⚡ 一键获取</button><button id="download" class="btn btn-ghost" type="button" disabled>下载</button><button id="reset" class="btn btn-ghost" type="button">清空</button><button id="cancel-extract" class="btn btn-ghost" type="button" hidden>取消请求</button><span id="status" class="status" role="status">就绪</span></div>
@@ -37,12 +37,28 @@
       </form>
       <div id="extract-message" class="message extract-message" role="status" aria-live="polite"></div>
       <section id="result" class="result" hidden aria-labelledby="result-heading"><div class="card"><div class="cardhead reshead"><h2 id="result-heading">② 提取结果</h2><span class="spacer"></span><a id="result-source" class="btn btn-ghost btn-sm" target="_blank" rel="noopener noreferrer" hidden>打开原文 ↗</a><button id="copy" class="btn btn-primary btn-sm" type="button" disabled>一键复制</button></div><div class="meta"><div>标题<b id="result-title"></b></div><div>作者 / 日期<b id="result-meta"></b></div></div><pre id="content" tabindex="0" aria-label="提取的内容"></pre></div></section>
+      <section class="card" id="video-panel" hidden>
+        <div class="cardhead"><h2>短视频（抖音 / B站）</h2></div>
+        <div id="video-result" hidden>
+          <div class="meta"><div>标题<b id="video-title"></b></div><div>平台<b id="video-platform"></b></div></div>
+          <video id="video-player" controls playsinline muted preload="none" style="width:min(100%,340px);max-height:38vh;background:#000;border-radius:8px;display:block"></video>
+          <div class="actions"><a id="video-download" class="btn btn-primary" href="#">下载视频</a><button id="video-copy" class="btn btn-ghost" type="button">复制直链</button><a id="video-open" class="btn btn-ghost" href="#" target="_blank" rel="noopener noreferrer">打开直链 ↗</a><span id="video-status" class="status" role="status"></span></div>
+          <p class="hint">在上方输入框粘贴抖音 / B站链接点「提取文本」即可解析：有字幕时字幕直接出现在上方提取结果里；没有字幕时这里给出直链，并保证有声音（拿不到音画合成流时只取音频）。直链是平台 CDN 临时地址，会过期。播放由浏览器直连 CDN（快），被拒时自动切换服务器中转；「下载视频」走服务器中转。解析逻辑源自 <a href="https://github.com/jiuhunwl/short_videos" target="_blank" rel="noopener noreferrer">jiuhunwl/short_videos</a>。</p>
+        </div>
+        <p id="video-message" class="message" role="status" aria-live="polite"></p>
+      </section>
       <details id="cookie-panel" class="card cookiewrap">
         <summary><span>知乎 Cookie</span><span id="cookie-badge" class="badge" data-state="unchecked">读取状态中</span><span class="chev" aria-hidden="true">▾</span></summary>
         <div class="cookiebody"><div class="cookie-links">
           <label>获取 Cookie 的页面（可修改，自动保存到本机浏览器）<input id="cookie-help-url" type="url" value="https://www.zhihu.com/commercial_api/banners_v3"><a id="cookie-help-link" class="hint" href="https://www.zhihu.com/commercial_api/banners_v3" target="_blank" rel="noopener noreferrer">点击打开知乎页面，登录后在开发者工具中获取 Cookie ↗</a></label>
           <label>Cookie 测试回答（可修改，自动保存到本机浏览器）<input id="cookie-test-url" type="url" value="https://www.zhihu.com/question/30311473/answer/2093279761095209383"><a id="cookie-test-link" class="hint" href="https://www.zhihu.com/question/30311473/answer/2093279761095209383" target="_blank" rel="noopener noreferrer">点击查看测试回答 ↗</a></label>
         </div><form id="cookie-form"><label class="sr-only" for="cookie-input">知乎 Cookie 请求头</label><textarea id="cookie-input" rows="3" maxlength="32768" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴整行 Cookie：d_c0=…; z_c0=…（留空则用服务器已保存的）"></textarea><p class="hint cookie-help">浏览器登录知乎 → <code>F12</code> → Network → 刷新 → 点任意请求 → Headers → 复制 <code>Cookie</code> 整行，务必含 <code>d_c0</code> 和 <code>z_c0</code>。输入后自动预验证，保存后其他浏览器可直接复用；已保存的 Cookie 不会回显。</p><div class="actions"><button id="save-cookie" class="btn btn-primary" type="submit">保存到服务器并自动测试</button><button id="test-cookie" class="btn btn-ghost" type="button" disabled>重新测试 Cookie</button><button id="remove-cookie" class="btn btn-ghost" type="button" disabled>删除服务器 Cookie</button></div><p id="cookie-message" class="message cookie-test-status" role="status" aria-live="polite"></p></form></div>
+      </details>
+      <details id="bili-cookie-panel" class="card cookiewrap">
+        <summary><span>Bilibili Cookie（字幕）</span><span id="bili-cookie-badge" class="badge" data-state="unchecked">读取状态中</span><span class="chev" aria-hidden="true">▾</span></summary>
+        <div class="cookiebody"><div class="cookie-links">
+          <label>测试视频（用它验证 Cookie 能否取到字幕，可修改，自动保存到服务器）<input id="bili-test-url" type="url" value="https://www.bilibili.com/video/BV1VeHQ6tEaS/"><a id="bili-test-link" class="hint" href="https://www.bilibili.com/video/BV1VeHQ6tEaS/" target="_blank" rel="noopener noreferrer">点击打开测试视频 ↗</a></label>
+        </div><form id="bili-cookie-form"><p class="hint">B站字幕列表对未登录请求返回空（已实测），粘贴你自己浏览器登录 B 站后的完整 Cookie（含 SESSDATA），解析 B 站链接时就能优先抓取字幕并按文字输出。获取方式：浏览器登录 bilibili.com → F12 → Network → 刷新 → 点任意请求 → Headers → 复制 Cookie 整行。输入后自动预验证，保存后其他浏览器可直接复用；已保存的 Cookie 不会回显。</p><label class="sr-only" for="bili-cookie-input">Bilibili Cookie 请求头</label><textarea id="bili-cookie-input" rows="3" maxlength="32768" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴整行 Cookie：SESSDATA=…; bili_jct=…; DedeUserID=…"></textarea><div class="actions"><button id="save-bili-cookie" class="btn btn-primary" type="submit">保存到服务器并自动测试</button><button id="test-bili-cookie" class="btn btn-ghost" type="button" disabled>重新测试 Cookie</button><button id="remove-bili-cookie" class="btn btn-ghost" type="button" disabled>删除服务器 Cookie</button></div><p id="bili-cookie-message" class="message" role="status" aria-live="polite"></p></form></div>
       </details>
       <details id="settings-panel" class="card cookiewrap">
         <summary><span>链接与分流设置</span><span class="badge" id="settings-badge">读取中</span><span class="chev" aria-hidden="true">▾</span></summary>

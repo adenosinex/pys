@@ -4,28 +4,67 @@ from html import escape
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 if __package__:
-    from .cookie_manager import CookieManager, DEFAULT_TEST_URL
+    from .cookie_manager import CookieManager, DEFAULT_TEST_URL, FileCookieStore, timestamp
     from .site_settings import SiteSettings
     from .site_router import SiteRouter
-    from .extractor import ZhihuError, extract, render
+    from .extractor import ZhihuError, extract, render, validate_cookie
+    from .video_parse import bili_cookie_probe, open_download, parse_video, safe_filename
 else:
-    from cookie_manager import CookieManager, DEFAULT_TEST_URL
+    from cookie_manager import CookieManager, DEFAULT_TEST_URL, FileCookieStore, timestamp
     from site_settings import SiteSettings
     from site_router import SiteRouter
-    from extractor import ZhihuError, extract, render
+    from extractor import ZhihuError, extract, render, validate_cookie
+    from video_parse import bili_cookie_probe, open_download, parse_video, safe_filename
 
 MAX_REQUEST_BYTES = 16 * 1024
+DEFAULT_BILI_TEST_URL = 'https://www.bilibili.com/video/BV1VeHQ6tEaS/'
 
 
 def create_app(*, extract_fn=None, max_concurrency=None,
                cookie_manager=None, site_settings=None):
     cookies = CookieManager.from_environment() if cookie_manager is None else cookie_manager
+    bili_store = FileCookieStore(os.environ.get(
+        'BILI_COOKIE_STATE_FILE',
+        str(Path(__file__).parent / '.runtime' / 'bili-cookie-state.json')))
+
+    def bili_cookie_value():
+        try:
+            record = bili_store.read()
+        except ZhihuError:
+            return ''
+        return (record or {}).get('cookie', '') or ''
+
+    def bili_record():
+        try:
+            return bili_store.read() or {}
+        except ZhihuError:
+            return {}
+
+    def bili_status():
+        record = bili_record()
+        configured = bool(record.get('cookie'))
+        validation = record.get('validation') or {
+            'valid': False, 'state': 'unchecked', 'message': '尚未测试。'}
+        if not configured:
+            validation = {'valid': False, 'state': 'not_configured',
+                          'message': '尚未配置 Bilibili Cookie。'}
+        return {'bili_configured': configured,
+                'test_url': record.get('test_url') or DEFAULT_BILI_TEST_URL,
+                'validation': validation,
+                'updated_at': record.get('updated_at')}
+
+    def bili_test_url(value):
+        m = re.search(r'BV[0-9A-Za-z]{10}', value or '')
+        if not m:
+            raise ZhihuError('测试链接需为含 BV 号的 Bilibili 视频链接。', 'invalid_request', 400)
+        return 'https://www.bilibili.com/video/' + m.group(0) + '/'
     settings = SiteSettings.from_environment() if site_settings is None else site_settings
     router = SiteRouter(settings)
     extract_stats = threading.local()
@@ -54,7 +93,10 @@ def create_app(*, extract_fn=None, max_concurrency=None,
                    ('X-Frame-Options', 'DENY'), ('Referrer-Policy', 'no-referrer'),
                    ('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; "
                     "connect-src 'self' " + ' '.join(connect_origins)
-                    + "; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")]
+                    + "; img-src 'self'; media-src 'self' https://*.douyinvod.com https://*.douyin.com" 
+                    " https://*.snssdk.com https://*.bilivideo.com https://*.bilibili.com" 
+                    " https://*.hdslb.com https://*.akamaized.net https://*.zjcdn.com" 
+                    " https://*.douyincdn.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")]
         start_response(str(status)+' '+HTTPStatus(status).phrase, headers+list(extra))
         return [body]
 
@@ -117,10 +159,40 @@ def create_app(*, extract_fn=None, max_concurrency=None,
                     ('<meta name="routing-origins" content="' + escape(json.dumps(origins), quote=True) + '">').encode())
                 return raw_response(start_response, 200, body, content_type, connect_origins=origins)
             return raw_response(start_response, 200, *assets[path])
-        methods = {'/api/extract': ('POST',),
+        methods = {'/api/extract': ('POST',), '/api/video/parse': ('POST',),
                    '/api/session': ('GET',), '/api/cookie': ('GET', 'POST'),
                    '/api/cookie/test': ('POST',), '/api/cookie/remove': ('POST',),
-                   '/api/settings': ('GET', 'POST')}
+                   '/api/settings': ('GET', 'POST'),
+                   '/api/bili-cookie': ('GET', 'POST'),
+                   '/api/bili-cookie/remove': ('POST',),
+                   '/api/bili-cookie/test': ('POST',)}
+        if path == '/api/video/stream' and method == 'GET':
+            query = parse_qs(environ.get('QUERY_STRING', ''))
+            try:
+                status, headers, body = open_download(
+                    (query.get('u') or [''])[0],
+                    (query.get('ref') or [''])[0],
+                    environ.get('HTTP_RANGE'))
+            except ZhihuError as exc:
+                return error(start_response, exc.status, str(exc), exc.code)
+            if (query.get('dl') or [''])[0] == '1':
+                name = safe_filename((query.get('name') or [''])[0])
+                headers.append(('Content-Disposition',
+                                'attachment; filename="' + name + '"'))
+            start_response(str(status) + ' ' + HTTPStatus(status).phrase,
+                           headers)
+
+            def stream():
+                try:
+                    while True:
+                        chunk = body.read(256 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+                finally:
+                    body.close()
+
+            return stream()
         if path not in methods:
             return error(start_response, 404, '接口不存在。', 'not_found')
         if method not in methods[path]:
@@ -173,6 +245,100 @@ def create_app(*, extract_fn=None, max_concurrency=None,
                 return error(start_response, exc.status, str(exc), exc.code)
             except (ValueError, UnicodeError, TypeError):
                 return error(start_response, 400, 'Cookie 或测试链接无效。', 'invalid_request')
+            finally:
+                slots.release()
+        if path in {'/api/bili-cookie', '/api/bili-cookie/test', '/api/bili-cookie/remove'}:
+            if environ.get('QUERY_STRING'):
+                return error(start_response, 400, 'Cookie 和测试参数请放在 JSON 请求体中。', 'invalid_request')
+            if not slots.acquire(blocking=False):
+                return response(start_response, 429, {'ok': False, 'error': '任务已满，请稍后重试。', 'code': 'busy'},
+                                [('Retry-After', '3')])
+            try:
+                if method == 'GET':
+                    return response(start_response, 200, {'ok': True, **bili_status()})
+                data = read_json(environ, limit=80 * 1024)
+                allowed = {'cookie', 'test_url'} if path != '/api/bili-cookie/remove' else set()
+                if set(data) - allowed:
+                    raise ZhihuError('Cookie 请求参数无效。', 'invalid_request', 400)
+                if path == '/api/bili-cookie/remove':
+                    record = bili_record()
+                    bili_store.write({'cookie': '',
+                                      'test_url': record.get('test_url') or DEFAULT_BILI_TEST_URL,
+                                      'updated_at': timestamp()})
+                    return response(start_response, 200, {'ok': True, **bili_status()})
+                test_url = bili_test_url(data.get('test_url') or bili_status()['test_url'])
+                if path == '/api/bili-cookie/test':
+                    candidate = data.get('cookie')
+                    preview = candidate is not None
+                    if preview:
+                        if not isinstance(candidate, str):
+                            raise ValueError('invalid cookie')
+                        candidate = validate_cookie(candidate)
+                        if 'SESSDATA=' not in candidate:
+                            raise ZhihuError('Cookie 必须包含 SESSDATA 登录项。', 'invalid_cookie', 400)
+                    else:
+                        candidate = bili_cookie_value()
+                        if not candidate:
+                            raise ZhihuError('请先在页面中配置 Bilibili Cookie。', 'cookie_not_configured', 503)
+                    validation = bili_cookie_probe(candidate, test_url)
+                    validation['checked_at'] = timestamp()
+                    validation['test_url'] = test_url
+                    if not preview:
+                        record = bili_record()
+                        if record.get('cookie') == candidate:
+                            record['validation'] = validation
+                            record['test_url'] = test_url
+                            bili_store.write(record)
+                    return response(start_response, 200, {'ok': True, 'validation': validation,
+                                                          'preview': preview})
+                value = data.get('cookie')
+                if not isinstance(value, str):
+                    raise ValueError('invalid cookie')
+                value = validate_cookie(value)
+                if len(value.encode('utf-8')) > 32 * 1024 or 'SESSDATA=' not in value:
+                    raise ZhihuError('Cookie 必须包含 SESSDATA 登录项，且不超过 32 KiB。', 'invalid_cookie', 400)
+                validation = bili_cookie_probe(value, test_url)
+                validation['checked_at'] = timestamp()
+                validation['test_url'] = test_url
+                bili_store.write({'cookie': value, 'test_url': test_url,
+                                  'validation': validation,
+                                  'updated_at': timestamp()})
+                return response(start_response, 200, {'ok': True, **bili_status()})
+            except ZhihuError as exc:
+                if exc.status == 429:
+                    return response(start_response, 429, {'ok': False, 'error': str(exc), 'code': exc.code},
+                                    [('Retry-After', '3')])
+                return error(start_response, exc.status, str(exc), exc.code)
+            except (ValueError, UnicodeError, TypeError):
+                return error(start_response, 400, 'Cookie 或测试链接无效。', 'invalid_request')
+            finally:
+                slots.release()
+        if path == '/api/video/parse':
+            if environ.get('QUERY_STRING'):
+                return error(start_response, 400, '参数请放在 JSON 请求体中。', 'invalid_request')
+            try:
+                data = read_json(environ)
+                if set(data) - {'text'}:
+                    raise ValueError('unknown fields')
+                text = data.get('text')
+                if not isinstance(text, str) or not text.strip() \
+                        or len(text) > 8000:
+                    raise ValueError('invalid text')
+            except ZhihuError as exc:
+                return error(start_response, exc.status, str(exc), exc.code)
+            except (ValueError, UnicodeError, RecursionError):
+                return error(start_response, 400, '请求参数无效，请粘贴分享文本或链接。', 'invalid_request')
+            if not slots.acquire(blocking=False):
+                return response(start_response, 429, {'ok': False, 'error': '任务已满，请稍后重试。', 'code': 'busy'},
+                                [('Retry-After', '3')])
+            try:
+                result = parse_video(text, bili_cookie=bili_cookie_value())
+                return response(start_response, 200, {'ok': True, **result})
+            except ZhihuError as exc:
+                return error(start_response, exc.status, str(exc), exc.code)
+            except Exception as exc:
+                logging.getLogger(__name__).error('Video parse failed (%s)', type(exc).__name__)
+                return error(start_response, 500, '内部处理失败，请检查服务端配置。', 'internal_error')
             finally:
                 slots.release()
         if environ.get('QUERY_STRING'):

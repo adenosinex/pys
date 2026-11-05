@@ -34,6 +34,7 @@ function showAccount(username) {
   $('workspace').hidden = false;
   window.siteSettingsUI.accountChanged(activeUsername);
   loadCookieState();
+  loadBiliCookieState();
 }
 
 function cookieMessage(message, kind = '') {
@@ -177,6 +178,140 @@ for (const [input, link, storage] of [['cookie-help-url', 'cookie-help-link', 'z
   });
 }
 
+// ---- Bilibili cookie: unlocks direct subtitle fetching ----
+// Mirrors the Zhihu cookie flow: typing a complete cookie triggers
+// a debounced preview test, saving stores + tests against the test
+// video, and a stale saved validation re-tests itself on load.
+let biliCookieState = null;
+let biliCookieBusy = false;
+let biliCookieTimer = null;
+let biliCookieGeneration = 0;
+
+function biliCookieMessage(message, kind = '') {
+  $('bili-cookie-message').textContent = message;
+  $('bili-cookie-message').className = 'message' + (kind ? ' ' + kind : '');
+}
+
+function biliCookieButtons() {
+  $('save-bili-cookie').disabled = biliCookieBusy;
+  $('test-bili-cookie').disabled = biliCookieBusy || (!biliCookieState?.bili_configured && !$('bili-cookie-input').value.trim());
+  $('remove-bili-cookie').disabled = biliCookieBusy || !biliCookieState?.bili_configured;
+}
+
+function renderBiliCookieState(data) {
+  biliCookieState = data;
+  const validation = data.validation || {};
+  $('bili-cookie-badge').textContent = !data.bili_configured ? '未配置'
+    : validation.valid ? '已保存 · 验证通过' : validation.state === 'unchecked' ? '已保存 · 待测试' : '已保存 · 测试未通过';
+  $('bili-cookie-badge').dataset.state = validation.valid ? 'valid' : data.bili_configured ? 'warning' : 'unchecked';
+  biliCookieButtons();
+}
+
+function biliValidationMessage(validation, prefix) {
+  const checked = validation.checked_at ? ` 上次测试：${new Date(validation.checked_at).toLocaleString()}` : '';
+  return prefix + (validation.message || '') + checked;
+}
+
+function syncBiliTestLink() {
+  const value = $('bili-test-url').value.trim();
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || !(url.hostname === 'bilibili.com' || url.hostname.endsWith('.bilibili.com')) || url.username || url.password) throw new Error();
+    $('bili-test-link').href = url.href;
+    $('bili-test-link').removeAttribute('aria-disabled');
+  } catch {
+    $('bili-test-link').removeAttribute('href');
+    $('bili-test-link').setAttribute('aria-disabled', 'true');
+  }
+}
+
+async function loadBiliCookieState() {
+  try {
+    const data = await api('/api/bili-cookie');
+    if (!activeUsername) return;
+    renderBiliCookieState(data);
+    if (data.test_url) $('bili-test-url').value = data.test_url;
+    syncBiliTestLink();
+    if (data.bili_configured) {
+      biliCookieMessage(biliValidationMessage(data.validation || {}, ''), data.validation?.valid ? 'success' : 'warning');
+      const checked = Date.parse(data.validation?.checked_at || '');
+      if (!Number.isFinite(checked) || Date.now() - checked > 15 * 60 * 1000) await testBiliCookie(false);
+    }
+  } catch (error) { biliCookieMessage(error.message, 'warning'); }
+}
+
+async function testBiliCookie(preview = false) {
+  if (biliCookieBusy || !activeUsername) return;
+  const candidate = $('bili-cookie-input').value.trim();
+  if (preview && !candidate) return;
+  const generation = ++biliCookieGeneration;
+  biliCookieBusy = true;
+  biliCookieButtons();
+  biliCookieMessage(preview ? '正在自动验证输入的 Cookie…' : '正在使用已保存的 Cookie 测试登录与字幕…', 'pending');
+  try {
+    const payload = {test_url: $('bili-test-url').value.trim()};
+    if (preview) payload.cookie = candidate;
+    const data = await api('/api/bili-cookie/test', payload);
+    if (generation !== biliCookieGeneration || !activeUsername) return;
+    if (!preview && biliCookieState) renderBiliCookieState({...biliCookieState, validation: data.validation});
+    biliCookieMessage(biliValidationMessage(data.validation, preview ? '输入尚未保存。' : ''), data.validation.valid ? 'success' : 'warning');
+  } catch (error) { if (generation === biliCookieGeneration) biliCookieMessage(error.message, 'warning'); }
+  finally { biliCookieBusy = false; biliCookieButtons(); }
+}
+
+function queueBiliCookiePreview() {
+  clearTimeout(biliCookieTimer);
+  const candidate = $('bili-cookie-input').value.trim().replace(/^cookie:\s*/i, '');
+  if (!candidate || !/(?:^|;\s*)SESSDATA=\s*\S+/.test(candidate)) return;
+  biliCookieTimer = setTimeout(() => { if (biliCookieBusy) queueBiliCookiePreview(); else testBiliCookie(true); }, 1200);
+}
+
+$('bili-cookie-input').addEventListener('input', () => {
+  biliCookieGeneration += 1;
+  biliCookieButtons();
+  biliCookieMessage($('bili-cookie-input').value.trim() ? '输入含 SESSDATA 的完整 Cookie 后会自动预验证；点击保存后才会替换已保存的值。' : '');
+  queueBiliCookiePreview();
+});
+
+$('bili-test-url').addEventListener('input', () => { syncBiliTestLink(); biliCookieGeneration += 1; queueBiliCookiePreview(); });
+
+$('bili-cookie-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (biliCookieBusy) return;
+  const candidate = $('bili-cookie-input').value.trim();
+  if (!candidate) { biliCookieMessage('请先粘贴完整的 Bilibili Cookie。', 'warning'); return; }
+  clearTimeout(biliCookieTimer);
+  const generation = ++biliCookieGeneration;
+  biliCookieBusy = true;
+  biliCookieButtons();
+  biliCookieMessage('正在保存并测试 Cookie…', 'pending');
+  try {
+    const data = await api('/api/bili-cookie', {cookie: candidate, test_url: $('bili-test-url').value.trim()});
+    if (generation !== biliCookieGeneration || !activeUsername) return;
+    $('bili-cookie-input').value = '';
+    renderBiliCookieState(data);
+    biliCookieMessage(biliValidationMessage(data.validation, data.validation.valid ? '已保存。' : 'Cookie 已保存，测试暂未通过。'), data.validation.valid ? 'success' : 'warning');
+  } catch (error) { if (generation === biliCookieGeneration) biliCookieMessage(error.message, 'warning'); }
+  finally { biliCookieBusy = false; biliCookieButtons(); }
+});
+
+$('test-bili-cookie').addEventListener('click', () => { clearTimeout(biliCookieTimer); testBiliCookie(Boolean($('bili-cookie-input').value.trim())); });
+$('remove-bili-cookie').addEventListener('click', async () => {
+  if (biliCookieBusy) return;
+  clearTimeout(biliCookieTimer);
+  const generation = ++biliCookieGeneration;
+  biliCookieBusy = true;
+  biliCookieButtons();
+  try {
+    const data = await api('/api/bili-cookie/remove', {});
+    if (generation !== biliCookieGeneration || !activeUsername) return;
+    $('bili-cookie-input').value = '';
+    renderBiliCookieState(data);
+    biliCookieMessage('已移除当前保存的 Bilibili Cookie。');
+  } catch (error) { if (generation === biliCookieGeneration) biliCookieMessage(error.message, 'warning'); }
+  finally { biliCookieBusy = false; biliCookieButtons(); }
+});
+
 // Clipboard workflow follows the supplied page: read/extract, then click/copy.
 const flow = {links: [], selected: '', busy: false, reading: false, copying: false,
   phase: 'idle', controller: null, generation: 0, lastCopiedText: ''};
@@ -235,6 +370,12 @@ function classifyLink(raw) {
   const host = parsed.hostname.toLowerCase();
   const routed = window.siteSettingsUI.classify(parsed);
   if (routed) return routed;
+  if (['douyin.com', 'www.douyin.com', 'v.douyin.com', 'iesdouyin.com', 'www.iesdouyin.com'].includes(host)) {
+    return {url: value, kind: '抖音视频', tail: host + path, media: 'video'};
+  }
+  if (['bilibili.com', 'www.bilibili.com', 'm.bilibili.com', 'b23.tv'].includes(host)) {
+    return {url: value, kind: 'B站视频', tail: host + path, media: 'video'};
+  }
   let match;
   if (host === 'zhuanlan.zhihu.com' && (match = /^\/p\/([0-9]{1,30})$/.exec(path))) {
     return {url: 'https://zhuanlan.zhihu.com' + path, kind: '专栏', tail: 'p/' + match[1]};
@@ -316,6 +457,11 @@ function resetExtraction({quiet = false} = {}) {
   $('result-source').hidden = true;
   $('result-source').removeAttribute('href');
   $('result').hidden = true;
+  $('video-panel').hidden = true;
+  $('video-result').hidden = true;
+  $('video-player').removeAttribute('src');
+  $('video-player').load();
+  videoResult = null;
   $('copy').textContent = '一键复制';
   $('copy').classList.remove('done');
   renderLinks();
@@ -328,8 +474,13 @@ function resetExtraction({quiet = false} = {}) {
 async function extractContent({copyOnNextClick = false} = {}) {
   if (!activeUsername || flow.busy || flow.reading || flow.copying) return false;
   renderLinks();
+  const selectedLink = flow.links.find(link => link.url === flow.selected);
+  if (selectedLink?.media === 'video'
+      || (!flow.selected && /BV[0-9A-Za-z]{10}/.test($('url').value))) {
+    return extractVideo({copyOnNextClick});
+  }
   if (!flow.selected) {
-    extractMessage('没有识别到支持的链接。请粘贴知乎、YouTube 或已配置网站的完整链接。', 'warning');
+    extractMessage('没有识别到支持的链接。请粘贴知乎、YouTube、抖音、B站或已配置网站的完整链接。', 'warning');
     $('url').focus();
     return false;
   }
@@ -396,6 +547,78 @@ async function readClipboardText() {
   catch { throw new Error('无法读取剪贴板，请允许此网站的剪贴板权限，或手动粘贴后点击“提取文本”。'); }
   if (!text) throw new Error('剪贴板里没有文本，请先复制链接。');
   return text.slice(0, 65536);
+}
+
+async function extractVideo({copyOnNextClick = false} = {}) {
+  disarmCopy();
+  const generation = ++flow.generation;
+  flow.busy = true;
+  flow.phase = 'extracting';
+  currentResult = null;
+  $('result').hidden = true;
+  $('video-panel').hidden = true;
+  $('video-result').hidden = true;
+  $('status').textContent = '正在解析…';
+  extractMessage('正在解析视频链接，请稍候…', 'pending');
+  controls();
+  const startedAt = performance.now();
+  try {
+    const data = await api('/api/video/parse', {text: $('url').value.trim()});
+    if (generation !== flow.generation || !activeUsername) return false;
+    videoResult = data;
+    if (data.subtitle_text) {
+      currentResult = {title: data.title || '字幕', author: data.platform_name || '',
+        published: '', content: data.subtitle_text, format: 'text'};
+      $('result-title').textContent = data.title || '字幕原文';
+      const elapsedMs = Math.round(performance.now() - startedAt);
+      const parts = ['用时 ' + (elapsedMs >= 1000 ? (elapsedMs / 1000).toFixed(1) + ' 秒' : elapsedMs + ' 毫秒'),
+        '字幕 ' + data.subtitle_text.length.toLocaleString() + ' 字'];
+      $('result-meta').textContent = [data.platform_name + ' · 字幕', data.subtitle_lang].filter(Boolean).join(' · ')
+        + ' · ' + parts.join(' · ');
+      const src = data.page_url || data.referer;
+      if (src) { $('result-source').href = src; $('result-source').hidden = false; }
+      $('content').textContent = data.subtitle_text;
+      $('result').hidden = false;
+      $('copy').textContent = '一键复制';
+      $('copy').classList.remove('done');
+      flow.phase = 'idle';
+      if (copyOnNextClick || zen.on) {
+        armCopy();
+        extractMessage('✓ 字幕已提取。再次点击「一键获取」或页面空白处即可复制。', 'success');
+        toast('已提取字幕，再点一次复制', 2600);
+      } else {
+        $('status').textContent = '提取完成 ✓';
+        extractMessage('字幕提取成功', 'success');
+      }
+      return true;
+    }
+    $('video-title').textContent = data.title || data.id;
+    $('video-platform').textContent = data.platform_name + ' · ' + data.quality;
+    videoUsingProxy = false;
+    $('video-player').src = data.play_url;
+    $('video-download').href = videoStreamUrl(data, true);
+    $('video-download').textContent = data.audio_only ? '下载音频' : '下载视频';
+    $('video-open').href = data.play_url;
+    $('video-status').textContent = '';
+    $('video-message').textContent = '';
+    $('video-result').hidden = false;
+    $('video-panel').hidden = false;
+    flow.phase = 'idle';
+    $('status').textContent = '解析完成 ✓';
+    extractMessage(data.audio_only ? '该视频没有音画合成流，已改为只取音频（保证有声音）。' : '视频解析成功', 'success');
+    return true;
+  } catch (error) {
+    if (generation !== flow.generation) return false;
+    flow.phase = 'idle';
+    $('status').textContent = '解析未完成';
+    extractMessage(error.message, 'warning');
+    return false;
+  } finally {
+    if (generation === flow.generation) {
+      flow.busy = false;
+      controls();
+    }
+  }
 }
 
 async function fromClipboard({extractImmediately = true} = {}) {
@@ -574,3 +797,37 @@ try {
 } catch {}
 controls();
 showAccount('platform');
+
+// ---- short-video parsing (Douyin / Bilibili, lowest quality) ----
+// Logic ported from jiuhunwl/short_videos:
+// https://github.com/jiuhunwl/short_videos
+let videoResult = null;
+let videoUsingProxy = false;
+
+function videoStreamUrl(data, download) {
+  const params = new URLSearchParams({u: data.play_url, ref: data.referer,
+    name: data.filename});
+  if (download) params.set('dl', '1');
+  return '/api/video/stream?' + params.toString();
+}
+
+$('video-copy').addEventListener('click', async () => {
+  if (!videoResult) return;
+  try {
+    await navigator.clipboard.writeText(videoResult.play_url);
+    $('video-status').textContent = '直链已复制';
+  } catch {
+    $('video-message').textContent = '复制失败，请用「打开直链」手动复制地址。';
+  }
+});
+
+$('video-player').addEventListener('error', () => {
+  if (!videoResult) return;
+  if (!videoUsingProxy) {
+    videoUsingProxy = true;
+    $('video-player').src = videoStreamUrl(videoResult, false);
+    $('video-status').textContent = '直连被 CDN 拒绝，已切换服务器中转播放';
+  } else {
+    $('video-message').textContent = '播放失败：直链可能已过期，请重新解析。';
+  }
+});
