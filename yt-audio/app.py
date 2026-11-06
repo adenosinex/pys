@@ -177,21 +177,64 @@ def cookie_status():
         return {"configured": False, "updated_at": None, "size": 0}
 
 
+_COOKIE_KEY_FIELDS = ("__Secure-1PSID", "SAPISID", "HSID", "SSID", "APISID")
+_COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$")
+
+
+def _header_cookie_to_netscape(text):
+    """Convert a raw Cookie header string ("a=b; c=d", as copied from a
+    browser's devtools or a request header) into Netscape cookies.txt
+    lines for .youtube.com. Returns the converted text, or None when
+    the input does not parse as a header string."""
+    body = text.strip()
+    if body.lower().startswith("cookie:"):
+        body = body.split(":", 1)[1]
+    pairs = {}
+    for chunk in re.split(r"[;\n]", body):
+        chunk = chunk.strip()
+        if "=" not in chunk:
+            continue
+        name, value = chunk.split("=", 1)
+        name, value = name.strip(), value.strip()
+        if value and _COOKIE_NAME_RE.match(name):
+            pairs[name] = value
+    if len(pairs) < 3:
+        return None
+    if not any(k in pairs for k in _COOKIE_KEY_FIELDS):
+        return None
+    lines = ["# Netscape HTTP Cookie File",
+             "# converted from a raw Cookie header string"]
+    for name in sorted(pairs):
+        lines.append(".youtube.com\tTRUE\t/\tTRUE\t1893456000\t%s\t%s"
+                     % (name, pairs[name]))
+    return "\n".join(lines) + "\n"
+
+
 def save_cookies(content):
-    """Validate lightly and store a Netscape cookies.txt (0600)."""
+    """Validate lightly and store a Netscape cookies.txt (0600).
+
+    Accepts either a real Netscape cookies.txt (as exported by browser
+    extensions) or a raw Cookie header string, which is converted.
+    Returns a note when a conversion happened, else ""."""
     text = (content or "").strip()
     if len(text) < 20 or len(text) > 512 * 1024:
         raise ValueError("Cookie 内容长度不合理。")
+    note = ""
+    if "\t" not in text or "youtube.com" not in text:
+        converted = _header_cookie_to_netscape(text)
+        if converted is not None:
+            text, note = converted, "已把浏览器 Cookie 串转换为 cookies.txt 格式保存。"
     if "youtube.com" not in text:
-        raise ValueError("这不像 YouTube 的 Cookie（缺少 youtube.com 条目）。请用浏览器扩展导出 youtube.com 的 cookies.txt。")
-    if not any(k in text for k in ("__Secure-1PSID", "SAPISID", "HSID", "SSID", "APISID")):
+        raise ValueError("这不像 YouTube 的 Cookie（缺少 youtube.com 条目）。请粘贴 youtube.com 的 cookies.txt，或浏览器请求头里的 Cookie 串。")
+    if not any(k in text for k in _COOKIE_KEY_FIELDS):
         raise ValueError("Cookie 里缺少登录关键字段（如 SAPISID/HSID），可能没有登录或导错了站点。")
-    os.makedirs(RUNTIME, exist_ok=True)
+    os.makedirs(os.path.dirname(COOKIE_FILE), exist_ok=True)
     tmp = COOKIE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text + "\n")
+        fh.write(text if text.endswith("\n") else text + "\n")
     os.chmod(tmp, 0o600)
     os.replace(tmp, COOKIE_FILE)
+    return note
 
 
 def delete_cookies():
@@ -662,11 +705,12 @@ def handle_delete(environ, start_response, fid):
 def handle_cookie_save(environ, start_response):
     data = _read_json(environ, limit=600 * 1024)
     try:
-        save_cookies(str(data.get("content") or ""))
+        note = save_cookies(str(data.get("content") or ""))
     except ValueError as exc:
         return _json(start_response, "400 Bad Request",
                      {"ok": False, "error": "bad_cookie", "message": str(exc)})
-    return _json(start_response, "200 OK", {"ok": True, "cookie": cookie_status()})
+    return _json(start_response, "200 OK",
+                 {"ok": True, "cookie": cookie_status(), "message": note})
 
 
 def handle_cookie_delete(environ, start_response):
@@ -809,8 +853,8 @@ PAGE = """<!DOCTYPE html>
       <details>
         <summary>YouTube Cookie（被要求登录验证时用）</summary>
         <div class="meta" id="cookieStatus" style="margin-top:10px"></div>
-        <div class="meta">用浏览器扩展（如 “Get cookies.txt LOCALLY”）在 youtube.com 登录状态下导出 cookies.txt，把内容粘贴到下面保存。Cookie 只存在服务器本地，供 yt-dlp 使用；过期后重新导出粘贴即可。</div>
-        <textarea id="cookieText" placeholder="# Netscape HTTP Cookie File ..."></textarea>
+        <div class="meta">两种格式都可以：浏览器扩展（如 “Get cookies.txt LOCALLY”）导出的 cookies.txt，或浏览器请求头里的 Cookie 串（name=value; name=value 形式），粘贴保存即可，后者会自动转换。Cookie 只存在服务器本地，供 yt-dlp 使用；过期后重新粘贴即可。</div>
+        <textarea id="cookieText" placeholder="# Netscape HTTP Cookie File ... 或 SID=...; HSID=...; SAPISID=... 形式的 Cookie 串"></textarea>
         <div class="row" style="margin-top:10px">
           <button id="cookieSave" class="small">保存 Cookie</button>
           <button id="cookieDel" class="ghost small">删除已存 Cookie</button>
@@ -956,7 +1000,7 @@ $("logoutBtn").onclick = async () => { await api("api/logout", {method: "POST", 
 $("cookieSave").onclick = async () => {
   const {data} = await api("api/cookie", {method: "POST", body: JSON.stringify({content: $("cookieText").value})});
   $("cookieMsg").className = "msg " + (data.ok ? "ok" : "err");
-  $("cookieMsg").textContent = data.ok ? "已保存，下次下载生效。" : (data.message || "保存失败");
+  $("cookieMsg").textContent = data.ok ? (data.message || "已保存，下次下载生效。") : (data.message || "保存失败");
   if (data.ok) { session.cookie = data.cookie; renderCookie(); $("cookieText").value = ""; }
 };
 $("cookieDel").onclick = async () => {
