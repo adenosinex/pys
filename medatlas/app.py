@@ -87,6 +87,11 @@ DRUG_FIELDS = [
     ("overdose_risk", "过量使用的风险"), ("longterm_risk", "长期或反复使用的风险"),
     ("red_flags", "需要就医的警示情况"),
 ]
+SYMPTOM_FIELDS = [
+    ("describe", "如何描述这个症状"), ("common_causes", "常见原因（多为良性）"),
+    ("watch_causes", "需要警惕的原因"), ("red_flags", "红旗信号：立即就医"),
+    ("department", "该看哪个科"), ("observe", "可以先观察的情况"),
+]
 
 # ------------------------------------------------------------------ db
 
@@ -686,6 +691,7 @@ const RELS = {involves:"涉及",belongs:"属于",participates:"参与",manifests
 const STS = {unlearned:"未学习",learning:"学习中",review:"待复习",mastered:"已掌握"};
 const VER = {sourced:"有来源",pending:"待核验",personal:"个人整理"};
 const DRUG_FIELDS = [["drug_class","药物类别"],["mechanism","作用机制"],["indications","适应证"],["dosage_forms","常见剂型与规格"],["adverse","常见不良反应"],["contraindications","禁忌与重要注意事项"],["interactions","药物相互作用"],["special_populations","特殊人群注意事项"],["overdose_risk","过量使用的风险"],["longterm_risk","长期或反复使用的风险"],["red_flags","需要就医的警示情况"]];
+const SYMPTOM_FIELDS = [["describe","如何描述这个症状"],["common_causes","常见原因（多为良性）"],["watch_causes","需要警惕的原因"],["red_flags","红旗信号：立即就医"],["department","该看哪个科"],["observe","可以先观察的情况"]];
 let state = {view:"home", q:"", category:"", tag:"", status:"", nodeId:null, sources:[]};
 const $ = s => document.querySelector(s);
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
@@ -800,6 +806,7 @@ async function renderDetail(app){
   if(n.aliases.length) h += '<p class="small">别名：' + n.aliases.map(esc).join("、") + '</p>';
   h += '<div>' + badges(n) + n.tags.map(t => '<span class="badge">#' + esc(t) + '</span>').join("") + '</div>';
   h += '<p class="body-text" style="font-size:16px">' + esc(n.summary) + '</p>';
+  if(f.plain) h += '<div style="background:#eefaf7;border:1px solid #bfe8dd;border-radius:10px;padding:10px 12px;margin:10px 0"><b style="color:var(--acc)">通俗解读</b> <span class="small">大白话版本；与下方严谨内容冲突时以严谨内容为准</span><div class="body-text" style="margin-top:6px">' + esc(f.plain) + '</div></div>';
   if(n.body) h += '<div class="body-text">' + esc(n.body) + '</div>';
   h += '<div class="row-flex" style="margin-top:12px">'
      + '<label class="small">学习状态 <select class="in wa" id="d-status">'
@@ -825,8 +832,12 @@ async function renderDetail(app){
     if(exs.length){ h += '<h4>有效期信息（具体产品）</h4>' + exs.map(p => '<p class="small">' + esc([p.product,p.expiry,p.storage,p.after_open,p.source].filter(Boolean).join(" · ")) + '</p>').join(""); }
     if(!prs.length && !exs.length) h += '<p class="small">暂无价格 / 有效期记录（这类信息必须带来源和日期，不填统一数值）。</p>';
     h += '</div>';
+  } else if(n.type === "symptom" && SYMPTOM_FIELDS.some(([k]) => f[k])){
+    h += '<div class="card"><h3 style="margin:4px 0 10px">症状鉴别要点</h3><dl class="kv">';
+    for(const [k, label] of SYMPTOM_FIELDS){ if(f[k]) h += '<dt>' + (k === "red_flags" ? '<span style="color:var(--bad)">' + label + '</span>' : label) + '</dt><dd>' + esc(f[k]) + '</dd>'; }
+    h += '</dl></div>';
   } else {
-    const extra = Object.keys(f).filter(k => !["price_records","expiry_records"].includes(k) && f[k]);
+    const extra = Object.keys(f).filter(k => !["price_records","expiry_records","plain"].includes(k) && f[k]);
     if(extra.length) h += '<div class="card"><h3 style="margin:4px 0 10px">补充信息</h3><dl class="kv">'
       + extra.map(k => '<dt>' + esc(k) + '</dt><dd>' + esc(f[k]) + '</dd>').join("") + '</dl></div>';
   }
@@ -908,12 +919,16 @@ async function renderEdit(app, id){
   h += '<label class="fl">别名（逗号分隔）</label><input class="in" id="e-alias" value="' + esc(n.aliases.join(", ")) + '">';
   h += '<label class="fl">摘要 *</label><textarea class="in" id="e-summary" style="min-height:60px">' + esc(n.summary) + '</textarea>';
   h += '<label class="fl">正文</label><textarea class="in" id="e-body" style="min-height:130px">' + esc(n.body) + '</textarea>';
+  h += '<label class="fl">通俗解读（大白话版本，可空）</label><textarea class="in" id="e-plain" style="min-height:60px">' + esc(f.plain || "") + '</textarea>';
   h += '<div id="e-drug"' + (n.type === "drug" ? "" : ' style="display:none"') + '><h3 style="margin:14px 0 4px">药物档案字段</h3>';
   for(const [k, label] of DRUG_FIELDS) h += '<label class="fl">' + label + '</label><textarea class="in drugf" data-k="' + k + '" style="min-height:44px">' + esc(f[k] || "") + '</textarea>';
   h += '<label class="fl">价格记录（每行一条：地区 | 规格 | 包装 | 价格 | 币种 | 来源 | 日期）</label><textarea class="in" id="e-prices" style="min-height:52px">'
      + esc((f.price_records || []).map(p => [p.region,p.spec,p.pack,p.price,p.currency,p.source,p.date].join(" | ")).join("\n")) + '</textarea>';
   h += '<label class="fl">有效期记录（每行一条：具体产品 | 有效期 | 储存要求 | 开封后要求 | 来源）</label><textarea class="in" id="e-expiries" style="min-height:52px">'
      + esc((f.expiry_records || []).map(p => [p.product,p.expiry,p.storage,p.after_open,p.source].join(" | ")).join("\n")) + '</textarea></div>';
+  h += '<div id="e-symptom"' + (n.type === "symptom" ? "" : ' style="display:none"') + '><h3 style="margin:14px 0 4px">症状鉴别字段</h3>';
+  for(const [k, label] of SYMPTOM_FIELDS) h += '<label class="fl">' + label + '</label><textarea class="in sympf" data-k="' + k + '" style="min-height:44px">' + esc(f[k] || "") + '</textarea>';
+  h += '</div>';
   h += '<label class="fl">标签（逗号分隔）</label><input class="in" id="e-tags" value="' + esc(n.tags.join(", ")) + '">';
   h += '<div class="row-flex"><label class="fl" style="margin:0">难度 <select class="in wa" id="e-diff">' + [1,2,3,4,5].map(d => '<option' + (n.difficulty === d ? " selected" : "") + '>' + d + '</option>').join("") + '</select></label>'
      + '<label class="fl" style="margin:0">核验状态 <select class="in wa" id="e-verify">' + Object.keys(VER).map(k => '<option value="' + k + '"' + (n.verify === k ? " selected" : "") + '>' + VER[k] + '</option>').join("") + '</select></label>'
@@ -924,7 +939,7 @@ async function renderEdit(app, id){
   h += '<div class="row-flex" style="margin-top:16px"><button class="btn" id="e-save">保存</button>'
      + '<button class="btn gray" id="e-cancel">取消</button><span class="small">保存后进入详情页预览效果。</span></div></div>';
   app.innerHTML = h;
-  $("#e-type").addEventListener("change", e => { $("#e-drug").style.display = e.target.value === "drug" ? "" : "none"; });
+  $("#e-type").addEventListener("change", e => { $("#e-drug").style.display = e.target.value === "drug" ? "" : "none"; $("#e-symptom").style.display = e.target.value === "symptom" ? "" : "none"; });
   $("#e-cancel").addEventListener("click", () => { if(id) openNode(id); else go("library"); });
   $("#e-save").addEventListener("click", async () => {
     const title = $("#e-title").value.trim(), summary = $("#e-summary").value.trim();
@@ -937,7 +952,12 @@ async function renderEdit(app, id){
       fields.expiry_records = $("#e-expiries").value.split("\n").map(l => l.trim()).filter(Boolean).map(l => { const p = l.split("|").map(s => s.trim()); return {product:p[0]||"", expiry:p[1]||"", storage:p[2]||"", after_open:p[3]||"", source:p[4]||""}; });
     } else {
       Object.keys(f || {}).forEach(k => { fields[k] = f[k]; });
+      if($("#e-type").value === "symptom"){
+        app.querySelectorAll(".sympf").forEach(t => { if(t.value.trim()) fields[t.dataset.k] = t.value.trim(); else delete fields[t.dataset.k]; });
+      }
     }
+    const plainVal = $("#e-plain").value.trim();
+    if(plainVal) fields.plain = plainVal; else delete fields.plain;
     const payload = {type: $("#e-type").value, category: $("#e-cat").value, title, summary,
       aliases: $("#e-alias").value.split(/[,，]/).map(s => s.trim()).filter(Boolean),
       body: $("#e-body").value, fields,
