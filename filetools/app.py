@@ -739,19 +739,25 @@ header.sp{flex:1}
 .hbtn{background:rgba(255,255,255,.16);color:#fff;border:1px solid rgba(255,255,255,.35);border-radius:999px;padding:6px 14px;font-size:13px;cursor:pointer;text-decoration:none}
 .hbtn:hover{background:rgba(255,255,255,.28)}
 main{max-width:1020px;margin:0 auto;padding:18px 14px 40px}
-h2.sec{font-size:15px;margin:20px 2px 10px;display:flex;align-items:center;gap:8px}
+h2.sec{font-size:15px;margin:20px 2px 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 h2.sec.r{margin-left:auto;font-size:12px;color:var(--mut);font-weight:400}
+#selInfo{font-size:12.5px;color:var(--acc);font-weight:600}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:12px}
-.fcard{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:13px 14px;box-shadow:0 1px 4px rgba(20,30,60,.05)}
-.fcard.nm{font-weight:650;font-size:14.5px}
+.fcard{background:var(--card);border:1.5px solid var(--line);border-radius:14px;padding:13px 14px;box-shadow:0 1px 4px rgba(20,30,60,.05);cursor:pointer;transition:all.15s;position:relative}
+.fcard:hover{border-color:var(--acc);transform:translateY(-1px);box-shadow:0 5px 14px rgba(79,70,229,.18)}
+.fcard:active{transform:scale(.98)}
+.fcard.nm{font-weight:650;font-size:14.5px;padding-right:34px}
 .fcard.fl{color:var(--mut);font-size:11.5px;margin-top:2px}
 .fcard.ds{color:var(--mut);font-size:12px;margin-top:6px;white-space:pre-wrap}
-.fcard.ops{margin-top:9px;display:flex;gap:6px;align-items:center}
+.fcard.bad{cursor:default;opacity:.75}
+.fcard.bad:hover{border-color:var(--line);transform:none;box-shadow:0 1px 4px rgba(20,30,60,.05)}
+.edit-ic{position:absolute;top:9px;right:9px;background:var(--chip);border:0;color:var(--acc);width:26px;height:26px;border-radius:8px;cursor:pointer;font-size:13px;line-height:1}
+.edit-ic:hover{background:var(--acc);color:#fff}
 .badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;background:var(--chip);color:var(--acc)}
 .badge.need{background:#fdf0e0;color:var(--warn)}
-.link{background:none;border:0;color:var(--acc);cursor:pointer;font-size:12px;padding:2px 4px}
-.link.red{color:var(--err)}
-.bcard{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-bottom:12px;box-shadow:0 1px 4px rgba(20,30,60,.05)}
+.bcard{background:var(--card);border:1.5px solid var(--line);border-radius:14px;padding:13px 16px;margin-bottom:10px;box-shadow:0 1px 4px rgba(20,30,60,.05);cursor:pointer;transition:border-color.15s}
+.bcard:hover{border-color:#c3cbf5}
+.bcard.sel{border-color:var(--acc);box-shadow:0 0 0 3px rgba(79,70,229,.15)}
 .bcard.top{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
 .bcard.nm{font-weight:650;font-size:15px}
 .meta{color:var(--mut);font-size:12px}
@@ -760,14 +766,14 @@ h2.sec.r{margin-left:auto;font-size:12px;color:var(--mut);font-weight:400}
 .chip.fields{background:#fdf0e0;color:var(--warn)}
 .chip.ready{background:#e2f6ec;color:var(--ok)}
 .chip.done{background:#e8ecf3;color:var(--mut)}
-.del{margin-left:auto;background:none;border:0;color:var(--mut);font-size:16px;cursor:pointer;line-height:1}
-.del:hover{color:var(--err)}
-.frow{display:flex;flex-wrap:wrap;gap:8px;margin-top:11px}
-.fbtn{border:1.5px solid var(--acc);color:var(--acc);background:transparent;border-radius:999px;padding:7px 16px;font-size:13.5px;font-weight:600;cursor:pointer;transition:all.15s}
-.fbtn:hover{background:var(--acc);color:#fff;transform:translateY(-1px);box-shadow:0 4px 12px rgba(79,70,229,.3)}
-.fbtn small{font-weight:400;opacity:.75;font-size:11px;margin-left:4px}
-.status-line{margin-top:10px;font-size:13px;color:var(--mut)}
+.chip.selchip{background:var(--acc);color:#fff}
+.status-line{margin-top:8px;font-size:13px;color:var(--mut)}
 .status-line b{color:var(--ink)}
+.cardfoot{display:flex;align-items:center;gap:10px;margin-top:9px}
+.link{background:none;border:0;color:var(--acc);cursor:pointer;font-size:12px;padding:2px 4px}
+.delquiet{margin-left:auto;background:none;border:0;color:var(--mut);font-size:12px;cursor:pointer;opacity:.55;padding:2px 4px}
+.delquiet:hover{opacity:1;color:var(--err)}
+.delquiet.armed{opacity:1;color:#fff;background:var(--err);border-radius:6px;padding:2px 8px}
 .dotpulse::after{content:"";animation:dp 1.2s infinite}
 @keyframes dp{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
 .planbox{max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:10px;margin-top:8px}
@@ -775,14 +781,17 @@ h2.sec.r{margin-left:auto;font-size:12px;color:var(--mut);font-weight:400}
 .planbox td{padding:5px 9px;border-bottom:1px solid var(--line)}
 .btn{background:var(--acc);color:#fff;border:0;border-radius:999px;padding:8px 18px;font-size:13.5px;font-weight:600;cursor:pointer}
 .btn.ghost{background:transparent;color:var(--acc);border:1.5px solid var(--acc)}
+.btn.danger{background:transparent;color:var(--err);border:1.5px solid var(--err)}
 .btn:disabled{opacity:.5}
 input[type=text],input[type=password]{padding:8px 11px;border:1px solid var(--line);border-radius:9px;font-size:13.5px;background:var(--card);color:var(--ink)}
-textarea{width:100%;min-height:210px;padding:11px;border:1px solid var(--line);border-radius:10px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;background:var(--card);color:var(--ink)}
+textarea{width:100%;min-height:230px;padding:11px;border:1px solid var(--line);border-radius:10px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;background:var(--card);color:var(--ink)}
 .modal{position:fixed;inset:0;background:rgba(10,15,30,.5);display:none;align-items:center;justify-content:center;z-index:20;padding:14px}
 .modal.show{display:flex}
 .mbox{background:var(--card);border-radius:16px;max-width:640px;width:100%;max-height:92vh;overflow:auto;padding:20px}
 .mbox h3{margin:0 0 12px;font-size:16px}
 .mbox label{display:block;font-size:12.5px;color:var(--mut);margin:10px 0 4px}
+.mrow{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
+.mrow.sp{flex:1}
 pre.spec{background:#0f172a;color:#c9d6f2;padding:13px;border-radius:10px;font-size:12px;overflow:auto;white-space:pre-wrap;line-height:1.65}
 #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);background:#16233a;color:#fff;padding:10px 20px;border-radius:999px;font-size:13.5px;opacity:0;pointer-events:none;transition:all.25s;z-index:30;max-width:92vw;text-align:center}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
@@ -790,35 +799,37 @@ pre.spec{background:#0f172a;color:#c9d6f2;padding:13px;border-radius:10px;font-s
 .err{color:var(--err);font-size:12.5px;white-space:pre-wrap}
 .empty{color:var(--mut);font-size:13.5px;padding:16px 4px}
 .setrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px}
+.scard{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:13px 14px;box-shadow:0 1px 4px rgba(20,30,60,.05);max-width:640px}
 </style></head><body>
 <header><h1>文件整理台</h1><span class="sp"></span>
 <button class="hbtn" onclick="openHelp()">编写规范</button>
 <a class="hbtn" href="download/filetools_client.py">下载客户端</a>
 </header><main>
-<h2 class="sec">功能库<span class="r">点批次卡片上的功能按钮即可执行</span></h2>
-<div class="grid" id="funcs"></div>
-<div style="margin-top:12px"><button class="btn ghost" onclick="openNew()">＋ 新功能（粘贴代码）</button>
-<label class="link" style="cursor:pointer">或上传.py<input type="file" id="upFile" accept=".py" hidden onchange="uploadFile(this)"></label></div>
-<h2 class="sec">批次</h2>
+<h2 class="sec">批次 · 文件列表<span class="r">点一张批次卡选中它</span></h2>
 <div id="batches"><div class="empty">加载中…</div></div>
+<h2 class="sec">功能<span id="selInfo"></span><span class="r">点功能卡对选中批次执行</span></h2>
+<div class="grid" id="funcs"></div>
+<div style="margin-top:12px"><button class="btn ghost" onclick="openEditor(null)">＋ 新功能（粘贴代码）</button>
+<label class="link" style="cursor:pointer">或上传.py<input type="file" id="upFile" accept=".py" hidden onchange="uploadFile(this)"></label></div>
 <h2 class="sec">设置</h2>
-<div class="fcard" style="max-width:640px"><div class="nm" style="font-size:13.5px">客户端令牌</div>
+<div class="scard"><div style="font-weight:650;font-size:13.5px">客户端令牌</div>
 <div class="setrow"><input type="password" id="tok" size="30" placeholder="至少 8 位（只写入、不可读回）">
 <button class="btn" onclick="setToken()">保存</button><span class="meta" id="tokState"></span></div>
-<div class="meta" style="margin-top:6px">流程：客户端扫文件夹只传路径 → 批次出现在上方 → 点功能按钮 → 若功能声明了 size/mtime，客户端自动补读 → 清单生成后客户端执行并回传。</div></div>
+<div class="meta" style="margin-top:6px">流程：客户端扫文件夹只传路径 → 在上方点选批次 → 点功能卡执行 → 若功能声明了 size/mtime，客户端自动补读 → 清单生成后客户端执行并回传。</div></div>
 </main>
 
-<div class="modal" id="newModal"><div class="mbox">
-<h3>新功能</h3>
-<label>文件名（小写英文，如 by_size.py；同名即覆盖更新）</label>
-<input type="text" id="nf-name" size="30" placeholder="by_size.py">
+<div class="modal" id="editModal"><div class="mbox">
+<h3 id="ed-title">新功能</h3>
+<label>文件名（小写英文，如 by_size.py）</label>
+<input type="text" id="ed-name" size="30" placeholder="by_size.py">
 <label>核心代码（只需一个 transform 函数，外围项目全包）</label>
-<textarea id="nf-code" spellcheck="false"></textarea>
-<div style="margin-top:12px;display:flex;gap:8px;align-items:center">
+<textarea id="ed-code" spellcheck="false"></textarea>
+<div class="mrow">
+<button class="btn danger" id="ed-del" style="display:none" onclick="delToolFromEditor()">删除此功能</button>
+<span class="sp"></span><span id="ed-msg"></span>
+<button class="btn ghost" onclick="closeEditor()">取消</button>
 <button class="btn" onclick="saveTool()">保存并生效</button>
-<button class="btn ghost" onclick="closeNew()">取消</button>
-<span id="nf-msg"></span></div>
-</div></div>
+</div></div></div>
 
 <div class="modal" id="helpModal"><div class="mbox">
 <h3>功能编写规范</h3>
@@ -826,14 +837,10 @@ pre.spec{background:#0f172a;color:#c9d6f2;padding:13px;border-radius:10px;font-s
 <div style="margin-top:12px"><button class="btn ghost" onclick="closeHelp()">关闭</button></div>
 </div></div>
 
-<div class="modal" id="srcModal"><div class="mbox">
-<h3 id="srcTitle">源码</h3><pre class="spec" id="srcPre"></pre>
-<div style="margin-top:12px"><button class="btn ghost" onclick="document.getElementById('srcModal').classList.remove('show')">关闭</button></div>
-</div></div>
-
 <div id="toast"></div>
 <script>
 let tools = [], batches = [], sig = "", modalOpen = false;
+let selBatch = null, armedDel = 0, armedUntil = 0, editingFile = null;
 const SPEC = `
 粘贴一段 Python 代码、起个文件名保存即生效。外围（扫描、传参、生成
 清单、执行、回滚）全部由项目承担，代码只写核心规则。
@@ -844,7 +851,6 @@ const SPEC = `
 
 
 返回新的相对路径字符串；返回 None、空字符串或原路径 = 这个文件不动。
-如 return "大文件/" + 文件名。
 
 
 size 文件大小（字节，整数）—— 客户端会自动补读后再执行
@@ -855,10 +861,7 @@ total 整批文件总数 —— 服务器直接提供
 保存时会被拒绝并告诉你原因。
 
 
-函数文档字符串的第一行就是按钮上显示的名字，如：
-def transform(path, size):
-'''按大小分夹'''
-没有文档字符串时显示文件名。
+函数文档字符串的第一行就是卡片上显示的名字。没有文档字符串时显示文件名。
 
 
 代码里已预置 common 模块，可直接用：
@@ -867,9 +870,8 @@ common.size_bucket(size) 大小分档 common.safe_seg(s) 清洗路径段
 也可以 import 标准库模块。
 
 
-只做纯计算：不要读写文件、不要联网、不要 import os/sys 去碰磁盘。
-函数只输入路径、输出路径；对某个文件抛异常只会跳过该文件并计数，
-不影响其他文件。
+只做纯计算：不要读写文件、不要联网。函数只输入路径、输出路径；
+对某个文件抛异常只会跳过该文件并计数，不影响其他文件。
 
 
 集中到根目录：
@@ -890,7 +892,7 @@ def transform(path, index):
 '''分组到新文件夹'''
 return "分组%03d/" % (index // 2 + 1) + path.rsplit("/", 1)[-1]`;
 const TEMPLATE = `def transform(path):
-'''功能名称（显示在按钮上）'''
+'''功能名称（显示在卡片上）'''
 # path 是相对路径，如 "子目录/文件.mp4"
 # 返回新相对路径；返回 None 表示不动这个文件
 return None
@@ -901,51 +903,68 @@ function esc(s){return String(s==null?"":s).replace(/[&<>"]/g, c => ({"&":"&amp;
 function fmtT(ts){return ts? new Date(ts*1000).toLocaleString("zh-CN",{hour12:false}): "";}
 let toastTimer = null;
 function toast(msg, isErr){ const t = document.getElementById("toast"); t.textContent = msg; t.className = "show" + (isErr? " err": ""); clearTimeout(toastTimer); toastTimer = setTimeout(()=>{ t.className = "";}, 3400);}
+function toolName(id){ const t = tools.find(x=>x.id===id); return t? t.name: id;}
+function selectedBatch(){ return batches.find(b=>b.id===selBatch) || null;}
+function ensureSelection(){
+if(selectedBatch()) return;
+const open = batches.find(b=>b.status==="open");
+selBatch = (open || batches[0] || {}).id?? null;
+}
 function renderFuncs(){
 let h = "";
 for(const t of tools){
-h += "<div class='fcard'><div class='nm'>"+esc(t.name)+"</div><div class='fl'>"+esc(t.file)+"</div>";
-if(t.ok){ h += "<div style='margin-top:6px'>"+(t.needs.length? "<span class='badge need'>需要 "+esc(t.needs.join(" / "))+"</span>": "<span class='badge'>只需路径</span>")+"</div>";}
-else { h += "<div class='err' style='margin-top:6px'>"+esc((t.error||"").slice(-160))+"</div>";}
-if(t.desc) h += "<div class='ds'>"+esc(t.desc)+"</div>";
-h += "<div class='ops'><button class='link' onclick='viewSrc(\""+esc(t.file)+"\")'>源码</button><button class='link red' onclick='delTool(\""+esc(t.file)+"\")'>删除</button></div></div>";
+if(!t.ok){
+h += "<div class='fcard bad'><div class='nm'>"+esc(t.name)+"</div><div class='fl'>"+esc(t.file)+"</div>"
++ "<div class='err' style='margin-top:6px'>"+esc((t.error||"").slice(-160))+"</div>"
++ "<button class='edit-ic' title='编辑代码' onclick='openEditor(\""+esc(t.file)+"\")'>✎</button></div>";
+continue;
+}
+h += "<div class='fcard' onclick='runTool(\""+t.id+"\")'><div class='nm'>"+esc(t.name)+"</div><div class='fl'>"+esc(t.file)+"</div>"
++ "<div style='margin-top:6px'>"+(t.needs.length? "<span class='badge need'>需要 "+esc(t.needs.join(" / "))+"</span>": "<span class='badge'>只需路径</span>")+"</div>"
++ (t.desc? "<div class='ds'>"+esc(t.desc)+"</div>": "")
++ "<button class='edit-ic' title='编辑代码' onclick='event.stopPropagation(); openEditor(\""+esc(t.file)+"\")'>✎</button></div>";
 }
 document.getElementById("funcs").innerHTML = h || "<div class='empty'>暂无功能</div>";
+const b = selectedBatch();
+document.getElementById("selInfo").textContent = b? ("当前批次：" + b.name + "（" + b.file_count + " 个文件）"): "（先在上方点选一个批次）";
 }
-const CHIP = {open:"待选择功能", fields:"补读字段中", ready:"清单已生成", done:"已完成"};
+const CHIP = {open:"待执行", fields:"补读字段中", ready:"清单已生成", done:"已完成"};
 function batchBody(b){
-const okTools = tools.filter(t=>t.ok);
-if(b.status === "open"){
-if(!okTools.length) return "<div class='status-line'>暂无可用功能</div>";
-return "<div class='frow'>" + okTools.map(t =>
-"<button class='fbtn' onclick='runTool("+b.id+",\""+t.id+"\")'>"+esc(t.name)+(t.needs.length? "<small>需"+esc(t.needs.join("/"))+"</small>": "")+"</button>").join("") + "</div>";
+let h = "";
+if(b.status === "fields") h = "<div class='status-line dotpulse'>功能 <b>"+esc(toolName(b.tool_id))+"</b> · 等待客户端补读字段（"+esc((b.needs||[]).join(", "))+"）</div>";
+else if(b.status === "ready") h = "<div class='status-line'>功能 <b>"+esc(toolName(b.tool_id))+"</b> · 生成 <b>"+b.plan_count+"</b> 条操作，等待客户端执行"+(b.plan_note? " · "+esc(b.plan_note): "")+"</div>";
+else if(b.status === "done"){ let rep = {}; try{ rep = JSON.parse(b.report||"{}");}catch(e){}
+h = "<div class='status-line'>功能 <b>"+esc(toolName(b.tool_id))+"</b> · 移动 "+(rep.moved??"—")+" · 跳过 "+(rep.skipped??"—")+" · 失败 "+(rep.errors??"—")+"</div>";}
+const armed = (armedDel === b.id && Date.now() < armedUntil);
+h += "<div class='cardfoot'>"
++ (b.status === "ready" || b.status === "done"? "<button class='link' onclick='event.stopPropagation(); togglePlan("+b.id+", this)'>查看清单</button>": "")
++ "<button class='delquiet"+(armed? " armed": "")+"' onclick='event.stopPropagation(); delBatch("+b.id+", this)'>"+(armed? "确认删除？": "删除批次")+"</button></div>"
++ "<div id='plan-"+b.id+"'></div>";
+return h;
 }
-if(b.status === "fields") return "<div class='status-line dotpulse'>已点选 <b>"+esc(toolName(b.tool_id))+"</b>，等待客户端补读字段（"+esc((b.needs||[]).join(", "))+"）</div>";
-if(b.status === "ready") return "<div class='status-line'>已点选 <b>"+esc(toolName(b.tool_id))+"</b> · 生成 <b>"+b.plan_count+"</b> 条操作，等待客户端执行"+(b.plan_note? " · "+esc(b.plan_note): "")+"</div>"
-+ "<div><button class='link' onclick='togglePlan("+b.id+", this)'>查看清单</button></div><div id='plan-"+b.id+"'></div>";
-if(b.status === "done"){ let rep = {}; try{ rep = JSON.parse(b.report||"{}");}catch(e){}
-return "<div class='status-line'>功能 <b>"+esc(toolName(b.tool_id))+"</b> · 移动 "+(rep.moved??"—")+" · 跳过 "+(rep.skipped??"—")+" · 失败 "+(rep.errors??"—")+"</div>";}
-return "";
-}
-function toolName(id){ const t = tools.find(x=>x.id===id); return t? t.name: id;}
 function renderBatches(){
 const box = document.getElementById("batches");
 if(!batches.length){ box.innerHTML = "<div class='empty'>暂无批次。运行客户端扫描一个文件夹，批次会出现在这里。</div>"; return;}
 box.innerHTML = batches.map(b =>
-"<div class='bcard'><div class='top'><span class='nm'>"+esc(b.name)+"</span>"
+"<div class='bcard"+(b.id===selBatch? " sel": "")+"' onclick='selectBatch("+b.id+")'><div class='top'><span class='nm'>"+esc(b.name)+"</span>"
 + "<span class='chip "+b.status+"'>"+CHIP[b.status]+"</span>"
-+ "<span class='meta'>"+b.file_count+" 个文件 · "+fmtT(b.created_at)+"</span>"
-+ "<button class='del' title='删除批次' onclick='delBatch("+b.id+")'>×</button></div>"
++ (b.id===selBatch? "<span class='chip selchip'>已选</span>": "")
++ "<span class='meta'>"+b.file_count+" 个文件 · "+fmtT(b.created_at)+"</span></div>"
 + batchBody(b) + "</div>").join("");
 }
+function selectBatch(id){ selBatch = id; sig = ""; refresh();}
 async function refresh(){
 const td = await jget("api/tools"); if(td.ok) tools = td.tools;
 const bd = await jget("api/batches"); if(bd.ok) batches = bd.batches;
-const s = JSON.stringify([tools.map(t=>[t.id,t.ok,t.name]), batches.map(b=>[b.id,b.status,b.plan_count,b.tool_id])]);
+ensureSelection();
+const s = JSON.stringify([tools.map(t=>[t.id,t.ok,t.name]), batches.map(b=>[b.id,b.status,b.plan_count,b.tool_id]), selBatch]);
 if(s!== sig){ sig = s; renderFuncs(); renderBatches();}
 }
-async function runTool(bid, tid){
-const d = await jpost("api/batches/"+bid+"/run", {tool_id: tid});
+async function runTool(tid){
+const b = selectedBatch();
+if(!b){ toast("先在上方点选一个批次", true); return;}
+if(b.status!== "open"){ toast("批次「"+b.name+"」当前状态是"+CHIP[b.status]+"，不能重复执行", true); return;}
+const d = await jpost("api/batches/"+b.id+"/run", {tool_id: tid});
 toast(d.ok? (d.msg||"已执行"): (d.error||"失败"),!d.ok);
 sig = ""; refresh();
 }
@@ -958,22 +977,50 @@ box.innerHTML = "<div class='planbox'><table>" + plan.map(op=>"<tr><td>"+esc(op.
 + (d.batch.plan_truncated? "<div class='meta'>仅显示前 300 条</div>": "");
 btn.textContent = "收起清单";
 }
-async function delBatch(id){ if(!confirm("删除批次 "+id+"？")) return; await fetch("api/batches/"+id, {method:"DELETE"}); sig=""; refresh();}
-async function viewSrc(fn){
-const d = await jget("api/tools/"+encodeURIComponent(fn)+"/source");
-if(d.ok){ document.getElementById("srcTitle").textContent = fn; document.getElementById("srcPre").textContent = d.content; document.getElementById("srcModal").classList.add("show");}
+async function delBatch(id){
+if(armedDel === id && Date.now() < armedUntil){
+armedDel = 0;
+await fetch("api/batches/"+id, {method:"DELETE"});
+if(selBatch === id) selBatch = null;
+toast("批次已删除"); sig = ""; refresh();
+return;
 }
-async function delTool(fn){ if(!confirm("删除功能 "+fn+"？")) return; await fetch("api/tools/"+encodeURIComponent(fn), {method:"DELETE"}); sig=""; refresh();}
-function openNew(){ modalOpen = true; document.getElementById("nf-code").value = TEMPLATE; document.getElementById("nf-msg").textContent = ""; document.getElementById("newModal").classList.add("show");}
-function closeNew(){ modalOpen = false; document.getElementById("newModal").classList.remove("show");}
+armedDel = id; armedUntil = Date.now() + 3000;
+sig = ""; renderBatches();
+setTimeout(()=>{ if(armedDel === id){ armedDel = 0; renderBatches();}}, 3100);
+}
+async function openEditor(fn){
+modalOpen = true; editingFile = fn;
+document.getElementById("ed-title").textContent = fn? ("编辑功能 · " + fn): "新功能";
+const nameEl = document.getElementById("ed-name");
+nameEl.value = fn || ""; nameEl.readOnly =!!fn;
+document.getElementById("ed-del").style.display = fn? "": "none";
+document.getElementById("ed-msg").textContent = "";
+const codeEl = document.getElementById("ed-code");
+if(fn){
+codeEl.value = "加载中…";
+const d = await jget("api/tools/"+encodeURIComponent(fn)+"/source");
+codeEl.value = d.ok? d.content: ("# 读取失败: " + (d.error||""));
+} else {
+codeEl.value = TEMPLATE;
+}
+document.getElementById("editModal").classList.add("show");
+}
+function closeEditor(){ modalOpen = false; editingFile = null; document.getElementById("editModal").classList.remove("show");}
 async function saveTool(){
-const fn = document.getElementById("nf-name").value.trim();
-const code = document.getElementById("nf-code").value;
-const m = document.getElementById("nf-msg");
+const fn = document.getElementById("ed-name").value.trim();
+const code = document.getElementById("ed-code").value;
+const m = document.getElementById("ed-msg");
 if(!fn){ m.textContent = "先填文件名"; return;}
 const d = await jpost("api/tools/upload", {filename: fn, content: code});
-if(d.ok){ closeNew(); toast(d.msg||"已生效"); sig=""; refresh();}
+if(d.ok){ closeEditor(); toast(d.msg||"已生效"); sig=""; refresh();}
 else { m.className = "err"; m.textContent = d.error||"保存失败";}
+}
+async function delToolFromEditor(){
+if(!editingFile) return;
+if(!confirm("删除功能 "+editingFile+"？此操作不可恢复。")) return;
+await fetch("api/tools/"+encodeURIComponent(editingFile), {method:"DELETE"});
+closeEditor(); toast("功能已删除"); sig=""; refresh();
 }
 function uploadFile(inp){
 const f = inp.files[0]; if(!f) return;
@@ -995,5 +1042,4 @@ document.getElementById("tokState").textContent = s.token_configured? "令牌已
 await refresh();
 setInterval(()=>{ if(!modalOpen) refresh();}, 3000);
 })();
-</script></body></html>
-"""
+</script></body></html>"""
