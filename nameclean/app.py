@@ -607,7 +607,10 @@ def _dedup_contained(stats, regions_per_file, phrases, threshold):
             if any(not covered(claimed, doc, ri, a, b) for ri, a, b in lst):
                 residual.add(doc)
         if len(residual) >= threshold:
-            selected[k] = set(spans.keys())
+            # selected[] holds the INDEPENDENT (residual) docs only, so the
+            # mixed-token reconciliation below can never inflate the count
+            # back to the raw total.
+            selected[k] = set(residual)
             stats[k]["cnt"] = len(residual)
             stats[k]["raw_docs"] = set(spans.keys())
             # Only a genuinely recurring candidate may claim spans and
@@ -620,11 +623,13 @@ def _dedup_contained(stats, regions_per_file, phrases, threshold):
         else:
             del stats[k]
     # other tokens fully inside a selected candidate, doc-subset -> drop
+    # (subset is tested against the candidate's RAW doc set)
     for k in list(stats):
         if k in selected:
             continue
         s = stats[k]
-        for p, pdocs in selected.items():
+        for p in selected:
+            pdocs = stats[p].get("raw_docs") or selected[p]
             if k in p and s.get("docs") and s["docs"] <= pdocs:
                 del stats[k]
                 break
@@ -634,6 +639,9 @@ def _dedup_contained(stats, regions_per_file, phrases, threshold):
     for k, s in stats.items():
         if k in selected:
             continue
+        if s["cnt"] < threshold:
+            continue  # only a token that would itself be displayed may
+            # absorb a candidate; one-off titles never cover anything
         if not any(CJK_RE.match(ch) for ch in k):
             continue
         tnorm = "".join(norm for _sp, norm in chinese_runs(k))
