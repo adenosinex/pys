@@ -308,6 +308,7 @@ def node_dict(row, with_extra=False):
         "fields": _loads(row["fields"], {}), "tags": _loads(row["tags"], []),
         "difficulty": row["difficulty"], "status": row["status"],
         "verify": row["verify"], "favorite": bool(row["favorite"]),
+        "chars": len(row["summary"] or "") + len(row["body"] or ""),
         "archived": bool(row["archived"]), "next_review_at": row["next_review_at"],
         "created_at": row["created_at"], "updated_at": row["updated_at"],
     }
@@ -574,6 +575,9 @@ def home_data():
     for r in conn.execute("SELECT status, COUNT(*) AS c FROM nodes WHERE archived = 0 GROUP BY status"):
         counts[r["status"]] = r["c"]
     total = conn.execute("SELECT COUNT(*) AS c FROM nodes WHERE archived = 0").fetchone()["c"]
+    total_chars = conn.execute(
+        "SELECT COALESCE(SUM(LENGTH(summary) + LENGTH(body)), 0) AS s FROM nodes WHERE archived = 0"
+    ).fetchone()["s"]
     pending = conn.execute(
         "SELECT COUNT(*) AS c FROM nodes WHERE archived = 0 AND verify = 'pending'").fetchone()["c"]
     due = [node_dict(r) for r in conn.execute(
@@ -588,6 +592,7 @@ def home_data():
     for r in conn.execute("SELECT tags FROM nodes WHERE archived = 0"):
         tags.update(_loads(r["tags"], []))
     return {"counts": counts, "total": total, "pending_verify": pending,
+            "total_chars": total_chars,
             "due": due, "continue": cont, "recent": recent, "tags": sorted(tags)}
 
 
@@ -691,6 +696,7 @@ async function api(path, opts){
   if(!r.ok) throw new Error(d.error || ("请求失败 " + r.status));
   return d;
 }
+function fmtChars(c){ if(!c && c !== 0) return "0"; return c >= 10000 ? (Math.round(c / 100) / 100) + " 万" : String(c); }
 function badges(n){
   let h = '<span class="badge t">' + esc(TYPES[n.type]||n.type) + '</span>'
         + '<span class="badge">' + esc(n.category) + '</span>'
@@ -724,6 +730,7 @@ async function renderHome(app){
   let h = "";
   h += '<div class="card"><h2 style="margin:4px 0 10px">今日学习</h2>';
   h += '<span class="stat">知识总数 <b>' + d.total + '</b></span>'
+     + '<span class="stat">总字数 <b>' + fmtChars(d.total_chars) + '</b></span>'
      + '<span class="stat">已掌握 <b>' + (d.counts.mastered||0) + '</b></span>'
      + '<span class="stat">学习中 <b>' + (d.counts.learning||0) + '</b></span>'
      + '<span class="stat">待复习 <b>' + (d.counts.review||0) + '</b></span>'
@@ -758,7 +765,7 @@ async function renderLibrary(app){
      + Object.keys(STS).map(k => '<option value="' + k + '"' + (state.status === k ? " selected" : "") + '>' + STS[k] + '</option>').join("") + '</select>'
      + '<select class="in wa" id="lib-tag"><option value="">全部标签</option>'
      + home.tags.map(t => '<option' + (state.tag === t ? " selected" : "") + '>' + esc(t) + '</option>').join("") + '</select></div>';
-  h += '<p class="small">共 ' + list.nodes.length + ' 条</p>';
+  h += '<p class="small">共 ' + list.nodes.length + ' 条 · 约 ' + fmtChars(list.nodes.reduce((a, x) => a + (x.chars || 0), 0)) + ' 字</p>';
   h += list.nodes.length ? '<div class="grid">' + list.nodes.map(kcard).join("") + '</div>'
                          : '<div class="empty">没有找到符合条件的知识。可以换个关键词，或新增一条。</div>';
   app.innerHTML = h;
@@ -801,6 +808,7 @@ async function renderDetail(app){
      + '<button class="btn ghost sm" id="d-edit">编辑</button>'
      + '<button class="btn gray sm" id="d-archive">' + (n.archived ? "取消归档" : "归档") + '</button>'
      + '<button class="btn danger sm" id="d-delete">删除</button></div>';
+  h += '<p class="small" style="margin-top:8px">正文约 ' + fmtChars(n.chars) + ' 字 · 更新于 ' + new Date(n.updated_at * 1000).toLocaleDateString() + '</p>';
   h += '<p class="small" style="margin-top:8px">复习自评：'
      + '<button class="btn gray sm" data-rev="again">忘了（1 天后）</button> '
      + '<button class="btn gray sm" data-rev="fuzzy">模糊（2 天后）</button> '
