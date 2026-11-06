@@ -305,15 +305,41 @@ def _loads(text, default):
         return default
 
 
+def _text_len(v):
+    if isinstance(v, str):
+        return len(v)
+    if isinstance(v, list):
+        return sum(_text_len(x) for x in v)
+    if isinstance(v, dict):
+        return sum(_text_len(x) for x in v.values())
+    return 0
+
+
+def _char_breakdown(summary, body, fields):
+    rig = len(summary or "") + len(body or "")
+    plain = 0
+    rest = 0
+    if isinstance(fields, dict):
+        for k, v in fields.items():
+            if k == "plain":
+                plain = _text_len(v)
+            else:
+                rest += _text_len(v)
+    return rig, plain, rest
+
+
 def node_dict(row, with_extra=False):
+    _fields = _loads(row["fields"], {})
+    _rig, _plain, _rest = _char_breakdown(row["summary"], row["body"], _fields)
     d = {
         "id": row["id"], "type": row["type"], "category": row["category"],
         "title": row["title"], "aliases": _loads(row["aliases"], []),
         "summary": row["summary"], "body": row["body"],
-        "fields": _loads(row["fields"], {}), "tags": _loads(row["tags"], []),
+        "fields": _fields, "tags": _loads(row["tags"], []),
         "difficulty": row["difficulty"], "status": row["status"],
         "verify": row["verify"], "favorite": bool(row["favorite"]),
-        "chars": len(row["summary"] or "") + len(row["body"] or ""),
+        "chars": _rig + _plain + _rest,
+        "chars_rig": _rig, "chars_plain": _plain, "chars_fields": _rest,
         "archived": bool(row["archived"]), "next_review_at": row["next_review_at"],
         "created_at": row["created_at"], "updated_at": row["updated_at"],
     }
@@ -580,9 +606,13 @@ def home_data():
     for r in conn.execute("SELECT status, COUNT(*) AS c FROM nodes WHERE archived = 0 GROUP BY status"):
         counts[r["status"]] = r["c"]
     total = conn.execute("SELECT COUNT(*) AS c FROM nodes WHERE archived = 0").fetchone()["c"]
-    total_chars = conn.execute(
-        "SELECT COALESCE(SUM(LENGTH(summary) + LENGTH(body)), 0) AS s FROM nodes WHERE archived = 0"
-    ).fetchone()["s"]
+    total_chars = rig_chars = plain_chars = fields_chars = 0
+    for r in conn.execute("SELECT summary, body, fields FROM nodes WHERE archived = 0"):
+        _a, _b, _c = _char_breakdown(r["summary"], r["body"], _loads(r["fields"], {}))
+        rig_chars += _a
+        plain_chars += _b
+        fields_chars += _c
+    total_chars = rig_chars + plain_chars + fields_chars
     pending = conn.execute(
         "SELECT COUNT(*) AS c FROM nodes WHERE archived = 0 AND verify = 'pending'").fetchone()["c"]
     due = [node_dict(r) for r in conn.execute(
@@ -597,7 +627,8 @@ def home_data():
     for r in conn.execute("SELECT tags FROM nodes WHERE archived = 0"):
         tags.update(_loads(r["tags"], []))
     return {"counts": counts, "total": total, "pending_verify": pending,
-            "total_chars": total_chars,
+            "total_chars": total_chars, "rig_chars": rig_chars,
+            "plain_chars": plain_chars, "fields_chars": fields_chars,
             "due": due, "continue": cont, "recent": recent, "tags": sorted(tags)}
 
 
@@ -741,6 +772,7 @@ async function renderHome(app){
      + '<span class="stat">学习中 <b>' + (d.counts.learning||0) + '</b></span>'
      + '<span class="stat">待复习 <b>' + (d.counts.review||0) + '</b></span>'
      + '<span class="stat">待核验 <b>' + d.pending_verify + '</b></span>';
+  h += '<p class="small" style="margin:2px 0 4px">字数构成：严谨正文 ' + fmtChars(d.rig_chars) + ' 字 · 通俗解读 ' + fmtChars(d.plain_chars) + ' 字 · 档案与模板字段 ' + fmtChars(d.fields_chars) + ' 字</p>';
   h += '<div class="row-flex" style="margin-top:6px"><button class="btn" onclick="go(\'library\')">进入知识库</button>'
      + '<button class="btn ghost" id="home-add">＋ 新增知识</button></div></div>';
   if(d.due.length){
@@ -815,7 +847,7 @@ async function renderDetail(app){
      + '<button class="btn ghost sm" id="d-edit">编辑</button>'
      + '<button class="btn gray sm" id="d-archive">' + (n.archived ? "取消归档" : "归档") + '</button>'
      + '<button class="btn danger sm" id="d-delete">删除</button></div>';
-  h += '<p class="small" style="margin-top:8px">正文约 ' + fmtChars(n.chars) + ' 字 · 更新于 ' + new Date(n.updated_at * 1000).toLocaleDateString() + '</p>';
+  h += '<p class="small" style="margin-top:8px">全文约 ' + fmtChars(n.chars) + ' 字（严谨 ' + fmtChars(n.chars_rig) + ' · 通俗 ' + fmtChars(n.chars_plain) + ' · 档案 ' + fmtChars(n.chars_fields) + '）· 更新于 ' + new Date(n.updated_at * 1000).toLocaleDateString() + '</p>';
   h += '<p class="small" style="margin-top:8px">复习自评：'
      + '<button class="btn gray sm" data-rev="again">忘了（1 天后）</button> '
      + '<button class="btn gray sm" data-rev="fuzzy">模糊（2 天后）</button> '
