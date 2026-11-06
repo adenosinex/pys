@@ -414,8 +414,8 @@ def atom_span_stats(regions_per_file, filenames, threshold):
         for region in regions:
             n = len(region)
             for a in range(n):
-                if is_protected(region[a]):
-                    continue
+                if is_protected(region[a]) or region[a].lower() in KNOWN_EXTS:
+                    continue  # protected atoms and bare extension names
                 text = ""
                 all_cjk = True
                 for k in range(a, min(n, a + 6)):
