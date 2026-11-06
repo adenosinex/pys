@@ -20,10 +20,12 @@
 配置：脚本同目录 nameclean_client.json
   {"server": "https://debi.su7.dpdns.org/web/nameclean", "token": "你在网页设置里填的令牌"}
 也可以用环境变量（优先于配置文件）：NAMECLEAN_TOKEN、NAMECLEAN_SERVER。
+接口入口自动推导：server 填网页地址即可，客户端会改走同域名的 /nc-api
+直连入口（不过网页门禁，只认令牌）；特殊情况可用 NAMECLEAN_API 覆盖。
 客户端可从清洗台网页右上角「下载客户端」直接下载最新版。
 分段/套用算法与服务端保持一致（SEG_VERSION = 1）。
 """
-CLIENT_VERSION = "1.2.1"
+CLIENT_VERSION = "1.3.0"
 import argparse
 import json
 import os
@@ -32,6 +34,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 
 SEG_VERSION = 1
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
@@ -146,6 +149,15 @@ def parse_rules_text(text):
 
 
 # ---------------- http ------------------------------------------------------
+
+def derive_api_base(server):
+    """Web URL -> direct API entry on the same origin (…/web/nameclean ->
+    …/nc-api). If server already points at the API entry, use it as-is."""
+    p = urllib.parse.urlsplit(server)
+    if p.path.rstrip("/").endswith("/nc-api"):
+        return server.rstrip("/")
+    return "%s://%s/nc-api" % (p.scheme, p.netloc)
+
 
 class Client:
     def __init__(self, server, token):
@@ -360,8 +372,10 @@ def main(argv=None):
               "也可以用环境变量 NAMECLEAN_TOKEN 提供。")
         return 2
 
-    client = Client(server, token)
-    print("上传文件名清单到清洗台…")
+    api_base = (os.environ.get("NAMECLEAN_API") or cfg.get("api")
+                or derive_api_base(server))
+    client = Client(api_base, token)
+    print("上传文件名清单到清洗台…（接口 %s）" % api_base)
     try:
         r = client.call("POST", "/api/client/batches",
                         {"name": os.path.basename(os.path.abspath(args.path)),
