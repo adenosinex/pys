@@ -71,6 +71,10 @@ REL_TYPES = {
     "metabolized_in": "主要代谢于",
     "differential": "需与之鉴别",
     "examined_by": "可通过检查",
+    "prerequisite": "是…的前置知识",
+    "adverse": "可引起不良反应",
+    "contraindicated": "禁忌/慎用于",
+    "interacts": "与…相互作用",
 }
 STATUSES = {"unlearned": "未学习", "learning": "学习中",
             "review": "待复习", "mastered": "已掌握"}
