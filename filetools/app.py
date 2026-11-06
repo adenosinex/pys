@@ -10,20 +10,22 @@ executes the moves locally (no overwrite, undo log, report back). The
 server never sees file contents.
 
 A function is ONE pasted function — all peripheral machinery lives in
-this project, the function only carries the core rule:
+this project, the function only carries the core rule. It receives the
+WHOLE batch at once (a per-file mapping cannot count, accumulate or
+sort across files, which real organizing rules need):
 
-    def transform(path, size=None):
-        \"\"\"按大小分夹\"\"\"
-        ...
+    NEEDS = ["size"]            # optional: fields the client must supply
 
-Contract (see SPEC_TEXT in the page help / the spec document):
-  - the code defines `transform`; its first parameter is `path`
-    (a relative path string);
-  - return the new relative path, or None / "" / the same path to
-    leave the file alone;
-  - extra inputs are declared BY PARAMETER NAME: size, mtime
-    (fetched by the client on demand), index, total (batch context,
-    supplied by the server). Missing field values arrive as None;
+    def transform(files):
+        '''display name from this docstring'''
+        # files: [{"path": rel, "size": ..., "mtime": ...}, ...]
+        #        (natural-sorted; only NEEDS fields are populated)
+        # return [{"from": a, "to": b}, ...] | {a: b} | [(a, b)] | None
+
+Contract (see the spec document / page help):
+  - the code defines `transform(files)` — one parameter, the file list;
+  - extra inputs are declared by the NEEDS constant (size / mtime),
+    fetched by the client on demand; missing values arrive as None;
   - the display name is the docstring's first line;
   - `common` helpers are pre-imported in the function's namespace.
 Functions live as .py files in DATA_DIR/tools/; saving one on the web
@@ -47,7 +49,7 @@ import traceback
 MAX_PATHS = 50000
 FIELD_PARAMS = ("size", "mtime")     # supplied by the client on demand
 CTX_PARAMS = ("index", "total")      # supplied by the server
-SEED_STAMP = "2"
+SEED_STAMP = "3"
 
 # ---------------- data dir / db (per-thread connections) ----------------
 
@@ -191,31 +193,24 @@ def _load_common():
 
 
 def _signature_of(func):
-    """Validate transform's signature. Returns (argnames, needs, error)."""
+    """Validate transform's signature. Returns an error string or ""."""
     try:
         params = [p for p in inspect.signature(func).parameters.values()
                   if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
     except (TypeError, ValueError):
-        return None, None, "无法读取函数签名"
-    if not params or params[0].name != "path":
-        return None, None, "第一个参数必须是 path"
-    argnames = [p.name for p in params]
-    needs = []
-    for name in argnames[1:]:
-        if name in FIELD_PARAMS:
-            needs.append(name)
-        elif name in CTX_PARAMS:
-            pass
-        else:
-            return None, None, ("不支持的参数 %s(只允许 size / mtime / "
-                                "index / total)" % name)
-    return argnames, needs, ""
+        return "无法读取函数签名"
+    if not params or params[0].name != "files":
+        return "transform 的参数必须是 files(全部文件列表)"
+    if len(params) > 1:
+        return ("transform 只接受 files 一个参数;"
+                "需要字段请在代码顶部声明 NEEDS = [...]")
+    return ""
 
 
 def _load_one(fn):
     path = os.path.join(TOOLS_DIR, fn)
     entry = {"file": fn, "id": fn[:-3], "ok": False, "error": "",
-             "name": fn[:-3], "desc": "", "needs": [], "argnames": [],
+             "name": fn[:-3], "desc": "", "needs": [],
              "func": None}
     common = _load_common()
     ns = {"__name__": "fttool_" + re.sub(r"\W", "_", fn[:-3]),
@@ -231,13 +226,19 @@ def _load_one(fn):
     if not callable(func):
         entry["error"] = "代码里没有定义 transform 函数"
         return entry
-    argnames, needs, err = _signature_of(func)
+    err = _signature_of(func)
     if err:
         entry["error"] = err
         return entry
+    needs_decl = ns.get("NEEDS") or []
+    if not isinstance(needs_decl, (list, tuple)) or \
+            any(n not in FIELD_PARAMS for n in needs_decl):
+        entry["error"] = "NEEDS 只能是 size / mtime 组成的列表"
+        return entry
+    needs = list(needs_decl)
     doc = (inspect.getdoc(func) or "").strip()
     lines = doc.split("\n") if doc else []
-    entry.update({"ok": True, "func": func, "argnames": argnames,
+    entry.update({"ok": True, "func": func,
                   "needs": needs,
                   "name": lines[0].strip() if lines else fn[:-3],
                   "desc": "\n".join(lines[1:]).strip()})
@@ -322,41 +323,52 @@ def compute_plan(batch_id):
         f.update(json.loads(r["fields"] or "{}"))
         files.append(f)
     files.sort(key=lambda f: _natural_key(f["path"]))
-    total = len(files)
-    ops, errors, seen_from = [], 0, set()
-    for i, f in enumerate(files):
-        kwargs = {}
-        for name in tool["argnames"][1:]:
-            if name == "index":
-                kwargs["index"] = i
-            elif name == "total":
-                kwargs["total"] = total
-            else:  # size / mtime: None when the client could not read it
-                kwargs[name] = f.get(name)
-        try:
-            newp = tool["func"](f["path"], **kwargs)
-        except Exception:
-            errors += 1
-            continue
-        if not newp or not isinstance(newp, str):
-            continue
-        dst = _norm_rel(newp)
-        if not dst or dst == f["path"] or f["path"] in seen_from:
-            continue
-        seen_from.add(f["path"])
-        ops.append({"from": f["path"], "to": dst})
-    note = ""
-    if errors:
-        note = "%d 个文件处理出错已跳过" % errors
-    c.execute("UPDATE batches SET plan = ?, plan_count = ?, plan_note = ?, "
+    try:
+        result = tool["func"](files)
+    except Exception:
+        errlines = traceback.format_exc(limit=3).strip().split("\n")
+        first = errlines[-1] if errlines else "unknown error"
+        c.execute("UPDATE batches SET status = 'open', plan = '[]', "
+                  "plan_count = 0, plan_note = ?, updated_at = ? "
+                  "WHERE id = ?",
+                  ("生成失败: " + first, time.time(), batch_id))
+        c.commit()
+        return False, "transform 报错: " + first
+    ops = _normalize_ops(result, {f["path"] for f in files})
+    c.execute("UPDATE batches SET plan = ?, plan_count = ?, plan_note = '', "
               "status = 'ready', updated_at = ? WHERE id = ?",
-              (json.dumps(ops, ensure_ascii=False), len(ops), note,
+              (json.dumps(ops, ensure_ascii=False), len(ops),
                time.time(), batch_id))
     c.commit()
-    msg = "已生成 %d 条操作" % len(ops)
-    if note:
-        msg += "(" + note + ")"
-    return True, msg
+    return True, "已生成 %d 条操作" % len(ops)
+
+
+def _normalize_ops(result, known):
+    """Accept transform()'s return value in its documented shapes:
+    [{"from": a, "to": b}, ...] | {a: b} | [(a, b), ...] | None."""
+    if result is None:
+        return []
+    pairs = []
+    if isinstance(result, dict):
+        pairs = list(result.items())
+    elif isinstance(result, (list, tuple)):
+        for item in result:
+            if isinstance(item, dict):
+                pairs.append((item.get("from"), item.get("to")))
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                pairs.append((item[0], item[1]))
+    ops, seen_from = [], set()
+    for src, dst in pairs:
+        if not src or not dst:
+            continue
+        s2, d2 = _norm_rel(src), _norm_rel(dst)
+        if not s2 or not d2 or s2 == d2:
+            continue
+        if s2 not in known or s2 in seen_from:
+            continue
+        seen_from.add(s2)
+        ops.append({"from": s2, "to": d2})
+    return ops
 
 
 # ---------------- http helpers ---------------------------------------------
@@ -735,31 +747,32 @@ PAGE = r"""<!DOCTYPE html>
 body{font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:var(--bg);color:var(--ink)}
 header{display:flex;align-items:center;gap:10px;padding:14px 20px;position:sticky;top:0;z-index:6;background:linear-gradient(90deg,var(--acc),var(--acc2));color:#fff;box-shadow:0 2px 14px rgba(60,50,180,.25)}
 header h1{font-size:18px;margin:0;font-weight:650;letter-spacing:.5px}
-header.sp{flex:1}
+header .sp{flex:1}
 .hbtn{background:rgba(255,255,255,.16);color:#fff;border:1px solid rgba(255,255,255,.35);border-radius:999px;padding:6px 14px;font-size:13px;cursor:pointer;text-decoration:none}
 .hbtn:hover{background:rgba(255,255,255,.28)}
 main{max-width:1020px;margin:0 auto;padding:18px 14px 40px}
 h2.sec{font-size:15px;margin:20px 2px 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-h2.sec.r{margin-left:auto;font-size:12px;color:var(--mut);font-weight:400}
+h2.sec .r{margin-left:auto;font-size:12px;color:var(--mut);font-weight:400}
+h2.sec.dim{font-size:13.5px;opacity:.85;margin-top:32px}
 #selInfo{font-size:12.5px;color:var(--acc);font-weight:600}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:12px}
-.fcard{background:var(--card);border:1.5px solid var(--line);border-radius:14px;padding:13px 14px;box-shadow:0 1px 4px rgba(20,30,60,.05);cursor:pointer;transition:all.15s;position:relative}
+.fcard{background:var(--card);border:1.5px solid var(--line);border-radius:14px;padding:13px 14px;box-shadow:0 1px 4px rgba(20,30,60,.05);cursor:pointer;transition:all .15s;position:relative}
 .fcard:hover{border-color:var(--acc);transform:translateY(-1px);box-shadow:0 5px 14px rgba(79,70,229,.18)}
 .fcard:active{transform:scale(.98)}
-.fcard.nm{font-weight:650;font-size:14.5px;padding-right:34px}
-.fcard.fl{color:var(--mut);font-size:11.5px;margin-top:2px}
-.fcard.ds{color:var(--mut);font-size:12px;margin-top:6px;white-space:pre-wrap}
+.fcard .nm{font-weight:650;font-size:14.5px;padding-right:34px}
+.fcard .fl{color:var(--mut);font-size:11.5px;margin-top:2px}
+.fcard .ds{color:var(--mut);font-size:12px;margin-top:6px;white-space:pre-wrap}
 .fcard.bad{cursor:default;opacity:.75}
 .fcard.bad:hover{border-color:var(--line);transform:none;box-shadow:0 1px 4px rgba(20,30,60,.05)}
 .edit-ic{position:absolute;top:9px;right:9px;background:var(--chip);border:0;color:var(--acc);width:26px;height:26px;border-radius:8px;cursor:pointer;font-size:13px;line-height:1}
 .edit-ic:hover{background:var(--acc);color:#fff}
 .badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;background:var(--chip);color:var(--acc)}
 .badge.need{background:#fdf0e0;color:var(--warn)}
-.bcard{background:var(--card);border:1.5px solid var(--line);border-radius:14px;padding:13px 16px;margin-bottom:10px;box-shadow:0 1px 4px rgba(20,30,60,.05);cursor:pointer;transition:border-color.15s}
+.bcard{background:var(--card);border:1.5px solid var(--line);border-radius:11px;padding:9px 14px;margin-bottom:8px;cursor:pointer;transition:border-color .15s}
 .bcard:hover{border-color:#c3cbf5}
 .bcard.sel{border-color:var(--acc);box-shadow:0 0 0 3px rgba(79,70,229,.15)}
-.bcard.top{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
-.bcard.nm{font-weight:650;font-size:15px}
+.bcard .top{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.bcard .nm{font-weight:600;font-size:14px}
 .meta{color:var(--mut);font-size:12px}
 .chip{display:inline-block;padding:2px 10px;border-radius:999px;font-size:11.5px;font-weight:600}
 .chip.open{background:#eef1fb;color:var(--acc)}
@@ -767,9 +780,9 @@ h2.sec.r{margin-left:auto;font-size:12px;color:var(--mut);font-weight:400}
 .chip.ready{background:#e2f6ec;color:var(--ok)}
 .chip.done{background:#e8ecf3;color:var(--mut)}
 .chip.selchip{background:var(--acc);color:#fff}
-.status-line{margin-top:8px;font-size:13px;color:var(--mut)}
+.status-line{margin-top:7px;font-size:12.5px;color:var(--mut)}
 .status-line b{color:var(--ink)}
-.cardfoot{display:flex;align-items:center;gap:10px;margin-top:9px}
+.cardfoot{display:flex;align-items:center;gap:10px;margin-top:7px}
 .link{background:none;border:0;color:var(--acc);cursor:pointer;font-size:12px;padding:2px 4px}
 .delquiet{margin-left:auto;background:none;border:0;color:var(--mut);font-size:12px;cursor:pointer;opacity:.55;padding:2px 4px}
 .delquiet:hover{opacity:1;color:var(--err)}
@@ -791,9 +804,9 @@ textarea{width:100%;min-height:230px;padding:11px;border:1px solid var(--line);b
 .mbox h3{margin:0 0 12px;font-size:16px}
 .mbox label{display:block;font-size:12.5px;color:var(--mut);margin:10px 0 4px}
 .mrow{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
-.mrow.sp{flex:1}
+.mrow .sp{flex:1}
 pre.spec{background:#0f172a;color:#c9d6f2;padding:13px;border-radius:10px;font-size:12px;overflow:auto;white-space:pre-wrap;line-height:1.65}
-#toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);background:#16233a;color:#fff;padding:10px 20px;border-radius:999px;font-size:13.5px;opacity:0;pointer-events:none;transition:all.25s;z-index:30;max-width:92vw;text-align:center}
+#toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);background:#16233a;color:#fff;padding:10px 20px;border-radius:999px;font-size:13.5px;opacity:0;pointer-events:none;transition:all .25s;z-index:30;max-width:92vw;text-align:center}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #toast.err{background:var(--err)}
 .err{color:var(--err);font-size:12.5px;white-space:pre-wrap}
@@ -805,17 +818,17 @@ pre.spec{background:#0f172a;color:#c9d6f2;padding:13px;border-radius:10px;font-s
 <button class="hbtn" onclick="openHelp()">编写规范</button>
 <a class="hbtn" href="download/filetools_client.py">下载客户端</a>
 </header><main>
-<h2 class="sec">批次 · 文件列表<span class="r">点一张批次卡选中它</span></h2>
-<div id="batches"><div class="empty">加载中…</div></div>
 <h2 class="sec">功能<span id="selInfo"></span><span class="r">点功能卡对选中批次执行</span></h2>
 <div class="grid" id="funcs"></div>
 <div style="margin-top:12px"><button class="btn ghost" onclick="openEditor(null)">＋ 新功能（粘贴代码）</button>
-<label class="link" style="cursor:pointer">或上传.py<input type="file" id="upFile" accept=".py" hidden onchange="uploadFile(this)"></label></div>
+<label class="link" style="cursor:pointer">或上传 .py<input type="file" id="upFile" accept=".py" hidden onchange="uploadFile(this)"></label></div>
+<h2 class="sec dim">批次 · 文件列表<span class="r">点一行选中它，功能对它执行</span></h2>
+<div id="batches"><div class="empty">加载中…</div></div>
 <h2 class="sec">设置</h2>
 <div class="scard"><div style="font-weight:650;font-size:13.5px">客户端令牌</div>
 <div class="setrow"><input type="password" id="tok" size="30" placeholder="至少 8 位（只写入、不可读回）">
 <button class="btn" onclick="setToken()">保存</button><span class="meta" id="tokState"></span></div>
-<div class="meta" style="margin-top:6px">流程：客户端扫文件夹只传路径 → 在上方点选批次 → 点功能卡执行 → 若功能声明了 size/mtime，客户端自动补读 → 清单生成后客户端执行并回传。</div></div>
+<div class="meta" style="margin-top:6px">流程：客户端扫文件夹只传路径 → 在下方列表点选批次 → 点上方功能卡执行 → 若功能声明了 size/mtime，客户端自动补读 → 清单生成后客户端执行并回传。</div></div>
 </main>
 
 <div class="modal" id="editModal"><div class="mbox">
@@ -841,205 +854,214 @@ pre.spec{background:#0f172a;color:#c9d6f2;padding:13px;border-radius:10px;font-s
 <script>
 let tools = [], batches = [], sig = "", modalOpen = false;
 let selBatch = null, armedDel = 0, armedUntil = 0, editingFile = null;
-const SPEC = `
+const SPEC = `【一个功能 = 一个函数，面对的是整批文件】
 粘贴一段 Python 代码、起个文件名保存即生效。外围（扫描、传参、生成
 清单、执行、回滚）全部由项目承担，代码只写核心规则。
 
+【函数签名】
+必须定义函数 transform，只有一个参数 files —— 整批文件列表：
+  [{"path": "子目录/a.mp4", ...}, ...]
+已按路径自然排序。一次调用看全集，所以计数、累计、排序、限量都能做。
 
-必须定义函数 transform，第一个参数固定为 path —— 相对路径字符串，
-如 "子目录/视频.mp4"。按自然排序逐个文件调用。
+【需要更多信息：代码顶部声明 NEEDS】
+  NEEDS = ["size"]     # 文件大小（字节）
+  NEEDS = ["mtime"]    # 修改时间（Unix 秒）
+声明了，客户端会自动补读，值出现在每个文件字典里（读不到为 None）；
+不声明就只有 path。NEEDS 写了表外字段，保存时会被拒绝。
 
+【返回值】（三种写法任选）
+  [{"from": 原路径, "to": 新路径}, ...]
+  {原路径: 新路径, ...}
+  [(原路径, 新路径), ...]
+不返回、返回 None 或空 = 全部不动。不出现在返回值里的文件不动。
 
-返回新的相对路径字符串；返回 None、空字符串或原路径 = 这个文件不动。
-
-
-size 文件大小（字节，整数）—— 客户端会自动补读后再执行
-mtime 修改时间（Unix 秒）—— 同上
-index 该文件在整批中的序号（从 0 开始）—— 服务器直接提供
-total 整批文件总数 —— 服务器直接提供
-字段读不到时传入 None，代码里自己判空。参数名写错或写了表外参数，
-保存时会被拒绝并告诉你原因。
-
-
+【显示名】
 函数文档字符串的第一行就是卡片上显示的名字。没有文档字符串时显示文件名。
 
+【可用工具】
+代码里已预置 common 模块：common.basename / dirname / ext_of /
+size_bucket / natural_key / safe_seg。也可以 import 标准库模块。
 
-代码里已预置 common 模块，可直接用：
-common.basename(path) 取文件名 common.ext_of(name) 取扩展名
-common.size_bucket(size) 大小分档 common.safe_seg(s) 清洗路径段
-也可以 import 标准库模块。
+【红线】
+只做纯计算：不要读写文件、不要联网。函数抛异常，整批生成失败，
+批次会退回待执行并显示错误原因，改好代码重新点即可。
 
+【示例】
+按大小分夹、每夹最多 100 个（声明 size）：
+  NEEDS = ["size"]
+  def transform(files):
+      '''按大小分夹'''
+      ops, counters = [], {}
+      for f in files:
+          if f.get("size") is None: continue
+          cat = "大于500M" if f["size"] > 500*1024*1024 else "小于500M"
+          counters[cat] = counters.get(cat, 0) + 1
+          folder = cat if counters[cat] <= 100 else cat + "-%d" % ((counters[cat]-1)//100 + 1)
+          ops.append({"from": f["path"], "to": folder + "/" + f["path"].rsplit("/", 1)[-1]})
+      return ops
 
-只做纯计算：不要读写文件、不要联网。函数只输入路径、输出路径；
-对某个文件抛异常只会跳过该文件并计数，不影响其他文件。
+累计 1GB 装箱（声明 size）：
+  NEEDS = ["size"]
+  def transform(files):
+      '''按累计大小装箱'''
+      ops, box, acc = [], 1, 0
+      for f in sorted(files, key=lambda x: -(x.get("size") or 0)):
+          sz = f.get("size") or 0
+          if acc + sz > 1024*1024*1024 and acc > 0: box, acc = box + 1, 0
+          acc += sz
+          ops.append({"from": f["path"], "to": "箱%03d/" % box + f["path"].rsplit("/", 1)[-1]})
+      return ops`;
+const TEMPLATE = `NEEDS = []  # 需要额外字段时填 ["size"] / ["mtime"]
 
-
-集中到根目录：
-def transform(path):
-'''集中到根目录'''
-if "/" in path:
-return path.rsplit("/", 1)[-1]
-
-按大小分夹（声明 size）：
-def transform(path, size):
-'''按大小分夹'''
-if size is None: return None
-name = path.rsplit("/", 1)[-1]
-return ("大于500M/" if size > 500*1024*1024 else "小于500M/") + name
-
-每组 2 个（声明 index）：
-def transform(path, index):
-'''分组到新文件夹'''
-return "分组%03d/" % (index // 2 + 1) + path.rsplit("/", 1)[-1]`;
-const TEMPLATE = `def transform(path):
-'''功能名称（显示在卡片上）'''
-# path 是相对路径，如 "子目录/文件.mp4"
-# 返回新相对路径；返回 None 表示不动这个文件
-return None
-`;
+def transform(files):
+    '''功能名称（显示在卡片上）'''
+    # files: [{"path": "子目录/文件.mp4", ...}, ...]，已按路径自然排序
+    # 返回 [{"from": 原路径, "to": 新路径}, ...]；不返回 = 全部不动
+    return []`;
 async function jget(u){const r = await fetch(u); return r.json();}
 async function jpost(u, body){const r = await fetch(u, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{})}); return r.json();}
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
-function fmtT(ts){return ts? new Date(ts*1000).toLocaleString("zh-CN",{hour12:false}): "";}
+function fmtT(ts){return ts ? new Date(ts*1000).toLocaleString("zh-CN",{hour12:false}) : "";}
 let toastTimer = null;
-function toast(msg, isErr){ const t = document.getElementById("toast"); t.textContent = msg; t.className = "show" + (isErr? " err": ""); clearTimeout(toastTimer); toastTimer = setTimeout(()=>{ t.className = "";}, 3400);}
-function toolName(id){ const t = tools.find(x=>x.id===id); return t? t.name: id;}
-function selectedBatch(){ return batches.find(b=>b.id===selBatch) || null;}
+function toast(msg, isErr){ const t = document.getElementById("toast"); t.textContent = msg; t.className = "show" + (isErr ? " err" : ""); clearTimeout(toastTimer); toastTimer = setTimeout(()=>{ t.className = ""; }, 3400); }
+function toolName(id){ const t = tools.find(x=>x.id===id); return t ? t.name : id; }
+function selectedBatch(){ return batches.find(b=>b.id===selBatch) || null; }
 function ensureSelection(){
-if(selectedBatch()) return;
-const open = batches.find(b=>b.status==="open");
-selBatch = (open || batches[0] || {}).id?? null;
+  if(selectedBatch()) return;
+  const open = batches.find(b=>b.status==="open");
+  selBatch = (open || batches[0] || {}).id ?? null;
 }
 function renderFuncs(){
-let h = "";
-for(const t of tools){
-if(!t.ok){
-h += "<div class='fcard bad'><div class='nm'>"+esc(t.name)+"</div><div class='fl'>"+esc(t.file)+"</div>"
-+ "<div class='err' style='margin-top:6px'>"+esc((t.error||"").slice(-160))+"</div>"
-+ "<button class='edit-ic' title='编辑代码' onclick='openEditor(\""+esc(t.file)+"\")'>✎</button></div>";
-continue;
-}
-h += "<div class='fcard' onclick='runTool(\""+t.id+"\")'><div class='nm'>"+esc(t.name)+"</div><div class='fl'>"+esc(t.file)+"</div>"
-+ "<div style='margin-top:6px'>"+(t.needs.length? "<span class='badge need'>需要 "+esc(t.needs.join(" / "))+"</span>": "<span class='badge'>只需路径</span>")+"</div>"
-+ (t.desc? "<div class='ds'>"+esc(t.desc)+"</div>": "")
-+ "<button class='edit-ic' title='编辑代码' onclick='event.stopPropagation(); openEditor(\""+esc(t.file)+"\")'>✎</button></div>";
-}
-document.getElementById("funcs").innerHTML = h || "<div class='empty'>暂无功能</div>";
-const b = selectedBatch();
-document.getElementById("selInfo").textContent = b? ("当前批次：" + b.name + "（" + b.file_count + " 个文件）"): "（先在上方点选一个批次）";
+  let h = "";
+  for(const t of tools){
+    if(!t.ok){
+      h += "<div class='fcard bad'><div class='nm'>"+esc(t.name)+"</div><div class='fl'>"+esc(t.file)+"</div>"
+        + "<div class='err' style='margin-top:6px'>"+esc((t.error||"").slice(-160))+"</div>"
+        + "<button class='edit-ic' title='编辑代码' onclick='openEditor(\""+esc(t.file)+"\")'>✎</button></div>";
+      continue;
+    }
+    h += "<div class='fcard' onclick='runTool(\""+t.id+"\")'><div class='nm'>"+esc(t.name)+"</div><div class='fl'>"+esc(t.file)+"</div>"
+      + "<div style='margin-top:6px'>"+(t.needs.length ? "<span class='badge need'>需要 "+esc(t.needs.join(" / "))+"</span>" : "<span class='badge'>只需路径</span>")+"</div>"
+      + (t.desc ? "<div class='ds'>"+esc(t.desc)+"</div>" : "")
+      + "<button class='edit-ic' title='编辑代码' onclick='event.stopPropagation(); openEditor(\""+esc(t.file)+"\")'>✎</button></div>";
+  }
+  document.getElementById("funcs").innerHTML = h || "<div class='empty'>暂无功能</div>";
+  const b = selectedBatch();
+  document.getElementById("selInfo").textContent = b ? ("当前批次：" + b.name + "（" + b.file_count + " 个文件）") : "（先在下方点选一个批次）";
 }
 const CHIP = {open:"待执行", fields:"补读字段中", ready:"清单已生成", done:"已完成"};
 function batchBody(b){
-let h = "";
-if(b.status === "fields") h = "<div class='status-line dotpulse'>功能 <b>"+esc(toolName(b.tool_id))+"</b> · 等待客户端补读字段（"+esc((b.needs||[]).join(", "))+"）</div>";
-else if(b.status === "ready") h = "<div class='status-line'>功能 <b>"+esc(toolName(b.tool_id))+"</b> · 生成 <b>"+b.plan_count+"</b> 条操作，等待客户端执行"+(b.plan_note? " · "+esc(b.plan_note): "")+"</div>";
-else if(b.status === "done"){ let rep = {}; try{ rep = JSON.parse(b.report||"{}");}catch(e){}
-h = "<div class='status-line'>功能 <b>"+esc(toolName(b.tool_id))+"</b> · 移动 "+(rep.moved??"—")+" · 跳过 "+(rep.skipped??"—")+" · 失败 "+(rep.errors??"—")+"</div>";}
-const armed = (armedDel === b.id && Date.now() < armedUntil);
-h += "<div class='cardfoot'>"
-+ (b.status === "ready" || b.status === "done"? "<button class='link' onclick='event.stopPropagation(); togglePlan("+b.id+", this)'>查看清单</button>": "")
-+ "<button class='delquiet"+(armed? " armed": "")+"' onclick='event.stopPropagation(); delBatch("+b.id+", this)'>"+(armed? "确认删除？": "删除批次")+"</button></div>"
-+ "<div id='plan-"+b.id+"'></div>";
-return h;
+  let h = "";
+  if(b.status === "open" && b.plan_note) h = "<div class='status-line' style='color:var(--err)'>"+esc(b.plan_note)+"</div>";
+  if(b.status === "fields") h = "<div class='status-line dotpulse'>功能 <b>"+esc(toolName(b.tool_id))+"</b> · 等待客户端补读字段（"+esc((b.needs||[]).join(", "))+"）</div>";
+  else if(b.status === "ready") h = "<div class='status-line'>功能 <b>"+esc(toolName(b.tool_id))+"</b> · 生成 <b>"+b.plan_count+"</b> 条操作，等待客户端执行"+(b.plan_note ? " · "+esc(b.plan_note) : "")+"</div>";
+  else if(b.status === "done"){ let rep = {}; try{ rep = JSON.parse(b.report||"{}"); }catch(e){}
+    h = "<div class='status-line'>功能 <b>"+esc(toolName(b.tool_id))+"</b> · 移动 "+(rep.moved??"—")+" · 跳过 "+(rep.skipped??"—")+" · 失败 "+(rep.errors??"—")+"</div>"; }
+  const armed = (armedDel === b.id && Date.now() < armedUntil);
+  h += "<div class='cardfoot'>"
+    + (b.status === "ready" || b.status === "done" ? "<button class='link' onclick='event.stopPropagation(); togglePlan("+b.id+", this)'>查看清单</button>" : "")
+    + "<button class='delquiet"+(armed ? " armed" : "")+"' onclick='event.stopPropagation(); delBatch("+b.id+", this)'>"+(armed ? "确认删除？" : "删除批次")+"</button></div>"
+    + "<div id='plan-"+b.id+"'></div>";
+  return h;
 }
 function renderBatches(){
-const box = document.getElementById("batches");
-if(!batches.length){ box.innerHTML = "<div class='empty'>暂无批次。运行客户端扫描一个文件夹，批次会出现在这里。</div>"; return;}
-box.innerHTML = batches.map(b =>
-"<div class='bcard"+(b.id===selBatch? " sel": "")+"' onclick='selectBatch("+b.id+")'><div class='top'><span class='nm'>"+esc(b.name)+"</span>"
-+ "<span class='chip "+b.status+"'>"+CHIP[b.status]+"</span>"
-+ (b.id===selBatch? "<span class='chip selchip'>已选</span>": "")
-+ "<span class='meta'>"+b.file_count+" 个文件 · "+fmtT(b.created_at)+"</span></div>"
-+ batchBody(b) + "</div>").join("");
+  const box = document.getElementById("batches");
+  if(!batches.length){ box.innerHTML = "<div class='empty'>暂无批次。运行客户端扫描一个文件夹，批次会出现在这里。</div>"; return; }
+  box.innerHTML = batches.map(b =>
+    "<div class='bcard"+(b.id===selBatch ? " sel" : "")+"' onclick='selectBatch("+b.id+")'><div class='top'><span class='nm'>"+esc(b.name)+"</span>"
+    + "<span class='chip "+b.status+"'>"+CHIP[b.status]+"</span>"
+    + (b.id===selBatch ? "<span class='chip selchip'>已选</span>" : "")
+    + "<span class='meta'>"+b.file_count+" 个文件 · "+fmtT(b.created_at)+"</span></div>"
+    + batchBody(b) + "</div>").join("");
 }
-function selectBatch(id){ selBatch = id; sig = ""; refresh();}
+function selectBatch(id){ selBatch = id; sig = ""; refresh(); }
 async function refresh(){
-const td = await jget("api/tools"); if(td.ok) tools = td.tools;
-const bd = await jget("api/batches"); if(bd.ok) batches = bd.batches;
-ensureSelection();
-const s = JSON.stringify([tools.map(t=>[t.id,t.ok,t.name]), batches.map(b=>[b.id,b.status,b.plan_count,b.tool_id]), selBatch]);
-if(s!== sig){ sig = s; renderFuncs(); renderBatches();}
+  const td = await jget("api/tools"); if(td.ok) tools = td.tools;
+  const bd = await jget("api/batches"); if(bd.ok) batches = bd.batches;
+  ensureSelection();
+  const s = JSON.stringify([tools.map(t=>[t.id,t.ok,t.name]), batches.map(b=>[b.id,b.status,b.plan_count,b.tool_id]), selBatch]);
+  if(s !== sig){ sig = s; renderFuncs(); renderBatches(); }
 }
 async function runTool(tid){
-const b = selectedBatch();
-if(!b){ toast("先在上方点选一个批次", true); return;}
-if(b.status!== "open"){ toast("批次「"+b.name+"」当前状态是"+CHIP[b.status]+"，不能重复执行", true); return;}
-const d = await jpost("api/batches/"+b.id+"/run", {tool_id: tid});
-toast(d.ok? (d.msg||"已执行"): (d.error||"失败"),!d.ok);
-sig = ""; refresh();
+  const b = selectedBatch();
+  if(!b){ toast("先在下方点选一个批次", true); return; }
+  if(b.status !== "open"){ toast("批次「"+b.name+"」当前状态是"+CHIP[b.status]+"，不能重复执行", true); return; }
+  const d = await jpost("api/batches/"+b.id+"/run", {tool_id: tid});
+  toast(d.ok ? (d.msg||"已执行") : (d.error||"失败"), !d.ok);
+  sig = ""; refresh();
 }
 async function togglePlan(bid, btn){
-const box = document.getElementById("plan-"+bid);
-if(box.innerHTML){ box.innerHTML = ""; btn.textContent = "查看清单"; return;}
-const d = await jget("api/batches/"+bid); if(!d.ok) return;
-const plan = d.batch.plan || [];
-box.innerHTML = "<div class='planbox'><table>" + plan.map(op=>"<tr><td>"+esc(op.from)+"</td><td>→</td><td>"+esc(op.to)+"</td></tr>").join("") + "</table></div>"
-+ (d.batch.plan_truncated? "<div class='meta'>仅显示前 300 条</div>": "");
-btn.textContent = "收起清单";
+  const box = document.getElementById("plan-"+bid);
+  if(box.innerHTML){ box.innerHTML = ""; btn.textContent = "查看清单"; return; }
+  const d = await jget("api/batches/"+bid); if(!d.ok) return;
+  const plan = d.batch.plan || [];
+  box.innerHTML = "<div class='planbox'><table>" + plan.map(op=>"<tr><td>"+esc(op.from)+"</td><td>→</td><td>"+esc(op.to)+"</td></tr>").join("") + "</table></div>"
+    + (d.batch.plan_truncated ? "<div class='meta'>仅显示前 300 条</div>" : "");
+  btn.textContent = "收起清单";
 }
 async function delBatch(id){
-if(armedDel === id && Date.now() < armedUntil){
-armedDel = 0;
-await fetch("api/batches/"+id, {method:"DELETE"});
-if(selBatch === id) selBatch = null;
-toast("批次已删除"); sig = ""; refresh();
-return;
-}
-armedDel = id; armedUntil = Date.now() + 3000;
-sig = ""; renderBatches();
-setTimeout(()=>{ if(armedDel === id){ armedDel = 0; renderBatches();}}, 3100);
+  if(armedDel === id && Date.now() < armedUntil){
+    armedDel = 0;
+    await fetch("api/batches/"+id, {method:"DELETE"});
+    if(selBatch === id) selBatch = null;
+    toast("批次已删除"); sig = ""; refresh();
+    return;
+  }
+  armedDel = id; armedUntil = Date.now() + 3000;
+  sig = ""; renderBatches();
+  setTimeout(()=>{ if(armedDel === id){ armedDel = 0; renderBatches(); } }, 3100);
 }
 async function openEditor(fn){
-modalOpen = true; editingFile = fn;
-document.getElementById("ed-title").textContent = fn? ("编辑功能 · " + fn): "新功能";
-const nameEl = document.getElementById("ed-name");
-nameEl.value = fn || ""; nameEl.readOnly =!!fn;
-document.getElementById("ed-del").style.display = fn? "": "none";
-document.getElementById("ed-msg").textContent = "";
-const codeEl = document.getElementById("ed-code");
-if(fn){
-codeEl.value = "加载中…";
-const d = await jget("api/tools/"+encodeURIComponent(fn)+"/source");
-codeEl.value = d.ok? d.content: ("# 读取失败: " + (d.error||""));
-} else {
-codeEl.value = TEMPLATE;
+  modalOpen = true; editingFile = fn;
+  document.getElementById("ed-title").textContent = fn ? ("编辑功能 · " + fn) : "新功能";
+  const nameEl = document.getElementById("ed-name");
+  nameEl.value = fn || ""; nameEl.readOnly = !!fn;
+  document.getElementById("ed-del").style.display = fn ? "" : "none";
+  document.getElementById("ed-msg").textContent = "";
+  const codeEl = document.getElementById("ed-code");
+  if(fn){
+    codeEl.value = "加载中…";
+    const d = await jget("api/tools/"+encodeURIComponent(fn)+"/source");
+    codeEl.value = d.ok ? d.content : ("# 读取失败: " + (d.error||""));
+  } else {
+    codeEl.value = TEMPLATE;
+  }
+  document.getElementById("editModal").classList.add("show");
 }
-document.getElementById("editModal").classList.add("show");
-}
-function closeEditor(){ modalOpen = false; editingFile = null; document.getElementById("editModal").classList.remove("show");}
+function closeEditor(){ modalOpen = false; editingFile = null; document.getElementById("editModal").classList.remove("show"); }
 async function saveTool(){
-const fn = document.getElementById("ed-name").value.trim();
-const code = document.getElementById("ed-code").value;
-const m = document.getElementById("ed-msg");
-if(!fn){ m.textContent = "先填文件名"; return;}
-const d = await jpost("api/tools/upload", {filename: fn, content: code});
-if(d.ok){ closeEditor(); toast(d.msg||"已生效"); sig=""; refresh();}
-else { m.className = "err"; m.textContent = d.error||"保存失败";}
+  const fn = document.getElementById("ed-name").value.trim();
+  const code = document.getElementById("ed-code").value;
+  const m = document.getElementById("ed-msg");
+  if(!fn){ m.textContent = "先填文件名"; return; }
+  const d = await jpost("api/tools/upload", {filename: fn, content: code});
+  if(d.ok){ closeEditor(); toast(d.msg||"已生效"); sig=""; refresh(); }
+  else { m.className = "err"; m.textContent = d.error||"保存失败"; }
 }
 async function delToolFromEditor(){
-if(!editingFile) return;
-if(!confirm("删除功能 "+editingFile+"？此操作不可恢复。")) return;
-await fetch("api/tools/"+encodeURIComponent(editingFile), {method:"DELETE"});
-closeEditor(); toast("功能已删除"); sig=""; refresh();
+  if(!editingFile) return;
+  if(!confirm("删除功能 "+editingFile+"？此操作不可恢复。")) return;
+  await fetch("api/tools/"+encodeURIComponent(editingFile), {method:"DELETE"});
+  closeEditor(); toast("功能已删除"); sig=""; refresh();
 }
 function uploadFile(inp){
-const f = inp.files[0]; if(!f) return;
-const rd = new FileReader();
-rd.onload = async () => { const d = await jpost("api/tools/upload", {filename: f.name, content: rd.result}); toast(d.ok? d.msg: d.error,!d.ok); sig=""; refresh();};
-rd.readAsText(f); inp.value = "";
+  const f = inp.files[0]; if(!f) return;
+  const rd = new FileReader();
+  rd.onload = async () => { const d = await jpost("api/tools/upload", {filename: f.name, content: rd.result}); toast(d.ok ? d.msg : d.error, !d.ok); sig=""; refresh(); };
+  rd.readAsText(f); inp.value = "";
 }
-function openHelp(){ modalOpen = true; document.getElementById("specPre").textContent = SPEC; document.getElementById("helpModal").classList.add("show");}
-function closeHelp(){ modalOpen = false; document.getElementById("helpModal").classList.remove("show");}
+function openHelp(){ modalOpen = true; document.getElementById("specPre").textContent = SPEC; document.getElementById("helpModal").classList.add("show"); }
+function closeHelp(){ modalOpen = false; document.getElementById("helpModal").classList.remove("show"); }
 async function setToken(){
-const v = document.getElementById("tok").value;
-const d = await jpost("api/settings/token", {token: v});
-toast(d.ok? "令牌已保存": (d.error||"失败"),!d.ok);
-if(d.ok){ document.getElementById("tok").value = ""; document.getElementById("tokState").textContent = "令牌已设置";}
+  const v = document.getElementById("tok").value;
+  const d = await jpost("api/settings/token", {token: v});
+  toast(d.ok ? "令牌已保存" : (d.error||"失败"), !d.ok);
+  if(d.ok){ document.getElementById("tok").value = ""; document.getElementById("tokState").textContent = "令牌已设置"; }
 }
 (async function init(){
-const s = await jget("api/session");
-document.getElementById("tokState").textContent = s.token_configured? "令牌已设置": "令牌未设置（客户端连不上，先在这里保存一个）";
-await refresh();
-setInterval(()=>{ if(!modalOpen) refresh();}, 3000);
+  const s = await jget("api/session");
+  document.getElementById("tokState").textContent = s.token_configured ? "令牌已设置" : "令牌未设置（客户端连不上，先在这里保存一个）";
+  await refresh();
+  setInterval(()=>{ if(!modalOpen) refresh(); }, 3000);
 })();
 </script></body></html>"""
