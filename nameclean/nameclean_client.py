@@ -7,7 +7,10 @@
 核心规则库在服务端先行过滤：已判定过的词块不会再让你审第二遍。
 
 用法：
-  python3 nameclean_client.py --path /待清洗目录
+  直接双击运行（或无参数运行）进入交互模式：按提示输入令牌、把文件夹
+  拖进来即可，全程有提示，结束会停住等你看完再关。
+  也可以把文件夹直接拖到本脚本图标上启动。
+  命令行：python3 nameclean_client.py --path /待清洗目录
   python3 nameclean_client.py --path /目录 --recursive      # 含子目录
   python3 nameclean_client.py --path /目录 --dry-run        # 只预览不改名
   python3 nameclean_client.py --undo nameclean-log-3.json   # 按日志回滚
@@ -20,7 +23,7 @@
 客户端可从清洗台网页右上角「下载客户端」直接下载最新版。
 分段/套用算法与服务端保持一致（SEG_VERSION = 1）。
 """
-CLIENT_VERSION = "1.1.0"
+CLIENT_VERSION = "1.2.0"
 import argparse
 import json
 import os
@@ -238,8 +241,60 @@ def load_config(path):
     return None
 
 
+def _ask(prompt, default=""):
+    try:
+        v = input(prompt).strip().strip('"').strip("'")
+    except EOFError:
+        v = ""
+    return v or default
+
+
+def interactive_main():
+    """Double-click / no-args mode: wizard prompts, then the normal flow."""
+    print("=" * 52)
+    print(" 文件名清洗客户端 v%s（交互模式）" % CLIENT_VERSION)
+    print(" 扫描目录 → 上传清单 → 你在网页上审查 → 自动改名")
+    print("=" * 52)
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "nameclean_client.json")
+    cfg = load_config(cfg_path) or {}
+    server = (os.environ.get("NAMECLEAN_SERVER") or cfg.get("server")
+              or "https://debi.su7.dpdns.org/web/nameclean")
+    token = os.environ.get("NAMECLEAN_TOKEN") or cfg.get("token") or ""
+    changed = False
+    if not token:
+        token = _ask("请输入清洗台令牌（网页「设置」页里保存的那个）: ")
+        if not token:
+            print("没有令牌无法连接，退出。")
+            return 2
+        cfg["token"] = token
+        changed = True
+    s2 = _ask("服务器地址（直接回车 = %s）: " % server, server)
+    if s2 != server:
+        server = s2
+        cfg["server"] = server
+        changed = True
+    elif not cfg.get("server"):
+        cfg["server"] = server
+        changed = True
+    if changed:
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        print("配置已保存，下次双击不用再输：", cfg_path)
+    path = _ask("把要清洗的文件夹拖到这里，或输入路径后回车: ")
+    if not path or not os.path.isdir(path):
+        print("路径无效：", path)
+        return 2
+    argv = ["--path", path, "--server", server, "--token", token]
+    if _ask("包含子文件夹？[y/N] ").lower() == "y":
+        argv.append("--recursive")
+    print()
+    return main(argv)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="文件名清洗客户端")
+    ap.add_argument("path_arg", nargs="?", help="目标目录（可把文件夹拖到脚本图标上）")
     ap.add_argument("--path", help="要扫描的目录")
     ap.add_argument("--server", help="清洗台地址（覆盖配置）")
     ap.add_argument("--token", help="客户端令牌（覆盖配置）")
@@ -259,6 +314,8 @@ def main(argv=None):
 
     if args.undo:
         return do_undo(args.undo)
+    if not args.path and args.path_arg:
+        args.path = args.path_arg
     if not args.path:
         ap.error("需要 --path")
     if not os.path.isdir(args.path):
@@ -372,5 +429,24 @@ def execute(args, paths, rules, batch_id, client):
     return 0
 
 
+def _pause():
+    try:
+        input("\n按回车键退出…")
+    except EOFError:
+        pass
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    if len(sys.argv) == 1:
+        # double-click / bare launch: interactive wizard, never flash-close
+        try:
+            _code = interactive_main()
+        except Exception as _e:
+            print("出错了：", _e)
+            _code = 1
+        _pause()
+        sys.exit(_code)
+    _code = main()
+    if len(sys.argv) == 2 and os.path.isdir(sys.argv[1]):
+        _pause()  # launched by dragging a folder onto the script icon
+    sys.exit(_code)

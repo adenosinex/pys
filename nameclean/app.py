@@ -843,7 +843,7 @@ async function renderSettings(app){
   let h = '<div class="card"><h3 style="margin:2px 0 8px">客户端令牌</h3>'
     + '<p class="small">状态：' + (s.token_configured ? "已设置" : "未设置") + '。令牌只写入、不可读回；客户端配置里填同一个令牌。清空 = 填空提交。</p>'
     + '<div style="display:flex;gap:6px"><input id="st-token" type="password" placeholder="新令牌（至少 8 位）" style="flex:1"><button class="btn primary" id="st-save">保存</button></div></div>';
-  h += '<div class="card"><h3 style="margin:2px 0 8px">客户端用法</h3><pre>下载：本页右上角「下载客户端」\npython3 nameclean_client.py --path /待清洗目录\n# 首次在同目录生成 nameclean_client.json，填入 server 与 token：\n#   server = 本页地址（https://debi.su7.dpdns.org/web/nameclean）\n#   token  = 上面设置的令牌\n# 令牌也可以走环境变量（优先于配置文件）：\n#   Linux/Mac: export NAMECLEAN_TOKEN=你的令牌\n#   Windows:   set NAMECLEAN_TOKEN=你的令牌\n# 流程：扫描上传 → 在本页审查 → 客户端自动拉取本批规则 → 预览确认 → 改名\n# 回滚：python3 nameclean_client.py --undo 日志文件.json</pre></div>';
+  h += '<div class="card"><h3 style="margin:2px 0 8px">客户端用法</h3><pre>下载：本页右上角「下载客户端」\n最简单：直接双击运行客户端，按提示输入令牌、把文件夹拖进去即可；\n也可以把文件夹拖到客户端脚本图标上启动。\n命令行：python3 nameclean_client.py --path /待清洗目录\n# 首次在同目录生成 nameclean_client.json，填入 server 与 token：\n#   server = 本页地址（https://debi.su7.dpdns.org/web/nameclean）\n#   token  = 上面设置的令牌\n# 令牌也可以走环境变量（优先于配置文件）：\n#   Linux/Mac: export NAMECLEAN_TOKEN=你的令牌\n#   Windows:   set NAMECLEAN_TOKEN=你的令牌\n# 流程：扫描上传 → 在本页审查 → 客户端自动拉取本批规则 → 预览确认 → 改名\n# 回滚：python3 nameclean_client.py --undo 日志文件.json</pre></div>';
   app.innerHTML = h;
   $("#st-save").addEventListener("click", async () => {
     try{
