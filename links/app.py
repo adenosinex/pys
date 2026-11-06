@@ -352,6 +352,7 @@ PAGE = """<!DOCTYPE html>
   .meta { width: 100%; min-width: 0; text-align: center; }
   .name { display: block; min-width: 0; font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sub2 { display: block; font-size: 11px; height: 15px; line-height: 15px; opacity: .55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .date2 { display: block; font-size: 10px; height: 13px; line-height: 13px; opacity: .45; }
   body.editing .card { border-style: dashed; cursor: pointer; }
   body.editing .card::after { content: "编辑"; position: absolute; top: 6px; right: 8px;
           font-size: 11px; opacity: .55; }
@@ -459,16 +460,27 @@ function groups() {
 
 function slugOf(u) { const m = String(u || "").match(/\/web\/([a-z0-9\-_]+)\//); return m ? m[1] : null; }
 function tileFallback(img) { const t = img.parentNode; t.textContent = t.dataset.letter || "?"; }
-function cardHtml(l) {
+function dateLabel(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const day = x => x.toDateString();
+  if (day(d) === day(now)) return "今天添加";
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (day(d) === day(y)) return "昨天添加";
+  return (d.getMonth() + 1) + "-" + String(d.getDate()).padStart(2, "0") + " 添加";
+}
+function cardHtml(l, withDate) {
   const letter = esc(Array.from(l.name || "?")[0] || "?");
   const sub = esc(l.note || "");
+  const dateHtml = withDate ? `<span class="date2">${esc(dateLabel(l.created_at))}</span>` : "";
   const slug = slugOf(l.url);
   const tileInner = slug
     ? `<img src="/assets/logos/${slug}" alt="" loading="lazy" onerror="tileFallback(this)">`
     : letter;
   const inner = `<span class="tile" data-letter="${letter}" style="--h:${hueOf(l.name || "")}">${tileInner}</span>` +
     `<span class="meta"><span class="name">${esc(l.name)}</span>` +
-    `<span class="sub2">${sub}</span></span>`;
+    `<span class="sub2">${sub}</span>${dateHtml}</span>`;
   if (editing) return `<div class="card" data-edit="${l.id}">${inner}</div>`;
   return `<a class="card" href="${esc(l.url)}" target="_blank" rel="noopener">${inner}</a>`;
 }
@@ -481,7 +493,16 @@ function render() {
   } else if (!gs.length) {
     board.innerHTML = `<div class="empty">没有匹配的链接。</div>`;
   } else {
-    board.innerHTML = gs.map(g =>
+    let recentHtml = "";
+    if (!editing && !$("q").value.trim()) {
+      const recent = [...allLinks].filter(l => l.created_at)
+        .sort((a, b) => b.created_at - a.created_at).slice(0, 8);
+      if (recent.length >= 2) {
+        recentHtml = `<h2 class="cat">最近添加</h2><div class="grid">` +
+          recent.map(l => cardHtml(l, true)).join("") + `</div>`;
+      }
+    }
+    board.innerHTML = recentHtml + gs.map(g =>
       `<h2 class="cat">${esc(g.cat || "未分类")}<span class="n">${g.items.length}</span></h2>` +
       `<div class="grid">` + g.items.map(cardHtml).join("") +
       (editing && !($("q").value.trim()) ? `<button type="button" class="addcard" data-add="${esc(g.cat)}">＋ 添加</button>` : "") +
