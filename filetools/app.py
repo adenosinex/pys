@@ -603,6 +603,9 @@ def api_tool_source(environ, fname):
 def api_set_token(environ):
     data = _json_body(environ)
     tok = str(data.get("token") or "")
+    if tok == "":
+        _meta_set("client_token_hash", "")
+        return {"ok": True, "cleared": True}, "200 OK"
     if len(tok) < 8:
         return {"ok": False, "error": "令牌至少 8 位"}, "400 Bad Request"
     _meta_set("client_token_hash",
