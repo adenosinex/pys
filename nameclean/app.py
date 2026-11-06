@@ -656,6 +656,7 @@ pre{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:10
 <button data-v="rules">核心规则库</button>
 <button data-v="settings">设置</button>
 </nav>
+<a class="btn sm" href="download/nameclean_client.py" style="text-decoration:none;margin-left:auto">下载客户端</a>
 </div></header>
 <main id="app"></main>
 <div id="toast"></div>
@@ -672,10 +673,30 @@ async function api(path, opt){
 }
 function toast(msg){ const t = $("#toast"); t.textContent = msg; t.style.display = "block"; setTimeout(() => t.style.display = "none", 2200); }
 let state = {view: "batches", batchId: null};
-document.querySelectorAll("nav button").forEach(b => b.addEventListener("click", () => { state.view = b.dataset.v; render(); }));
+let pollTimer = null;
+function stopPoll(){ if(pollTimer){ clearInterval(pollTimer); pollTimer = null; } }
+let blSig = "";
+function batchSig(bs){ return bs.map(b => b.id + ":" + b.status + ":" + b.pending + ":" + b.candidate_count).join(","); }
+function batchRowsHtml(bs){
+  let h = "";
+  for(const b of bs){
+    h += '<tr><td>' + b.id + '</td><td>' + esc(b.name) + '</td><td>' + (b.source === "client" ? "客户端" : "网页") + '</td><td>' + b.file_count + '</td><td>' + b.candidate_count + '</td><td>' + b.pending + '</td><td>' + (b.status === "confirmed" ? '<span style="color:var(--ok)">已入库</span>' : '<span style="color:var(--warn)">待审查</span>') + '</td><td class="small">' + new Date(b.created_at * 1000).toLocaleString() + '</td>'
+      + '<td style="white-space:nowrap"><button class="btn sm" data-review="' + b.id + '">审查</button> <button class="btn sm danger" data-del="' + b.id + '">删</button></td></tr>';
+  }
+  return h || '<tr><td colspan="9" class="small">暂无批次</td></tr>';
+}
+function bindBatchButtons(app){
+  app.querySelectorAll("[data-review]").forEach(b => b.addEventListener("click", () => { state.batchId = +b.dataset.review; render(); }));
+  app.querySelectorAll("[data-del]").forEach(b => b.addEventListener("click", async () => {
+    if(!confirm("删除该批次（含其本批规则）？")) return;
+    await api("api/batches/" + b.dataset.del + "/delete", {method: "POST", body: "{}"}); render();
+  }));
+}
+document.querySelectorAll("nav button").forEach(b => b.addEventListener("click", () => { state.view = b.dataset.v; state.batchId = null; render(); }));
 function syncNav(){ document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.v === state.view)); }
 
 async function render(){
+  stopPoll();
   syncNav();
   const app = $("#app");
   if(state.view === "batches" && !state.batchId) return renderBatches(app);
@@ -691,24 +712,30 @@ async function renderBatches(app){
     + '<textarea id="nb-text" placeholder="把客户端导出的文件名清单粘贴到这里"></textarea>'
     + '<div style="margin-top:8px"><button class="btn primary" id="nb-go">建批次并分析</button></div>'
     + '<p class="small">客户端上传的批次也会出现在这里。分析前先用核心规则库过滤：已判定的词块不会再出现，只有新词块进审查。</p></div>';
-  h += '<div class="card"><h3 style="margin:2px 0 8px">批次列表</h3><table><tr><th>ID</th><th>名称</th><th>来源</th><th>文件</th><th>候选</th><th>待确认</th><th>状态</th><th>时间</th><th></th></tr>';
-  for(const b of d.batches){
-    h += '<tr><td>' + b.id + '</td><td>' + esc(b.name) + '</td><td>' + (b.source === "client" ? "客户端" : "网页") + '</td><td>' + b.file_count + '</td><td>' + b.candidate_count + '</td><td>' + b.pending + '</td><td>' + (b.status === "confirmed" ? '<span style="color:var(--ok)">已入库</span>' : '<span style="color:var(--warn)">待审查</span>') + '</td><td class="small">' + new Date(b.created_at * 1000).toLocaleString() + '</td>'
-      + '<td style="white-space:nowrap"><button class="btn sm" data-review="' + b.id + '">审查</button> <button class="btn sm danger" data-del="' + b.id + '">删</button></td></tr>';
-  }
-  h += '</table></div>';
+  h += '<div class="card"><h3 style="margin:2px 0 8px">批次列表 <span class="small">（每 4 秒自动刷新，客户端上传即出现）</span></h3><table><thead><tr><th>ID</th><th>名称</th><th>来源</th><th>文件</th><th>候选</th><th>待确认</th><th>状态</th><th>时间</th><th></th></tr></thead><tbody id="bl-body"></tbody></table></div>';
   app.innerHTML = h;
+  const tbody = $("#bl-body");
+  tbody.innerHTML = batchRowsHtml(d.batches);
+  bindBatchButtons(app);
+  blSig = batchSig(d.batches);
+  pollTimer = setInterval(async () => {
+    try{
+      const nd = await api("api/batches");
+      const sig = batchSig(nd.batches);
+      if(sig !== blSig){
+        blSig = sig;
+        tbody.innerHTML = batchRowsHtml(nd.batches);
+        bindBatchButtons(app);
+        toast("批次列表已更新");
+      }
+    }catch(e){}
+  }, 4000);
   $("#nb-go").addEventListener("click", async () => {
     try{
       const r = await api("api/batches", {method: "POST", body: JSON.stringify({name: $("#nb-name").value, text: $("#nb-text").value})});
       toast("已建批次 #" + r.batch_id + "，候选 " + r.candidate_count + " 个"); state.batchId = r.batch_id; render();
     }catch(e){ toast(e.message); }
   });
-  app.querySelectorAll("[data-review]").forEach(b => b.addEventListener("click", () => { state.batchId = +b.dataset.review; render(); }));
-  app.querySelectorAll("[data-del]").forEach(b => b.addEventListener("click", async () => {
-    if(!confirm("删除该批次（含其本批规则）？")) return;
-    await api("api/batches/" + b.dataset.del + "/delete", {method: "POST", body: "{}"}); render();
-  }));
 }
 
 async function renderReview(app){
@@ -765,6 +792,19 @@ async function renderReview(app){
     tr.querySelector(".rp").addEventListener("change", saveMeta);
     tr.querySelector(".sc").addEventListener("change", saveMeta);
   });
+  let rvSig = b.status + "|" + d.candidates.map(c => c.id + ":" + c.decision).join(",");
+  pollTimer = setInterval(async () => {
+    try{
+      const nd = await api("api/batches/" + b.id);
+      const sig = nd.batch.status + "|" + nd.candidates.map(c => c.id + ":" + c.decision).join(",");
+      if(sig !== rvSig){
+        const ae = document.activeElement;
+        if(ae && (ae.tagName === "INPUT" || ae.tagName === "SELECT" || ae.tagName === "TEXTAREA")) return;
+        toast("页面已同步最新状态");
+        render();
+      }
+    }catch(e){}
+  }, 4000);
 }
 
 async function renderRules(app){
@@ -803,7 +843,7 @@ async function renderSettings(app){
   let h = '<div class="card"><h3 style="margin:2px 0 8px">客户端令牌</h3>'
     + '<p class="small">状态：' + (s.token_configured ? "已设置" : "未设置") + '。令牌只写入、不可读回；客户端配置里填同一个令牌。清空 = 填空提交。</p>'
     + '<div style="display:flex;gap:6px"><input id="st-token" type="password" placeholder="新令牌（至少 8 位）" style="flex:1"><button class="btn primary" id="st-save">保存</button></div></div>';
-  h += '<div class="card"><h3 style="margin:2px 0 8px">客户端用法</h3><pre>python3 nameclean_client.py --path /待清洗目录\n# 首次在同目录生成 nameclean_client.json，填入 server 与 token：\n#   server = 本页地址（https://debi.su7.dpdns.org/web/nameclean）\n#   token  = 上面设置的令牌\n# 流程：扫描上传 → 在本页审查 → 客户端自动拉取本批规则 → 预览确认 → 改名\n# 回滚：python3 nameclean_client.py --undo 日志文件.json</pre></div>';
+  h += '<div class="card"><h3 style="margin:2px 0 8px">客户端用法</h3><pre>下载：本页右上角「下载客户端」\npython3 nameclean_client.py --path /待清洗目录\n# 首次在同目录生成 nameclean_client.json，填入 server 与 token：\n#   server = 本页地址（https://debi.su7.dpdns.org/web/nameclean）\n#   token  = 上面设置的令牌\n# 令牌也可以走环境变量（优先于配置文件）：\n#   Linux/Mac: export NAMECLEAN_TOKEN=你的令牌\n#   Windows:   set NAMECLEAN_TOKEN=你的令牌\n# 流程：扫描上传 → 在本页审查 → 客户端自动拉取本批规则 → 预览确认 → 改名\n# 回滚：python3 nameclean_client.py --undo 日志文件.json</pre></div>';
   app.innerHTML = h;
   $("#st-save").addEventListener("click", async () => {
     try{
@@ -877,6 +917,20 @@ def _route(environ):
 
 
 def application(environ, start_response):
+    if (environ.get("PATH_INFO") or "") == "/download/nameclean_client.py":
+        fp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "nameclean_client.py")
+        if os.path.exists(fp):
+            with open(fp, "rb") as f:
+                body = f.read()
+            start_response("200 OK", [
+                ("Content-Type", "text/x-python; charset=utf-8"),
+                ("Content-Disposition",
+                 "attachment; filename=nameclean_client.py"),
+                ("Content-Length", str(len(body)))])
+            return [body]
+        return _reply(start_response, {"ok": False, "error": "客户端文件缺失"},
+                      "404 Not Found")
     routed = _route(environ)
     if routed is not None:
         obj, status = routed
