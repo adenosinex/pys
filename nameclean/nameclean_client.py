@@ -26,7 +26,7 @@
 分段/套用算法与服务端保持一致（SEG_VERSION = 3）：中文长串按短语匹配，
 文件名里短语字符之间的符号会被忽略。
 """
-CLIENT_VERSION = "1.5.0"
+CLIENT_VERSION = "1.5.1"
 import argparse
 import json
 import os
