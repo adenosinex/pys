@@ -194,7 +194,7 @@ def is_protected(token):
 # still break a run.
 
 CJK_RE = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002a6df]")
-PHRASE_CONNECTORS = set("-_ \t|~·•・/&+，,、：:；;！!？?。…—–")
+PHRASE_CONNECTORS = set(".-_ \t|~·•・/&+，,、：:；;！!？?。…—–")
 
 
 def chinese_runs(name):
@@ -320,7 +320,8 @@ def mine_phrases(filenames, threshold):
     for phrase, df in _sam_phrase_candidates(runs, threshold):
         head = tail = 0
         samples = []
-        for fn, fruns in per_file:
+        docs = set()
+        for doc_id, (fn, fruns) in enumerate(per_file):
             hit = False
             for _span, norm in fruns:
                 if phrase in norm:
@@ -329,10 +330,12 @@ def mine_phrases(filenames, threshold):
                         head += 1
                     if norm.endswith(phrase):
                         tail += 1
-            if hit and len(samples) < 3:
-                samples.append(fn)
+            if hit:
+                docs.add(doc_id)
+                if len(samples) < 3:
+                    samples.append(fn)
         out[phrase] = {"cnt": df, "head": head, "tail": tail,
-                       "samples": samples}
+                       "samples": samples, "docs": docs}
     return out
 
 
@@ -441,6 +444,102 @@ def candidate_threshold(nfiles):
     return max(3, -(-nfiles // 50))  # >=3 and >=2% of the batch
 
 
+def _is_pure_cjk(s):
+    return bool(s) and all(CJK_RE.match(ch) for ch in s)
+
+
+def _dedup_contained(stats, filenames, phrases, threshold):
+    """Containment dedup by occurrence coverage (classification rule):
+    candidates are processed longest-first; a selected candidate claims its
+    occurrence spans in each file's normalized Chinese runs. A shorter
+    candidate survives only if its occurrences NOT covered by a selected
+    longer candidate still reach the threshold — and its displayed count
+    is that residual (independent) count: 'abc' x9 absorbs 'bc' even when
+    'bc' totals 10, if only 1 of those is independent. Mixed tokens are
+    then reconciled against the selected phrases by document sets."""
+    norm_runs = [[norm for _span, norm in chinese_runs(fn)]
+                 for fn in filenames]
+
+    def occ_spans(s):
+        spans = {}
+        for doc, runs in enumerate(norm_runs):
+            lst = []
+            for ri, text in enumerate(runs):
+                start = 0
+                while True:
+                    j = text.find(s, start)
+                    if j < 0:
+                        break
+                    lst.append((ri, j, j + len(s)))
+                    start = j + 1
+            if lst:
+                spans[doc] = lst
+        return spans
+
+    def covered(claimed, doc, ri, a, b):
+        return any(ca <= a and b <= cb
+                   for ca, cb in claimed.get((doc, ri), ()))
+
+    claimed = {}
+    selected = {}
+    cand = []
+    for k in stats:
+        if k in phrases or _is_pure_cjk(k):
+            spans = occ_spans(k)
+            if spans:
+                cand.append((k, spans))
+    cand.sort(key=lambda kv: (-len(kv[0]), -len(kv[1]), kv[0]))
+    for k, spans in cand:
+        residual = set()
+        for doc, lst in spans.items():
+            if any(not covered(claimed, doc, ri, a, b) for ri, a, b in lst):
+                residual.add(doc)
+        if len(residual) >= threshold:
+            selected[k] = set(spans.keys())
+            stats[k]["cnt"] = len(residual)
+            stats[k]["raw_docs"] = set(spans.keys())
+            # Only a genuinely recurring candidate may claim spans and
+            # absorb shorter ones; a one-off long string (possible when
+            # the threshold is 1) is shown but blocks nothing.
+            if len(spans) >= 2:
+                for doc, lst in spans.items():
+                    for ri, a, b in lst:
+                        claimed.setdefault((doc, ri), []).append((a, b))
+        else:
+            del stats[k]
+    # other tokens fully inside a selected candidate, doc-subset -> drop
+    for k in list(stats):
+        if k in selected:
+            continue
+        s = stats[k]
+        for p, pdocs in selected.items():
+            if k in p and s.get("docs") and s["docs"] <= pdocs:
+                del stats[k]
+                break
+    # longer mixed tokens covering a selected candidate: the candidate
+    # keeps only its independent remainder; below threshold it goes.
+    cover = {p: set() for p in selected}
+    for k, s in stats.items():
+        if k in selected:
+            continue
+        if not any(CJK_RE.match(ch) for ch in k):
+            continue
+        tnorm = "".join(norm for _sp, norm in chinese_runs(k))
+        if not tnorm:
+            continue
+        for p in selected:
+            if p in tnorm:
+                cover[p] |= (s.get("docs") or set())
+    for p, cov in cover.items():
+        if not cov or p not in stats:
+            continue
+        residual = selected[p] - cov
+        if len(residual) < threshold:
+            del stats[p]
+        else:
+            stats[p]["cnt"] = len(residual)
+
+
 def _cand_rank(item):
     """Chinese first, longest-and-most-frequent first (SEG v3 ordering)."""
     token, s = item
@@ -461,7 +560,7 @@ def analyze_batch(batch_id):
         "SELECT filename FROM batch_files WHERE batch_id = ? ORDER BY id",
         (batch_id,))]
     stats = {}
-    for fn in filenames:
+    for doc_id, fn in enumerate(filenames):
         toks = segments(fn)
         last = len(toks) - 1
         for i, t in enumerate(toks):
@@ -470,8 +569,10 @@ def analyze_batch(batch_id):
                 continue
             s = stats.get(k)
             if s is None:
-                s = stats[k] = {"cnt": 0, "head": 0, "tail": 0, "samples": []}
+                s = stats[k] = {"cnt": 0, "head": 0, "tail": 0,
+                                "samples": [], "docs": set()}
             s["cnt"] += 1
+            s["docs"].add(doc_id)
             if i == 0:
                 s["head"] += 1
             if i == last and last > 0:
@@ -492,17 +593,11 @@ def analyze_batch(batch_id):
             s["cnt"] = max(s["cnt"], ps["cnt"])
             s["head"] = max(s["head"], ps["head"])
             s["tail"] = max(s["tail"], ps["tail"])
+            s["docs"] = s.get("docs", set()) | ps["docs"]
             for fn in ps["samples"]:
                 if len(s["samples"]) < 3 and fn not in s["samples"]:
                     s["samples"].append(fn)
-    # a token fully covered by an equally-frequent mined phrase is redundant
-    for token in list(stats):
-        if token in phrases:
-            continue
-        for phrase, ps in phrases.items():
-            if ps["cnt"] >= stats[token]["cnt"] and token in phrase:
-                del stats[token]
-                break
+    _dedup_contained(stats, filenames, phrases, threshold)
     prev = {r["token"]: (r["decision"], r["replace_to"], r["scope"])
             for r in c.execute("SELECT * FROM candidates WHERE batch_id = ?",
                                (batch_id,))}

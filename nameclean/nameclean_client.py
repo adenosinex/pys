@@ -102,7 +102,7 @@ def is_protected(token):
 
 # ------- Chinese phrase matching (SEG v3, shared spec with the server) ----
 CJK_RE = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002a6df]")
-PHRASE_CONNECTORS = set("-_ \t|~·•・/&+，,、：:；;！!？?。…—–")
+PHRASE_CONNECTORS = set(".-_ \t|~·•・/&+，,、：:；;！!？?。…—–")
 PHRASE_MIN_LEN = 4
 
 
