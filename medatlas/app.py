@@ -89,6 +89,7 @@ DRUG_FIELDS = [
 ]
 SYMPTOM_FIELDS = [
     ("describe", "如何描述这个症状"), ("common_causes", "常见原因（多为良性）"),
+    ("yellow_flags", "黄旗信号：大概率指向特定原因（安心提示）"),
     ("watch_causes", "需要警惕的原因"), ("red_flags", "红旗信号：立即就医"),
     ("department", "该看哪个科"), ("observe", "可以先观察的情况"),
 ]
@@ -722,7 +723,7 @@ const RELS = {involves:"涉及",belongs:"属于",participates:"参与",manifests
 const STS = {unlearned:"未学习",learning:"学习中",review:"待复习",mastered:"已掌握"};
 const VER = {sourced:"有来源",pending:"待核验",personal:"个人整理"};
 const DRUG_FIELDS = [["drug_class","药物类别"],["mechanism","作用机制"],["indications","适应证"],["dosage_forms","常见剂型与规格"],["adverse","常见不良反应"],["contraindications","禁忌与重要注意事项"],["interactions","药物相互作用"],["special_populations","特殊人群注意事项"],["overdose_risk","过量使用的风险"],["longterm_risk","长期或反复使用的风险"],["red_flags","需要就医的警示情况"]];
-const SYMPTOM_FIELDS = [["describe","如何描述这个症状"],["common_causes","常见原因（多为良性）"],["watch_causes","需要警惕的原因"],["red_flags","红旗信号：立即就医"],["department","该看哪个科"],["observe","可以先观察的情况"]];
+const SYMPTOM_FIELDS = [["describe","如何描述这个症状"],["common_causes","常见原因（多为良性）"],["yellow_flags","黄旗信号：大概率指向特定原因（安心提示）"],["watch_causes","需要警惕的原因"],["red_flags","红旗信号：立即就医"],["department","该看哪个科"],["observe","可以先观察的情况"]];
 let state = {view:"home", q:"", category:"", tag:"", status:"", nodeId:null, sources:[]};
 const $ = s => document.querySelector(s);
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
@@ -750,8 +751,22 @@ function kcard(n){
 function bindOpen(root){
   root.querySelectorAll("[data-open]").forEach(el => el.addEventListener("click", () => openNode(el.dataset.open)));
 }
-function go(view){state.view = view; document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.view === view)); render();}
-function openNode(id){state.nodeId = id; state.view = "detail"; document.querySelectorAll("#tabs button").forEach(b => b.classList.remove("on")); render(); window.scrollTo(0,0);}
+function snap(){ return {view: state.view, nodeId: state.nodeId || null, editId: state.editId || null}; }
+function syncTabs(){ document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.view === state.view)); }
+function applySnap(s){ state.view = s.view; state.nodeId = s.nodeId; state.editId = s.editId; syncTabs(); render(); window.scrollTo(0,0); }
+function navTo(s, replace){
+  state.view = s.view; state.nodeId = s.nodeId || null; state.editId = s.editId || null;
+  const st = {ma: snap()};
+  if(replace) history.replaceState(st, ""); else history.pushState(st, "");
+  syncTabs(); render(); window.scrollTo(0,0);
+}
+function goBack(){
+  if(history.state && history.state.ma) history.back();
+  else navTo({view:"home"}, true);
+}
+window.addEventListener("popstate", e => { const s = e.state && e.state.ma; if(s) applySnap(s); });
+function go(view){ navTo({view}); }
+function openNode(id){ navTo({view:"detail", nodeId:id}); }
 
 async function render(){
   const app = $("#app");
@@ -833,7 +848,8 @@ async function renderDetail(app){
   const n = await api("nodes/" + state.nodeId);
   state.sources = (await api("sources")).sources;
   const f = n.fields || {};
-  let h = '<div class="card"><div class="row-flex" style="justify-content:space-between">'
+  let h = '<div style="margin-bottom:8px"><button class="btn gray sm" id="d-back">← 返回</button></div>'
+    + '<div class="card"><div class="row-flex" style="justify-content:space-between">'
     + '<h2 style="margin:2px 0">' + esc(n.title) + '</h2></div>';
   if(n.aliases.length) h += '<p class="small">别名：' + n.aliases.map(esc).join("、") + '</p>';
   h += '<div>' + badges(n) + n.tags.map(t => '<span class="badge">#' + esc(t) + '</span>').join("") + '</div>';
@@ -866,7 +882,7 @@ async function renderDetail(app){
     h += '</div>';
   } else if(n.type === "symptom" && SYMPTOM_FIELDS.some(([k]) => f[k])){
     h += '<div class="card"><h3 style="margin:4px 0 10px">症状鉴别要点</h3><dl class="kv">';
-    for(const [k, label] of SYMPTOM_FIELDS){ if(f[k]) h += '<dt>' + (k === "red_flags" ? '<span style="color:var(--bad)">' + label + '</span>' : label) + '</dt><dd>' + esc(f[k]) + '</dd>'; }
+    for(const [k, label] of SYMPTOM_FIELDS){ if(f[k]) h += '<dt>' + (k === "red_flags" ? '<span style="color:var(--bad)">' + label + '</span>' : k === "yellow_flags" ? '<span style="color:var(--warn)">' + label + '</span>' : label) + '</dt><dd>' + esc(f[k]) + '</dd>'; }
     h += '</dl></div>';
   } else {
     const extra = Object.keys(f).filter(k => !["price_records","expiry_records","plain"].includes(k) && f[k]);
@@ -900,6 +916,7 @@ async function renderDetail(app){
 
   app.innerHTML = h;
   bindOpen(app);
+  $("#d-back").addEventListener("click", goBack);
   $("#d-status").addEventListener("change", async e => { await api("nodes/" + n.id + "/status", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({status: e.target.value})}); toast("状态已更新"); render(); });
   $("#d-fav").addEventListener("click", async () => { await api("nodes/" + n.id, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(fullNode(n, {favorite: !n.favorite}))}); render(); });
   $("#d-edit").addEventListener("click", () => startEdit(n.id));
@@ -937,14 +954,15 @@ function fullNode(n, patch){
   return Object.assign({}, n, patch || {});
 }
 
-function startEdit(id){ state.editId = id; state.view = "edit"; document.querySelectorAll("#tabs button").forEach(b => b.classList.remove("on")); render(); window.scrollTo(0,0); }
+function startEdit(id){ navTo({view:"edit", editId:id}); }
 
 async function renderEdit(app, id){
   const n = id ? await api("nodes/" + id) : {type:"concept", category:"医学基础", title:"", aliases:[], summary:"", body:"", fields:{}, tags:[], difficulty:1, status:"unlearned", verify:"pending", favorite:false, sources:[]};
   state.sources = (await api("sources")).sources;
   const f = n.fields || {};
   const selSrc = new Set((n.sources || []).map(s => s.id));
-  let h = '<div class="card"><h2 style="margin:4px 0">' + (id ? "编辑知识" : "新增知识") + '</h2>';
+  let h = '<div style="margin-bottom:8px"><button class="btn gray sm" id="e-back">← 返回</button></div>'
+    + '<div class="card"><h2 style="margin:4px 0">' + (id ? "编辑知识" : "新增知识") + '</h2>';
   h += '<label class="fl">类型</label><select class="in" id="e-type">' + Object.keys(TYPES).map(k => '<option value="' + k + '"' + (n.type === k ? " selected" : "") + '>' + TYPES[k] + '</option>').join("") + '</select>';
   h += '<label class="fl">分类</label><select class="in" id="e-cat">' + CATS.map(c => '<option' + (n.category === c ? " selected" : "") + '>' + esc(c) + '</option>').join("") + '</select>';
   h += '<label class="fl">标题 *</label><input class="in" id="e-title" value="' + esc(n.title) + '">';
@@ -972,7 +990,8 @@ async function renderEdit(app, id){
      + '<button class="btn gray" id="e-cancel">取消</button><span class="small">保存后进入详情页预览效果。</span></div></div>';
   app.innerHTML = h;
   $("#e-type").addEventListener("change", e => { $("#e-drug").style.display = e.target.value === "drug" ? "" : "none"; $("#e-symptom").style.display = e.target.value === "symptom" ? "" : "none"; });
-  $("#e-cancel").addEventListener("click", () => { if(id) openNode(id); else go("library"); });
+  $("#e-back").addEventListener("click", goBack);
+  $("#e-cancel").addEventListener("click", goBack);
   $("#e-save").addEventListener("click", async () => {
     const title = $("#e-title").value.trim(), summary = $("#e-summary").value.trim();
     if(!title){ toast("标题不能为空"); return; }
@@ -999,7 +1018,7 @@ async function renderEdit(app, id){
       source_ids: Array.from(app.querySelectorAll(".e-src:checked")).map(c => c.value)};
     try{
       const saved = await api(id ? "nodes/" + id : "nodes", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload)});
-      toast("已保存"); openNode(saved.node.id);
+      toast("已保存"); navTo({view:"detail", nodeId: saved.node.id}, true);
     }catch(err){ toast(err.message); }
   });
 }
@@ -1055,7 +1074,8 @@ async function renderManage(app){
 document.querySelectorAll("#tabs button").forEach(b => b.addEventListener("click", () => go(b.dataset.view)));
 $("#btn-add").addEventListener("click", () => startEdit(null));
 let gtimer;
-$("#global-q").addEventListener("input", e => { clearTimeout(gtimer); gtimer = setTimeout(() => { state.q = e.target.value; go("library"); }, 300); });
+$("#global-q").addEventListener("input", e => { clearTimeout(gtimer); gtimer = setTimeout(() => { state.q = e.target.value; if(state.view === "library") render(); else go("library"); }, 300); });
+history.replaceState({ma: snap()}, "");
 render().catch(err => { $("#app").innerHTML = '<div class="empty">加载失败：' + esc(err.message) + '</div>'; });
 </script>
 </body>
