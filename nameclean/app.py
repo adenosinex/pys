@@ -22,7 +22,7 @@ import threading
 import time
 import unicodedata
 
-SEG_VERSION = 4
+SEG_VERSION = 5
 CANDIDATE_CAP = 80
 PHRASE_MIN_LEN = 4
 PHRASE_MAX_CORPUS = 120000  # CJK chars; beyond this, phrase mining is skipped
@@ -195,7 +195,7 @@ def is_protected(token):
 # still break a run.
 
 CJK_RE = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002a6df]")
-PHRASE_CONNECTORS = set(".-_ \t|~·•・/&+，,、：:；;！!？?。…—–")
+PHRASE_CONNECTORS = set("-_ \t|~·•・/&+，,、：:；;！!？?。…—–")
 
 
 def chinese_runs(name):
@@ -243,6 +243,8 @@ def is_phrase_pattern(pattern):
 # cut can never destroy a meaningful unit:
 #   * before the extension / around a stripped domain,
 #   * both sides of brackets (bracket content is its own region),
+#   * at a dot: a HARD boundary — regions never join across it and no
+#     normalization is applied (decided 2026-11-06, keeps matching real),
 #   * character-class transitions: CJK <-> alnum, anything <-> symbols,
 #     EXCEPT letter<->digit (1080p, S01E05, 25V stay one atom),
 #   * at every symbol: symbols belong to no atom; both sides are points.
@@ -265,8 +267,8 @@ def _char_class(ch):
 
 def atoms_of(name):
     """Split a filename into regions of atoms (comparison form: alnum
-    atoms lowercased). Brackets and stripped domains break regions;
-    symbols are separable points but do not break a region."""
+    atoms lowercased). Brackets, stripped domains and dots break regions;
+    other symbols are separable points but do not break a region."""
     stem, _ext = split_ext(name)
     stem = strip_domains(stem)
     forced = {}
@@ -281,7 +283,9 @@ def atoms_of(name):
             i = forced[i]
             continue
         cls = _char_class(stem[i])
-        if cls == "B" or stem[i] == "\x00":
+        if cls == "B" or stem[i] == "\x00" or stem[i] in ".．":
+            # hard boundary: brackets, stripped domains and DOTS break
+            # regions — a candidate may end here but never cross
             if region:
                 regions.append(region)
                 region = []
@@ -588,9 +592,9 @@ def _dedup_contained(stats, regions_per_file, phrases, threshold):
                 spans[doc] = lst
         return spans
 
-    def covered(claimed, doc, ri, a, b):
-        return any(ca <= a and b <= cb
-                   for ca, cb in claimed.get((doc, ri), ()))
+    def owners_covering(claimed, doc, ri, a, b):
+        return {o for ca, cb, o in claimed.get((doc, ri), ())
+                if ca <= a and b <= cb}
 
     claimed = {}
     selected = {}
@@ -601,10 +605,21 @@ def _dedup_contained(stats, regions_per_file, phrases, threshold):
             if spans:
                 cand.append((k, spans))
     cand.sort(key=lambda kv: (-len(kv[0]), -len(kv[1]), kv[0]))
+    raw_df = {}
+    dropped = {}
     for k, spans in cand:
+        raw_df[k] = len(spans)
         residual = set()
+        coverers = set()
         for doc, lst in spans.items():
-            if any(not covered(claimed, doc, ri, a, b) for ri, a, b in lst):
+            doc_covered = True
+            for ri, a, b in lst:
+                owners = owners_covering(claimed, doc, ri, a, b)
+                if owners:
+                    coverers |= owners
+                else:
+                    doc_covered = False
+            if not doc_covered:
                 residual.add(doc)
         if len(residual) >= threshold:
             # selected[] holds the INDEPENDENT (residual) docs only, so the
@@ -619,9 +634,23 @@ def _dedup_contained(stats, regions_per_file, phrases, threshold):
             if len(spans) >= 2:
                 for doc, lst in spans.items():
                     for ri, a, b in lst:
-                        claimed.setdefault((doc, ri), []).append((a, b))
+                        claimed.setdefault((doc, ri), []).append((a, b, k))
         else:
+            dropped[k] = (stats[k], coverers)
             del stats[k]
+    # Shared-core protection: a candidate whose occurrences are covered
+    # only COLLECTIVELY by several different longer candidates, while its
+    # own frequency exceeds every single one of them, is the common core
+    # of those long strings — not a fragment of any of them. A single
+    # container still absorbs it (the abc/bc rule is untouched).
+    shared_core = set()
+    for k, (entry, coverers) in dropped.items():
+        if len(coverers) >= 2 and raw_df[k] >= threshold and \
+                all(raw_df[k] > raw_df[o] for o in coverers):
+            entry["cnt"] = raw_df[k]
+            stats[k] = entry
+            selected[k] = set(entry.get("docs") or ())
+            shared_core.add(k)
     # other tokens fully inside a selected candidate, doc-subset -> drop
     # (subset is tested against the candidate's RAW doc set)
     for k in list(stats):
@@ -651,7 +680,7 @@ def _dedup_contained(stats, regions_per_file, phrases, threshold):
             if p in tnorm:
                 cover[p] |= (s.get("docs") or set())
     for p, cov in cover.items():
-        if not cov or p not in stats:
+        if not cov or p not in stats or p in shared_core:
             continue
         residual = selected[p] - cov
         if len(residual) < threshold:

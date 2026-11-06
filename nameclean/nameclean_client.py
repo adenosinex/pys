@@ -23,10 +23,10 @@
 接口入口自动推导：server 填网页地址即可，客户端会改走同域名的 /nc-api
 直连入口（不过网页门禁，只认令牌）；特殊情况可用 NAMECLEAN_API 覆盖。
 客户端可从清洗台网页右上角「下载客户端」直接下载最新版。
-分段/套用算法与服务端保持一致（SEG_VERSION = 4）：中文长串按短语匹配，
+分段/套用算法与服务端保持一致（SEG_VERSION = 5）：中文长串按短语匹配，
 文件名里短语字符之间的符号会被忽略。
 """
-CLIENT_VERSION = "1.6.0"
+CLIENT_VERSION = "1.7.0"
 import argparse
 import json
 import os
@@ -38,14 +38,14 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
-SEG_VERSION = 4
+SEG_VERSION = 5
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
               ".rmvb", ".rm", ".webm", ".mpg", ".mpeg", ".m4v", ".3gp"}
 KNOWN_EXTS = {"mp4", "mkv", "avi", "mov", "wmv", "flv", "ts", "m2ts",
               "rmvb", "rm", "webm", "mpg", "mpeg", "m4v", "3gp",
               "srt", "ass", "ssa", "vtt"}
 
-# ------- segmentation (shared spec with the server, SEG_VERSION = 4) ------
+# ------- segmentation (shared spec with the server, SEG_VERSION = 5) ------
 SEP_CHARS = set("-_ \t|~·•・*+&@#%=,，;；'\"")
 BRACKET_CHARS = set("[]()（）《》〈〉{}<>「」『』") | {chr(12304), chr(12305)}
 DOMAIN_RE = re.compile(
@@ -103,7 +103,7 @@ def is_protected(token):
 
 # ------- Chinese phrase matching (SEG v3, shared spec with the server) ----
 CJK_RE = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002a6df]")
-PHRASE_CONNECTORS = set(".-_ \t|~·•・/&+，,、：:；;！!？?。…—–")
+PHRASE_CONNECTORS = set("-_ \t|~·•・/&+，,、：:；;！!？?。…—–")
 PHRASE_MIN_LEN = 4
 
 
