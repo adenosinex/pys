@@ -90,6 +90,7 @@ DRUG_FIELDS = [
 SYMPTOM_FIELDS = [
     ("describe", "如何描述这个症状"), ("common_causes", "常见原因（多为良性）"),
     ("yellow_flags", "黄旗信号：大概率指向特定原因（安心提示）"),
+    ("green_flags", "绿旗信号：多为个体差异或小问题（不必在意）"),
     ("watch_causes", "需要警惕的原因"), ("red_flags", "红旗信号：立即就医"),
     ("department", "该看哪个科"), ("observe", "可以先观察的情况"),
 ]
@@ -723,7 +724,7 @@ const RELS = {involves:"涉及",belongs:"属于",participates:"参与",manifests
 const STS = {unlearned:"未学习",learning:"学习中",review:"待复习",mastered:"已掌握"};
 const VER = {sourced:"有来源",pending:"待核验",personal:"个人整理"};
 const DRUG_FIELDS = [["drug_class","药物类别"],["mechanism","作用机制"],["indications","适应证"],["dosage_forms","常见剂型与规格"],["adverse","常见不良反应"],["contraindications","禁忌与重要注意事项"],["interactions","药物相互作用"],["special_populations","特殊人群注意事项"],["overdose_risk","过量使用的风险"],["longterm_risk","长期或反复使用的风险"],["red_flags","需要就医的警示情况"]];
-const SYMPTOM_FIELDS = [["describe","如何描述这个症状"],["common_causes","常见原因（多为良性）"],["yellow_flags","黄旗信号：大概率指向特定原因（安心提示）"],["watch_causes","需要警惕的原因"],["red_flags","红旗信号：立即就医"],["department","该看哪个科"],["observe","可以先观察的情况"]];
+const SYMPTOM_FIELDS = [["describe","如何描述这个症状"],["common_causes","常见原因（多为良性）"],["yellow_flags","黄旗信号：大概率指向特定原因（安心提示）"],["green_flags","绿旗信号：多为个体差异或小问题（不必在意）"],["watch_causes","需要警惕的原因"],["red_flags","红旗信号：立即就医"],["department","该看哪个科"],["observe","可以先观察的情况"]];
 let state = {view:"home", q:"", category:"", tag:"", status:"", nodeId:null, sources:[]};
 const $ = s => document.querySelector(s);
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
@@ -882,7 +883,7 @@ async function renderDetail(app){
     h += '</div>';
   } else if(n.type === "symptom" && SYMPTOM_FIELDS.some(([k]) => f[k])){
     h += '<div class="card"><h3 style="margin:4px 0 10px">症状鉴别要点</h3><dl class="kv">';
-    for(const [k, label] of SYMPTOM_FIELDS){ if(f[k]) h += '<dt>' + (k === "red_flags" ? '<span style="color:var(--bad)">' + label + '</span>' : k === "yellow_flags" ? '<span style="color:var(--warn)">' + label + '</span>' : label) + '</dt><dd>' + esc(f[k]) + '</dd>'; }
+    for(const [k, label] of SYMPTOM_FIELDS){ if(f[k]) h += '<dt>' + (k === "red_flags" ? '<span style="color:var(--bad)">' + label + '</span>' : k === "yellow_flags" ? '<span style="color:var(--warn)">' + label + '</span>' : k === "green_flags" ? '<span style="color:var(--ok)">' + label + '</span>' : label) + '</dt><dd>' + esc(f[k]) + '</dd>'; }
     h += '</dl></div>';
   } else {
     const extra = Object.keys(f).filter(k => !["price_records","expiry_records","plain"].includes(k) && f[k]);
