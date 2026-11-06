@@ -338,7 +338,7 @@ PAGE = """<!DOCTYPE html>
   h2.cat .n { font-size: 12px; opacity: .6; font-weight: 400; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px 8px; }
   @media (max-width: 560px) { .grid { grid-template-columns: repeat(4, 1fr); } }
-  .card { display: flex; flex-direction: column; align-items: center; gap: 7px;
+  .card { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0;
           padding: 12px 4px 10px; border-radius: 16px;
           border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
           background: color-mix(in srgb, currentColor 4%, transparent);
@@ -350,7 +350,7 @@ PAGE = """<!DOCTYPE html>
           font-size: 22px; font-weight: 700; background: hsl(var(--h, 210) 52% 44%); }
   .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .meta { width: 100%; min-width: 0; text-align: center; }
-  .name { display: block; font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .name { display: block; min-width: 0; font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sub2 { display: block; font-size: 11px; height: 15px; line-height: 15px; opacity: .55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   body.editing .card { border-style: dashed; cursor: pointer; }
   body.editing .card::after { content: "编辑"; position: absolute; top: 6px; right: 8px;

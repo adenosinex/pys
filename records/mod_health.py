@@ -49,22 +49,18 @@ CATEGORIES = {
     "food": {"name": "食物", "code": "食", "color": "#e8a13a", "sensitive": False},
     "stool": {"name": "大便", "code": "BM", "color": "#a9805a", "sensitive": True},
     "intimacy": {"name": "性生活", "code": "INT", "color": "#b06ab3", "sensitive": True},
-    "state": {"name": "状态", "code": "态", "color": "#4a90d9", "sensitive": False},
     "sleep": {"name": "睡眠", "code": "眠", "color": "#5b6ee1", "sensitive": False},
     "exercise": {"name": "运动", "code": "动", "color": "#43a06a", "sensitive": False},
-    "medication": {"name": "用药", "code": "药", "color": "#d96a4a", "sensitive": False},
-    "symptom": {"name": "症状", "code": "症", "color": "#c9a227", "sensitive": False},
+    "note": {"name": "备注", "code": "记", "color": "#7d8590", "sensitive": False},
 }
 
 DEFAULT_PRESETS = {
-    "food": ["早餐", "午餐", "晚餐", "夜宵", "加餐"],
+    "food": ["食物"],
     "stool": ["排便"],
     "intimacy": ["性生活"],
-    "state": ["心情", "精力", "压力", "疼痛", "腹胀"],
     "sleep": ["睡眠"],
+    "note": ["备注"],
     "exercise": ["步行", "跑步", "骑行", "游泳", "健身", "拉伸", "瑜伽"],
-    "medication": [],
-    "symptom": ["头痛", "胃痛", "腹泻", "便秘", "疲劳", "失眠", "恶心"],
 }
 
 FOOD_ATTRS = ["高脂", "高糖", "高盐", "高纤维", "高蛋白", "油炸", "烧烤",
@@ -76,11 +72,8 @@ TAG_POOLS = {
     "food": FOOD_ATTRS,
     "stool": ["腹痛", "腹胀", "很急", "没排干净", "疼痛", "熬夜", "吃辣后", "饮酒后"],
     "intimacy": ["放松", "疲劳", "压力大", "假期"],
-    "state": CONTEXT_TAGS + ["工作日", "会议多"],
-    "sleep": ["熬夜", "午睡后", "早起", "失眠", "多梦", "喝咖啡", "饮酒后", "运动后"],
+    "sleep": ["熬夜", "午睡后", "早起", "失眠", "多梦", "喝咖啡", "饮酒后", "运动后", "起床即散", "持续到上午", "大半天都在"],
     "exercise": ["晨练", "夜跑", "空腹", "饭后", "大强度", "拉伸到位"],
-    "medication": ["饭前", "饭后", "漏服", "加量", "减量"],
-    "symptom": ["服药后", "熬夜", "压力大", "饮食后", "运动后", "天气变化"],
 }
 
 VALUE_TYPES = ("count", "scale", "enum", "measure", "bool")
@@ -230,8 +223,20 @@ def _day(environ, start_response):
         v = r["value"] or {}
         if r["category"] == "state" and r["item"] in ("心情", "精力") and v.get("type") == "scale":
             summary[r["item"]] = v.get("v")
+        if r["category"] == "state" and r["item"] == "心情备注" and r["note"]:
+            summary["心情备注"] = r["note"]
+        if r["category"] == "note" and r["note"]:
+            summary["备注"] = r["note"]
+        if r["category"] == "sleep":
+            for t in r["tags"]:
+                if t.startswith("残留困意·"):
+                    summary["残留困意"] = t[len("残留困意·"):]
+        if r["category"] == "sleep" and r["item"] == "残留困意" and v.get("type") == "enum":
+            summary["残留困意"] = v.get("v")
         if r["category"] == "sleep" and v.get("type") == "measure":
             summary["睡眠"] = v.get("v")
+        if r["category"] == "sleep" and r["item"] == "睡眠" and v.get("type") == "enum":
+            summary["睡眠长短"] = v.get("v")
     return json_response(start_response,
                          {"ok": True, "date": date, "records": records, "summary": summary})
 
@@ -546,6 +551,15 @@ def _import_counts(payload, tie):
         if not isinstance(rec, dict) or not rec.get("id"):
             counts["skipped"] += 1
             continue
+        if rec.get("category") in ("state", "symptom", "medication"):
+            rec = dict(rec)
+            old_item = str(rec.get("item") or "").strip()
+            old_note = str(rec.get("note") or "").strip()
+            rec["category"] = "note"
+            rec["item"] = "备注"
+            rec["value"] = None
+            rec["tags"] = []
+            rec["note"] = (old_item + "：" + old_note) if old_item and old_note else (old_note or old_item)
         clean, err = _validate_record(rec)
         if err:
             counts["skipped"] += 1

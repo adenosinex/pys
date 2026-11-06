@@ -84,7 +84,7 @@ HEALTH_PAGE = r"""<!doctype html>
   .kv input { flex:1; }
   .switch { position:relative; width:44px; height:24px; flex:0 0 auto; }
   .switch input { opacity:0; width:100%; height:100%; position:absolute; margin:0; cursor:pointer; }
-  .switch i { position:absolute; inset:0; background:#2a3242; border-radius:999px; }
+  .switch i { position:absolute; inset:0; background:#2a3242; border-radius:999px; pointer-events:none; }
   .switch i:after { content:""; position:absolute; width:18px; height:18px; border-radius:50%; background:#fff; top:3px; left:3px; transition:.15s; }
   .switch input:checked + i { background:var(--acc); }
   .switch input:checked + i:after { left:23px; }
@@ -107,11 +107,6 @@ HEALTH_PAGE = r"""<!doctype html>
     </div>
     <div class="chips3" id="summary"></div>
     <div id="suggests"></div>
-    <div class="card" id="morning-card">
-      <h3>晨间打卡</h3>
-      <p>一次填完睡眠、心情、精力，不用记三次。</p>
-      <span class="go" id="morning-go">开始打卡 ›</span>
-    </div>
     <div class="card">
       <h3>最近常用</h3>
       <div class="chips" id="recent"></div>
@@ -143,7 +138,7 @@ HEALTH_PAGE = r"""<!doctype html>
     </div>
     <div class="card">
       <h3>代号映射</h3>
-      <p class="mut">敏感类别在时间线、筛选、快速记录和洞察里显示的代号，可改成任何词。底层存的仍是真实类别，统计和导出不受影响。</p>
+      <p class="mut">所有类别在筛选、快速记录等界面上显示的代号，可改成任何词。底层存的仍是真实类别，统计和导出不受影响。</p>
       <div id="me-codes"></div>
       <button class="btn" id="me-codes-save">保存代号</button>
     </div>
@@ -194,7 +189,7 @@ const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
 const API = "api/health";
 let CATS = {}, PRESETS = {}, FOOD_ATTRS = [], CTX_TAGS = [];
 let TAG_POOLS = {}, CAT_COUNTS = {}, ITEM_COUNTS = {}, CAT_ORDER = [];
-const DEFAULT_ORDER = ["stool", "food", "sleep", "symptom", "exercise", "medication", "intimacy", "state"];
+const DEFAULT_ORDER = ["stool", "food", "sleep", "exercise", "intimacy", "note"];
 const SENSITIVE_DEFAULT_ITEMS = { stool: "排便", intimacy: "性生活" };
 let SETTINGS = { codes: {}, predict: {} };
 let viewDate = todayStr();
@@ -238,9 +233,7 @@ function uuid() { return Array.from(crypto.getRandomValues(new Uint8Array(16))).
 /* ---------------- display helpers ---------------- */
 function isSensitive(rec) { return CATS[rec.category] && CATS[rec.category].sensitive; }
 function codeOf(cat) { return SETTINGS.codes[cat] || (CATS[cat] || {}).code || cat; }
-function catLabel(cat) {
-  return (CATS[cat] && CATS[cat].sensitive) ? codeOf(cat) : (CATS[cat] || {}).name || cat;
-}
+function catLabel(cat) { return codeOf(cat); }
 function itemLabel(cat, item) {
   if (CATS[cat] && CATS[cat].sensitive && SENSITIVE_DEFAULT_ITEMS[cat] === item) return codeOf(cat);
   return item;
@@ -263,7 +256,8 @@ function valueText(rec) {
       const desc = { 1: "偏干·硬块", 2: "偏干", 3: "略干", 4: "正常·顺滑", 5: "正常·软", 6: "偏稀", 7: "稀水" };
       return v.v + " 型 · " + (desc[v.v] || "");
     }
-    return "热量" + v.v;
+    if (rec.category === "food") return "热量" + v.v;
+    return String(v.v);
   }
   if (v.type === "measure") return v.v + (v.unit || "");
   if (v.type === "count") return v.v + " 次";
@@ -300,8 +294,10 @@ async function loadToday() {
   const recs = d.records || [];
   const s = d.summary || {};
   const cell = (k, v, unit) => '<div class="sumcard"><div class="k">' + k + '</div><div class="v">' + (v == null ? "—" : v) + (v == null ? "" : '<small style="font-size:12px;color:var(--mut)"> ' + unit + "</small>") + "</div></div>";
-  $("#summary").innerHTML = cell("心情", s["心情"], "分") + cell("精力", s["精力"], "分") + cell("睡眠", s["睡眠"], "小时");
-  $("#morning-card").style.display = viewDate === todayStr() ? "" : "none";
+  const moodCell = s["备注"] ? cell("备注", esc(String(s["备注"]).slice(0, 8)), "")
+    : (s["心情备注"] ? cell("心情", esc(String(s["心情备注"]).slice(0, 8)), "") : cell("心情", s["心情"], "分"));
+  const sleepCell = s["睡眠长短"] ? cell("睡眠", s["睡眠长短"], "") : cell("睡眠", s["睡眠"], "小时");
+  $("#summary").innerHTML = moodCell + sleepCell + cell("残留困意", s["残留困意"], "");
   try {
     const p = await api("/presets");
     CAT_COUNTS = p.cat_counts || CAT_COUNTS; ITEM_COUNTS = p.item_counts || ITEM_COUNTS;
@@ -353,13 +349,12 @@ const VALUE_CONF = {
   food: { kind: "enum", label: "热量档（可选）", options: ["低", "中", "高"] },
   stool: { kind: "bristol", label: "布里斯托分型" },
   intimacy: { kind: "bool", label: "" },
-  state: { kind: "scale", label: "程度（1 很少 – 5 很强）" },
-  sleep: { kind: "measure", label: "时长", unit: "小时", step: 0.5 },
+  sleep: { kind: "enum", label: "大致长短", options: ["偏短", "正常", "偏长"] },
   exercise: { kind: "measure", label: "时长", unit: "分钟", step: 5 },
-  medication: { kind: "bool", label: "" },
-  symptom: { kind: "scale", label: "程度（1 轻微 – 5 严重）" }
+  note: { kind: "none" }
 };
-function defaultMeal() { const h = new Date().getHours(); return h < 10 ? "早餐" : h < 15 ? "午餐" : h < 21 ? "晚餐" : "夜宵"; }
+const NO_ITEM = { food: "食物", sleep: "睡眠", note: "备注" };
+const DUR_TAGS = ["起床即散", "持续到上午", "大半天都在"];
 
 function openSheet(opts) {
   opts = opts || {};
@@ -369,15 +364,26 @@ function openSheet(opts) {
     rec: rec,
     note: rec ? (rec.note || "") : "",
     id: rec ? rec.id : uuid(),
-    category: rec ? rec.category : (opts.category || CAT_ORDER[0] || "state"),
+    category: rec ? rec.category : (opts.category || CAT_ORDER[0] || "stool"),
     item: rec ? rec.item : (opts.item || ""),
     value: rec ? rec.value : null,
     tags: rec ? (rec.tags || []).slice() : [],
     date: rec ? rec.date : (opts.date || viewDate),
-    morning: !!opts.morning,
-    mSleep: "", mMood: null, mEnergy: null
+    wipe: null, after: null, grog: null, grogDur: null
   };
-  if (sheetState.category === "food" && !sheetState.item) sheetState.item = defaultMeal();
+  if (rec && rec.category === "stool") {
+    (rec.tags || []).forEach(t => {
+      if (t.startsWith("擦纸·")) sheetState.wipe = t.slice(3);
+      if (t.startsWith("便后·")) sheetState.after = t.slice(3);
+    });
+  }
+  if (rec && rec.category === "sleep") {
+    (rec.tags || []).forEach(t => {
+      if (t.startsWith("残留困意·")) sheetState.grog = t.slice(5);
+      if (DUR_TAGS.includes(t)) sheetState.grogDur = t;
+    });
+  }
+  if (!sheetState.item && NO_ITEM[sheetState.category]) sheetState.item = NO_ITEM[sheetState.category];
   renderSheet();
   $("#sheet-wrap").classList.add("open");
 }
@@ -385,14 +391,13 @@ function closeSheet() { $("#sheet-wrap").classList.remove("open"); sheetState = 
 
 function renderSheet() {
   const st = sheetState, el = $("#sheet");
-  if (st.morning) { renderMorning(el); return; }
   const catChips = CAT_ORDER.map(c =>
     '<button class="chip' + (st.category === c ? " on" : "") + '" data-act="cat" data-v="' + c + '">' +
     esc(catLabel(c)) + "</button>").join("");
   const items = sortedItems(st.category);
   const itemChips = items.map(i =>
     '<button class="chip' + (st.item === i ? " on" : "") + '" data-act="item" data-v="' + esc(i) + '">' + esc(itemLabel(st.category, i)) + "</button>").join("");
-  const conf = VALUE_CONF[st.category];
+  const conf = VALUE_CONF[st.category] || { kind: "none" };
   let valueHtml = "";
   if (conf.kind === "scale") {
     valueHtml = '<div class="steplabel">' + conf.label + '</div><div class="chips">' +
@@ -408,21 +413,42 @@ function renderSheet() {
     valueHtml = '<div class="steplabel">' + conf.label + "（" + conf.unit + '）</div>' +
       '<input type="number" id="sh-num" step="' + conf.step + '" min="0" placeholder="例如 ' + (st.category === "sleep" ? "6.5" : "30") + '" value="' + (st.value ? st.value.v : "") + '">';
   }
+  let stoolHtml = "";
+  if (st.category === "stool") {
+    const grp = (label, key, opts) => '<div class="steplabel">' + label + '</div><div class="chips">' +
+      opts.map(o => '<button class="chip' + (st[key] === o ? " on" : "") + '" data-act="' + key + '" data-v="' + o + '">' + o + "</button>").join("") + "</div>";
+    stoolHtml = grp("擦纸干净程度", "wipe", ["一擦即净", "两三下干净", "多次仍有残留"]) +
+      grp("便后感觉", "after", ["完美解决", "意犹未尽", "仍有便意"]);
+  }
+  let sleepHtml = "";
+  if (st.category === "sleep") {
+    const grp = (label, key, opts) => '<div class="steplabel">' + label + '</div><div class="chips">' +
+      opts.map(o => '<button class="chip' + (st[key] === o ? " on" : "") + '" data-act="' + key + '" data-v="' + o + '">' + o + "</button>").join("") + "</div>";
+    sleepHtml = grp("残留困意", "grog", ["无", "轻微", "明显", "很重"]) +
+      grp("困意持续", "grogDur", DUR_TAGS);
+  }
   const tagPool = (TAG_POOLS[st.category] || CTX_TAGS).slice();
   st.tags.forEach(t => { if (!tagPool.includes(t)) tagPool.push(t); });
-  const tagChips = tagPool.map(t =>
+  const tagChips = tagPool.filter(t => !t.startsWith("擦纸·") && !t.startsWith("便后·") && !t.startsWith("残留困意·") && !DUR_TAGS.includes(t)).map(t =>
     '<button class="chip' + (st.tags.includes(t) ? " on" : "") + '" data-act="tag" data-v="' + esc(t) + '">' + esc(t) + "</button>").join("");
+  const noteLabel = st.category === "note" ? "备注" : (conf.kind === "none" ? "自由备注（这类记录只写一句话）" : "备注（可选）");
+  const tagsBlock = st.category === "note" ? "" :
+    '<div class="steplabel">标签（可多选）</div><div class="chips">' + tagChips + "</div>" +
+    '<div class="row2" style="margin-top:8px"><input type="text" id="sh-custom-tag" placeholder="或自建标签"><button class="btn ghost" data-act="custom-tag">添加</button></div>';
+  const itemBlock = NO_ITEM[st.category] ? "" :
+    '<div class="steplabel">项目</div><div class="chips">' + itemChips + "</div>" +
+    '<div class="row2" style="margin-top:8px"><input type="text" id="sh-custom-item" placeholder="或自建项目名"><button class="btn ghost" data-act="custom-item">使用</button></div>';
   const when = new Date((st.recTs || Date.now() / 1000) * 1000);
   const local = st.date + "T" + (st.timeStr || pad(new Date().getHours()) + ":" + pad(new Date().getMinutes()));
   el.innerHTML =
     "<h3>" + (st.mode === "edit" ? "记录详情" : "快速记录") + "</h3>" +
     '<div class="steplabel">类别</div><div class="chips">' + catChips + "</div>" +
-    '<div class="steplabel">项目</div><div class="chips">' + itemChips + "</div>" +
-    '<div class="row2" style="margin-top:8px"><input type="text" id="sh-custom-item" placeholder="或自建项目名"><button class="btn ghost" data-act="custom-item">使用</button></div>' +
+    itemBlock +
     valueHtml +
-    '<div class="steplabel">标签（可多选）</div><div class="chips">' + tagChips + "</div>" +
-    '<div class="row2" style="margin-top:8px"><input type="text" id="sh-custom-tag" placeholder="或自建标签"><button class="btn ghost" data-act="custom-tag">添加</button></div>' +
-    '<div class="steplabel">备注（可选）</div><input type="text" id="sh-note" placeholder="一句话即可" value="' + esc(st.note || "") + '">' +
+    stoolHtml +
+    sleepHtml +
+    tagsBlock +
+    '<div class="steplabel">' + noteLabel + '</div><input type="text" id="sh-note" placeholder="一句话即可" value="' + esc(st.note || "") + '">' +
     '<div class="steplabel">时间</div><input type="datetime-local" id="sh-when" value="' + (st.whenLocal || local) + '">' +
     '<button class="btn block" data-act="save">' + (st.mode === "edit" ? "保存修改" : "保存记录") + "</button>" +
     (st.mode === "edit" ? '<button class="btn danger block" data-act="delete">删除这条</button>' : "") +
@@ -432,21 +458,6 @@ function renderSheet() {
     const d = new Date(st.rec.ts * 1000);
     $("#sh-when").value = st.rec.date + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
   }
-  $$("#sheet [data-act]").forEach(b => b.addEventListener("click", () => sheetAction(b.dataset.act, b.dataset.v)));
-}
-function renderMorning(el) {
-  const st = sheetState;
-  const scale = (key, cur) => [1, 2, 3, 4, 5].map(n =>
-    '<button class="chip' + (cur === n ? " on" : "") + '" data-m="' + key + '" data-v="' + n + '">' + n + "</button>").join("");
-  el.innerHTML = "<h3>晨间打卡</h3>" +
-    '<div class="steplabel">昨晚睡眠（小时）</div><input type="number" id="m-sleep" step="0.5" min="0" placeholder="6.5" value="' + st.mSleep + '">' +
-    '<div class="steplabel">心情（1–5）</div><div class="chips">' + scale("mMood", st.mMood) + "</div>" +
-    '<div class="steplabel">精力（1–5）</div><div class="chips">' + scale("mEnergy", st.mEnergy) + "</div>" +
-    '<button class="btn block" data-act="morning-save">保存打卡</button>' +
-    '<button class="btn ghost block" data-act="close">取消</button>';
-  $$("#sheet [data-m]").forEach(b => b.addEventListener("click", () => {
-    sheetState[b.dataset.m] = Number(b.dataset.v); renderSheet();
-  }));
   $$("#sheet [data-act]").forEach(b => b.addEventListener("click", () => sheetAction(b.dataset.act, b.dataset.v)));
 }
 async function sheetAction(act, v) {
@@ -465,11 +476,14 @@ async function sheetAction(act, v) {
     return;
   }
   if (act === "val") {
-    const conf = VALUE_CONF[st.category];
+    const conf = VALUE_CONF[st.category] || { kind: "none" };
     if (conf.kind === "scale") st.value = { type: "scale", v: Number(v) };
     else if (conf.kind === "bristol") st.value = { type: "enum", v: Number(v) };
     else if (conf.kind === "enum") st.value = st.value && st.value.v === v ? null : { type: "enum", v };
     renderSheet(); return;
+  }
+  if (act === "wipe" || act === "after" || act === "grog" || act === "grogDur") {
+    st[act] = st[act] === v ? null : v; renderSheet(); return;
   }
   if (act === "tag") {
     const i = st.tags.indexOf(v);
@@ -481,23 +495,8 @@ async function sheetAction(act, v) {
     try { await api("/records/" + st.id, { method: "DELETE" }); } catch (e) { alert("删除失败：" + e.message); return; }
     closeSheet(); loadToday(); return;
   }
-  if (act === "morning-save") {
-    const sleep = parseFloat($("#m-sleep").value);
-    const items = [];
-    if (!isNaN(sleep) && sleep > 0) items.push({ category: "sleep", item: "睡眠", value: { type: "measure", v: sleep, unit: "小时" } });
-    if (st.mMood) items.push({ category: "state", item: "心情", value: { type: "scale", v: st.mMood } });
-    if (st.mEnergy) items.push({ category: "state", item: "精力", value: { type: "scale", v: st.mEnergy } });
-    if (!items.length) { alert("至少填一项"); return; }
-    const now = Math.floor(Date.now() / 1000);
-    for (const it of items) {
-      const payload = Object.assign({ id: uuid(), ts: now, date: todayStr(), tags: [], note: "" }, it);
-      try { await apiPost("/records", payload); }
-      catch (e) { const q = outbox(); q.push(payload); setOutbox(q); }
-    }
-    closeSheet(); loadToday(); return;
-  }
   if (act === "save") {
-    const conf = VALUE_CONF[st.category];
+    const conf = VALUE_CONF[st.category] || { kind: "none" };
     let value = st.value;
     if (conf.kind === "measure") {
       const n = parseFloat(($("#sh-num") || {}).value);
@@ -506,9 +505,20 @@ async function sheetAction(act, v) {
     const whenVal = $("#sh-when").value;
     if (!whenVal) { alert("请选择时间"); return; }
     const dt = new Date(whenVal);
+    let finalTags = st.tags.slice();
+    if (st.category === "sleep") {
+      finalTags = finalTags.filter(t => !t.startsWith("残留困意·") && !DUR_TAGS.includes(t));
+      if (st.grog) finalTags.push("残留困意·" + st.grog);
+      if (st.grogDur) finalTags.push(st.grogDur);
+    }
+    if (st.category === "stool") {
+      finalTags = finalTags.filter(t => !t.startsWith("擦纸·") && !t.startsWith("便后·"));
+      if (st.wipe) finalTags.push("擦纸·" + st.wipe);
+      if (st.after) finalTags.push("便后·" + st.after);
+    }
     const payload = {
       category: st.category, item: st.item || (sortedItems(st.category)[0] || ""),
-      value, tags: st.tags, note: $("#sh-note").value.trim(),
+      value, tags: finalTags, note: $("#sh-note").value.trim(),
       ts: Math.floor(dt.getTime() / 1000), date: todayStr(dt)
     };
     if (!payload.item) { alert("请先选择或填写项目名（例如药名）"); return; }
@@ -527,7 +537,7 @@ async function sheetAction(act, v) {
 }
 $("#sheet-wrap").addEventListener("click", e => { if (e.target.id === "sheet-wrap") closeSheet(); });
 $("#btn-add").addEventListener("click", () => openSheet({ mode: "create", date: viewDate === todayStr() ? todayStr() : viewDate }));
-$("#morning-go").addEventListener("click", () => openSheet({ morning: true }));
+
 $("#d-prev").addEventListener("click", () => { const d = new Date(viewDate); d.setDate(d.getDate() - 1); viewDate = todayStr(d); loadToday(); });
 $("#d-next").addEventListener("click", () => { const d = new Date(viewDate); d.setDate(d.getDate() + 1); viewDate = todayStr(d); loadToday(); });
 
