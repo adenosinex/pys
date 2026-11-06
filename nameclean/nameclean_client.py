@@ -25,7 +25,7 @@
 客户端可从清洗台网页右上角「下载客户端」直接下载最新版。
 分段/套用算法与服务端保持一致（SEG_VERSION = 1）。
 """
-CLIENT_VERSION = "1.3.0"
+CLIENT_VERSION = "1.4.0"
 import argparse
 import json
 import os
@@ -36,9 +36,12 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
-SEG_VERSION = 1
+SEG_VERSION = 2
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
               ".rmvb", ".rm", ".webm", ".mpg", ".mpeg", ".m4v", ".3gp"}
+KNOWN_EXTS = {"mp4", "mkv", "avi", "mov", "wmv", "flv", "ts", "m2ts",
+              "rmvb", "rm", "webm", "mpg", "mpeg", "m4v", "3gp",
+              "srt", "ass", "ssa", "vtt"}
 
 # ------- segmentation (shared spec with the server, SEG_VERSION = 1) ------
 SEP_CHARS = set("-_ \t|~·•・*+&@#%=,，;；'\"")
@@ -55,11 +58,20 @@ DIGITS_RE = re.compile(r"^\d+$")
 
 
 def split_ext(name):
+    """Strip the suffix BEFORE any comparison/tokenizing: known media
+    extensions count; short ASCII tags count; a CJK suffix is content."""
     if "." in name:
         stem, ext = name.rsplit(".", 1)
-        if stem and 0 < len(ext) <= 5 and ext.isalnum():
+        if stem and ext.lower() in KNOWN_EXTS:
+            return stem, "." + ext
+        if stem and 0 < len(ext) <= 5 and ext.isascii() and ext.isalnum():
             return stem, "." + ext
     return name, ""
+
+
+def tkey(token):
+    """Comparison key: ASCII tokens compare case-insensitively."""
+    return token.lower() if token.isascii() else token
 
 
 def segments(name):
@@ -75,7 +87,8 @@ def segments(name):
             cur.append(ch)
     if cur:
         out.append("".join(cur))
-    return [t.strip() for t in out if t.strip()]
+    return [t.strip() for t in out
+            if t.strip() and t.strip().lower() not in KNOWN_EXTS]
 
 
 def is_protected(token):
@@ -86,25 +99,27 @@ def is_protected(token):
 # ---------------- apply engine ---------------------------------------------
 
 def apply_rules(filename, rules):
-    """Return (new_name, hits). hits: pattern -> count for this file."""
-    keep = set(rules.get("keep") or [])
-    blacklist = set(rules.get("blacklist") or [])
-    replace = dict(rules.get("replace") or [])
+    """Return (new_name, hits). hits: pattern -> count for this file.
+    Rule lookup is case-insensitive for ASCII tokens (tkey)."""
+    keep = {tkey(x) for x in (rules.get("keep") or [])}
+    blacklist = {tkey(x) for x in (rules.get("blacklist") or [])}
+    replace = {tkey(k): v for k, v in (rules.get("replace") or [])}
     substrs = list(rules.get("substr") or [])
     _stem, ext = split_ext(filename)
     hits = {}
     out = []
     for tok in segments(filename):
-        if tok in keep:
+        k = tkey(tok)
+        if k in keep:
             out.append(tok)
             continue
-        if tok in replace:
-            hits[tok] = hits.get(tok, 0) + 1
-            if replace[tok]:
-                out.append(replace[tok])
+        if k in replace:
+            hits[k] = hits.get(k, 0) + 1
+            if replace[k]:
+                out.append(replace[k])
             continue
-        if tok in blacklist and not is_protected(tok):
-            hits[tok] = hits.get(tok, 0) + 1
+        if k in blacklist and not is_protected(tok):
+            hits[k] = hits.get(k, 0) + 1
             continue
         t = tok
         for s in substrs:
@@ -115,7 +130,7 @@ def apply_rules(filename, rules):
         if t:
             out.append(t)
         elif tok:
-            hits[tok] = hits.get(tok, 0) + 1
+            hits[k] = hits.get(k, 0) + 1
     if not out:
         return filename, {}
     new = ".".join(out) + ext
@@ -405,6 +420,9 @@ def main(argv=None):
             return 130
     print("批次已确认，拉取本批涉及的规则…")
     rules = client.call("GET", "/api/client/batches/%d/rules" % batch_id)
+    if rules.get("seg_version") not in (None, SEG_VERSION):
+        print("警告：服务端分段版本 %s 与客户端 %s 不一致，"
+              "建议从网页右上角重新下载客户端。" % (rules.get("seg_version"), SEG_VERSION))
     print("本批规则：黑名单 %d · 替换 %d · 保留 %d · 子串 %d" % (
         len(rules["blacklist"]), len(rules["replace"]),
         len(rules["keep"]), len(rules["substr"])))

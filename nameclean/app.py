@@ -21,7 +21,8 @@ import sqlite3
 import threading
 import time
 
-SEG_VERSION = 1
+SEG_VERSION = 2
+CANDIDATE_CAP = 80
 
 # ---------------- data dir / db (per-thread connections) ----------------
 
@@ -110,6 +111,10 @@ def _init():
             return
         c = _conn()
         c.executescript(SCHEMA)
+        cols = [r[1] for r in c.execute("PRAGMA table_info(batches)")]
+        if "lowfreq" not in cols:
+            c.execute("ALTER TABLE batches ADD COLUMN lowfreq "
+                      "INTEGER NOT NULL DEFAULT 0")
         c.commit()
         _inited = True
 
@@ -129,16 +134,32 @@ EPISODE_RE = re.compile(
 DIGITS_RE = re.compile(r"^\d+$")
 
 
+KNOWN_EXTS = {"mp4", "mkv", "avi", "mov", "wmv", "flv", "ts", "m2ts",
+              "rmvb", "rm", "webm", "mpg", "mpeg", "m4v", "3gp",
+              "srt", "ass", "ssa", "vtt"}
+
+
 def split_ext(name):
+    """Strip the suffix BEFORE any comparison/tokenizing. A suffix only
+    counts as an extension if it is a known media extension, or a short
+    ASCII tag — never a CJK word (a trailing .高清 is content, not an ext,
+    and the stem may itself contain a stray .mp4 that must not tokenize)."""
     if "." in name:
         stem, ext = name.rsplit(".", 1)
-        if stem and 0 < len(ext) <= 5 and ext.isalnum():
+        if stem and ext.lower() in KNOWN_EXTS:
+            return stem, "." + ext
+        if stem and 0 < len(ext) <= 5 and ext.isascii() and ext.isalnum():
             return stem, "." + ext
     return name, ""
 
 
 def strip_domains(text):
     return DOMAIN_RE.sub("\x00", text)
+
+
+def tkey(token):
+    """Comparison key: ASCII tokens compare case-insensitively."""
+    return token.lower() if token.isascii() else token
 
 
 def segments(name):
@@ -154,7 +175,9 @@ def segments(name):
             cur.append(ch)
     if cur:
         out.append("".join(cur))
-    return [t.strip() for t in out if t.strip()]
+    # a bare token that is just an extension name (mp4/mkv/…) is never content
+    return [t.strip() for t in out
+            if t.strip() and t.strip().lower() not in KNOWN_EXTS]
 
 
 def is_protected(token):
@@ -200,12 +223,12 @@ def _meta_set(key, value):
 
 
 def core_token_map():
-    """token -> (kind, replace_to) for all core-scope decided tokens."""
+    """tkey(token) -> (kind, replace_to) for all core-scope decided tokens."""
     m = {}
     for r in _conn().execute(
             "SELECT kind, pattern, replace_to FROM rules WHERE scope = 'core' "
             "AND kind IN ('blacklist', 'replace', 'keep')"):
-        m[r["pattern"]] = (r["kind"], r["replace_to"])
+        m[tkey(r["pattern"])] = (r["kind"], r["replace_to"])
     return m
 
 
@@ -214,23 +237,26 @@ def batch_rules(batch_id):
     restricted to tokens actually involved in the batch's files."""
     c = _conn()
     toks = set()
+    raw_toks = set()
     for r in c.execute("SELECT filename FROM batch_files WHERE batch_id = ?",
                        (batch_id,)):
-        toks.update(segments(r["filename"]))
+        segs = segments(r["filename"])
+        raw_toks.update(segs)
+        toks.update(tkey(t) for t in segs)
     out = {"blacklist": [], "replace": [], "keep": [], "substr": []}
     seen = set()
     for r in c.execute(
             "SELECT kind, pattern, replace_to FROM rules "
             "WHERE scope = 'core' OR (scope = 'batch' AND batch_id = ?) "
             "ORDER BY scope DESC", (batch_id,)):
-        key = (r["kind"], r["pattern"])
+        key = (r["kind"], tkey(r["pattern"]))
         if key in seen:
             continue
         if r["kind"] == "substr":
-            if any(r["pattern"] in t for t in toks):
+            if any(r["pattern"] in t for t in raw_toks):
                 out["substr"].append(r["pattern"])
                 seen.add(key)
-        elif r["pattern"] in toks:
+        elif tkey(r["pattern"]) in toks:
             seen.add(key)
             if r["kind"] == "replace":
                 out["replace"].append([r["pattern"], r["replace_to"]])
@@ -245,24 +271,33 @@ def batch_rules(batch_id):
 
 # ---------------- batch analysis ------------------------------------------
 
+def candidate_threshold(nfiles):
+    """A token must recur to be worth a human's attention. Small batches are
+    reviewed exhaustively; large batches need a real frequency floor."""
+    if nfiles < 10:
+        return 1
+    return max(3, -(-nfiles // 50))  # >=3 and >=2% of the batch
+
+
 def analyze_batch(batch_id):
     """(Re)compute candidates for a batch. Core-decided tokens and protected
-    tokens never become candidates — the core data speaks first."""
+    tokens never become candidates; below-threshold tokens never reach the
+    review list at all; the list is capped at CANDIDATE_CAP by frequency.
+    Existing decisions survive a re-analysis."""
     c = _conn()
     core = core_token_map()
     stats = {}
-    order = []
     for r in c.execute("SELECT filename FROM batch_files WHERE batch_id = ? "
                        "ORDER BY id", (batch_id,)):
         toks = segments(r["filename"])
         last = len(toks) - 1
         for i, t in enumerate(toks):
-            if t in core or is_protected(t) or len(t) < 2:
+            k = tkey(t)
+            if k in core or is_protected(t) or len(t) < 2:
                 continue
-            s = stats.get(t)
+            s = stats.get(k)
             if s is None:
-                s = stats[t] = {"cnt": 0, "head": 0, "tail": 0, "samples": []}
-                order.append(t)
+                s = stats[k] = {"cnt": 0, "head": 0, "tail": 0, "samples": []}
             s["cnt"] += 1
             if i == 0:
                 s["head"] += 1
@@ -272,23 +307,29 @@ def analyze_batch(batch_id):
                 s["samples"].append(r["filename"])
     nfiles = c.execute("SELECT COUNT(*) AS n FROM batch_files WHERE batch_id = ?",
                        (batch_id,)).fetchone()["n"]
-    threshold = 1 if nfiles < 10 else 2
+    threshold = candidate_threshold(nfiles)
+    prev = {r["token"]: (r["decision"], r["replace_to"], r["scope"])
+            for r in c.execute("SELECT * FROM candidates WHERE batch_id = ?",
+                               (batch_id,))}
+    ranked = sorted(stats.items(),
+                    key=lambda kv: (-kv[1]["cnt"], -kv[1]["head"], kv[0]))
+    above = [(k, s) for k, s in ranked if s["cnt"] >= threshold]
+    shown = above[:CANDIDATE_CAP]
+    lowfreq = len(ranked) - len(shown)
     c.execute("DELETE FROM candidates WHERE batch_id = ?", (batch_id,))
-    made = 0
-    for t in order:
-        s = stats[t]
-        if s["cnt"] < threshold:
-            continue
+    for k, s in shown:
+        dec, rto, scope = prev.get(k, ("", "", "core"))
         c.execute(
             "INSERT OR IGNORE INTO candidates "
-            "(batch_id, token, cnt, head, tail, samples, hint) VALUES (?,?,?,?,?,?,?)",
-            (batch_id, t, s["cnt"], s["head"], s["tail"],
-             json.dumps(s["samples"], ensure_ascii=False), hint_of(t)))
-        made += 1
-    c.execute("UPDATE batches SET candidate_count = ? WHERE id = ?",
-              (made, batch_id))
+            "(batch_id, token, cnt, head, tail, samples, hint, decision, "
+            "replace_to, scope) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (batch_id, k, s["cnt"], s["head"], s["tail"],
+             json.dumps(s["samples"], ensure_ascii=False), hint_of(k),
+             dec, rto, scope))
+    c.execute("UPDATE batches SET candidate_count = ?, lowfreq = ? WHERE id = ?",
+              (len(shown), lowfreq, batch_id))
     c.commit()
-    return made
+    return len(shown)
 
 
 def create_batch(name, filenames, source):
@@ -334,16 +375,19 @@ def confirm_batch(batch_id):
                 touched_tokens.add(r["token"])
     # rules involved in this batch gain a batches_seen tick
     toks = set()
+    raw_toks = set()
     for r in c.execute("SELECT filename FROM batch_files WHERE batch_id = ?",
                        (batch_id,)):
-        toks.update(segments(r["filename"]))
+        segs = segments(r["filename"])
+        raw_toks.update(segs)
+        toks.update(tkey(t) for t in segs)
     for r in c.execute("SELECT id, kind, pattern FROM rules "
                        "WHERE scope = 'core' OR (scope = 'batch' AND batch_id = ?)",
                        (batch_id,)):
         if r["kind"] == "substr":
-            hit = any(r["pattern"] in t for t in toks)
+            hit = any(r["pattern"] in t for t in raw_toks)
         else:
-            hit = r["pattern"] in toks
+            hit = tkey(r["pattern"]) in toks
         if hit and r["pattern"] not in touched_tokens:
             c.execute("UPDATE rules SET batches_seen = batches_seen + 1, "
                       "last_seen_at = ? WHERE id = ?", (now, r["id"]))
@@ -461,6 +505,7 @@ def api_batches(environ):
     out = []
     for b in rows:
         d = dict(b)
+        d["threshold"] = candidate_threshold(b["file_count"])
         d["pending"] = _conn().execute(
             "SELECT COUNT(*) AS n FROM candidates WHERE batch_id = ? AND decision = ''",
             (b["id"],)).fetchone()["n"]
@@ -494,7 +539,9 @@ def api_batch_detail(environ, batch_id):
         d = dict(r)
         d["samples"] = json.loads(d["samples"] or "[]")
         cands.append(d)
-    return {"batch": dict(b), "files": files, "candidates": cands}, "200 OK"
+    bd = dict(b)
+    bd["threshold"] = candidate_threshold(b["file_count"])
+    return {"batch": bd, "files": files, "candidates": cands}, "200 OK"
 
 
 def api_candidate_decide(environ, cand_id):
@@ -560,6 +607,8 @@ def api_rule_save(environ):
     data = _json_body(environ)
     kind = str(data.get("kind") or "")
     pattern = str(data.get("pattern") or "").strip()
+    if kind in ("blacklist", "replace", "keep"):
+        pattern = tkey(pattern)
     if kind not in ("blacklist", "replace", "keep", "substr") or not pattern:
         return {"ok": False, "error": "kind 或 pattern 无效"}, "400 Bad Request"
     now = time.time()
@@ -743,7 +792,7 @@ async function renderReview(app){
   const b = d.batch;
   let h = '<div style="margin-bottom:8px"><button class="btn sm" id="rv-back">← 批次列表</button></div>';
   h += '<div class="card"><h3 style="margin:2px 0">批次 #' + b.id + " " + esc(b.name) + '</h3>'
-    + '<p class="small">文件 ' + b.file_count + " 个 · 候选 " + d.candidates.length + " 个 · 状态 " + (b.status === "confirmed" ? "已入库" : "待审查") + '</p>'
+    + '<p class="small">文件 ' + b.file_count + " 个 · 候选 " + d.candidates.length + " 个（阈值：出现 ≥" + b.threshold + " 次才进审查，上限 " + 80 + " 个）· 另有 " + (b.lowfreq || 0) + " 个低频词块未达阈值，不进审查 · 状态 " + (b.status === "confirmed" ? "已入库" : "待审查") + '</p>'
     + '<details><summary class="small">查看全部文件名</summary><pre>' + esc(d.files.join("\n")) + '</pre></details></div>';
   h += '<div class="card"><table><tr><th>词块</th><th>次数</th><th>首/尾</th><th>提示</th><th>示例</th><th>判定</th><th>替换为 / 范围</th></tr>';
   for(const c of d.candidates){
