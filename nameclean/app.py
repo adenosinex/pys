@@ -20,8 +20,9 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 
-SEG_VERSION = 3
+SEG_VERSION = 4
 CANDIDATE_CAP = 80
 PHRASE_MIN_LEN = 4
 PHRASE_MAX_CORPUS = 120000  # CJK chars; beyond this, phrase mining is skipped
@@ -210,7 +211,7 @@ def chinese_runs(name):
         if CJK_RE.match(ch):
             chars.append(ch)
             idxs.append(pos)
-        elif ch in PHRASE_CONNECTORS:
+        elif ch in PHRASE_CONNECTORS or unicodedata.category(ch) in ("So", "Sk"):
             continue  # connector: neither extends nor breaks the run
         else:
             if chars:
@@ -235,6 +236,69 @@ def is_phrase_pattern(pattern):
         return False
     cjk = sum(1 for ch in pattern if CJK_RE.match(ch))
     return cjk >= PHRASE_MIN_LEN and cjk * 2 >= len(pattern)
+
+
+# ---------------- separable points & atoms (SEG v4) -----------------------
+# This is NOT word segmentation. First fix the separable points — places a
+# cut can never destroy a meaningful unit:
+#   * before the extension / around a stripped domain,
+#   * both sides of brackets (bracket content is its own region),
+#   * character-class transitions: CJK <-> alnum, anything <-> symbols,
+#     EXCEPT letter<->digit (1080p, S01E05, 25V stay one atom),
+#   * at every symbol: symbols belong to no atom; both sides are points.
+# An atom is the maximal span between neighbouring separable points.
+# Candidates may only start/end at separable points.
+
+EPISODE_SPAN_RE = re.compile(
+    r"(?i)第[0-9]+[集期话話回讲講]|[0-9]+[集期]")
+
+
+def _char_class(ch):
+    if CJK_RE.match(ch):
+        return "C"
+    if ch.isascii() and ch.isalnum():
+        return "A"
+    if ch in BRACKET_CHARS:
+        return "B"
+    return "S"
+
+
+def atoms_of(name):
+    """Split a filename into regions of atoms (comparison form: alnum
+    atoms lowercased). Brackets and stripped domains break regions;
+    symbols are separable points but do not break a region."""
+    stem, _ext = split_ext(name)
+    stem = strip_domains(stem)
+    forced = {}
+    for m in EPISODE_SPAN_RE.finditer(stem):
+        forced[m.start()] = m.end()
+    regions = []
+    region = []
+    i, n = 0, len(stem)
+    while i < n:
+        if i in forced:
+            region.append(stem[i:forced[i]])
+            i = forced[i]
+            continue
+        cls = _char_class(stem[i])
+        if cls == "B" or stem[i] == "\x00":
+            if region:
+                regions.append(region)
+                region = []
+            i += 1
+            continue
+        if cls == "S":
+            i += 1  # separable point: symbol belongs to no atom
+            continue
+        j = i
+        while j < n and j not in forced and _char_class(stem[j]) == cls:
+            j += 1
+        atom = stem[i:j]
+        region.append(atom.lower() if cls == "A" else atom)
+        i = j
+    if region:
+        regions.append(region)
+    return regions
 
 
 def _sam_phrase_candidates(runs, threshold):
@@ -301,19 +365,18 @@ def _sam_phrase_candidates(runs, threshold):
     return kept
 
 
-def mine_phrases(filenames, threshold):
-    """Longest repeated Chinese substrings across the batch.
-    Returns {phrase: {cnt(df), head, tail, samples}}."""
+def mine_atom_phrases(regions_per_file, filenames, threshold):
+    """Longest repeated Chinese substrings INSIDE single CJK atoms (an atom
+    has no separable points inside, so char-level mining applies there).
+    Returns {phrase: {cnt(df), head, tail, samples, docs}}."""
     runs = []
-    per_file = []
     total = 0
-    for doc_id, fn in enumerate(filenames):
-        fruns = chinese_runs(fn)
-        per_file.append((fn, fruns))
-        for _span, norm in fruns:
-            if len(norm) >= PHRASE_MIN_LEN:
-                runs.append((doc_id, norm))
-                total += len(norm)
+    for doc_id, regions in enumerate(regions_per_file):
+        for region in regions:
+            for atom in region:
+                if len(atom) >= PHRASE_MIN_LEN and _is_pure_cjk(atom):
+                    runs.append((doc_id, atom))
+                    total += len(atom)
     if not runs or total > PHRASE_MAX_CORPUS:
         return {}
     out = {}
@@ -321,21 +384,70 @@ def mine_phrases(filenames, threshold):
         head = tail = 0
         samples = []
         docs = set()
-        for doc_id, (fn, fruns) in enumerate(per_file):
+        for doc_id, regions in enumerate(regions_per_file):
             hit = False
-            for _span, norm in fruns:
-                if phrase in norm:
-                    hit = True
-                    if norm.startswith(phrase):
-                        head += 1
-                    if norm.endswith(phrase):
-                        tail += 1
+            for region in regions:
+                for atom in region:
+                    if phrase in atom:
+                        hit = True
+                        if atom.startswith(phrase):
+                            head += 1
+                        if atom.endswith(phrase):
+                            tail += 1
             if hit:
                 docs.add(doc_id)
                 if len(samples) < 3:
-                    samples.append(fn)
+                    samples.append(filenames[doc_id])
         out[phrase] = {"cnt": df, "head": head, "tail": tail,
                        "samples": samples, "docs": docs}
+    return out
+
+
+def atom_span_stats(regions_per_file, filenames, threshold):
+    """Repeated spans of consecutive atoms within one region (a span may
+    cross weak separable points — symbols — but never a region break, and
+    never includes a protected atom). Returns {text: stats} for spans whose
+    document frequency reaches the threshold."""
+    out = {}
+    for doc_id, regions in enumerate(regions_per_file):
+        seen = set()
+        for region in regions:
+            n = len(region)
+            for a in range(n):
+                if is_protected(region[a]):
+                    continue
+                text = ""
+                all_cjk = True
+                for k in range(a, min(n, a + 6)):
+                    if k > a and is_protected(region[k]):
+                        break
+                    if not _is_pure_cjk(region[k]):
+                        all_cjk = False
+                    text += region[k]
+                    if len(text) < 2:
+                        continue
+                    if k > a and not all_cjk:
+                        continue  # multi-atom spans: pure CJK only (mixed
+                        # sequences stay with the exact-segment token track)
+                    if text in seen:
+                        continue
+                    seen.add(text)
+                    s = out.get(text)
+                    if s is None:
+                        s = out[text] = {"cnt": 0, "head": 0, "tail": 0,
+                                         "samples": [], "docs": set()}
+                    s["docs"].add(doc_id)
+                    if a == 0:
+                        s["head"] += 1
+                    if k == n - 1:
+                        s["tail"] += 1
+                    if len(s["samples"]) < 3:
+                        s["samples"].append(filenames[doc_id])
+    for text in list(out):
+        s = out[text]
+        s["cnt"] = len(s["docs"])
+        if s["cnt"] < threshold:
+            del out[text]
     return out
 
 
@@ -448,7 +560,7 @@ def _is_pure_cjk(s):
     return bool(s) and all(CJK_RE.match(ch) for ch in s)
 
 
-def _dedup_contained(stats, filenames, phrases, threshold):
+def _dedup_contained(stats, regions_per_file, phrases, threshold):
     """Containment dedup by occurrence coverage (classification rule):
     candidates are processed longest-first; a selected candidate claims its
     occurrence spans in each file's normalized Chinese runs. A shorter
@@ -457,8 +569,8 @@ def _dedup_contained(stats, filenames, phrases, threshold):
     is that residual (independent) count: 'abc' x9 absorbs 'bc' even when
     'bc' totals 10, if only 1 of those is independent. Mixed tokens are
     then reconciled against the selected phrases by document sets."""
-    norm_runs = [[norm for _span, norm in chinese_runs(fn)]
-                 for fn in filenames]
+    norm_runs = [["".join(region) for region in regions]
+                 for regions in regions_per_file]
 
     def occ_spans(s):
         spans = {}
@@ -581,9 +693,12 @@ def analyze_batch(batch_id):
                 s["samples"].append(fn)
     nfiles = len(filenames)
     threshold = candidate_threshold(nfiles)
-    # Chinese-first: longest repeated substrings over symbol-joined runs
-    phrases = mine_phrases(filenames, threshold)
-    for phrase, ps in phrases.items():
+    # SEG v4: separable points -> atoms -> repeated spans / substrings
+    regions_per_file = [atoms_of(fn) for fn in filenames]
+    phrases = mine_atom_phrases(regions_per_file, filenames, threshold)
+    extra = dict(phrases)
+    extra.update(atom_span_stats(regions_per_file, filenames, threshold))
+    for phrase, ps in extra.items():
         if phrase in core or is_protected(phrase):
             continue
         s = stats.get(phrase)
@@ -597,7 +712,7 @@ def analyze_batch(batch_id):
             for fn in ps["samples"]:
                 if len(s["samples"]) < 3 and fn not in s["samples"]:
                     s["samples"].append(fn)
-    _dedup_contained(stats, filenames, phrases, threshold)
+    _dedup_contained(stats, regions_per_file, phrases, threshold)
     prev = {r["token"]: (r["decision"], r["replace_to"], r["scope"])
             for r in c.execute("SELECT * FROM candidates WHERE batch_id = ?",
                                (batch_id,))}

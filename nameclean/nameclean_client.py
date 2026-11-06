@@ -23,28 +23,29 @@
 接口入口自动推导：server 填网页地址即可，客户端会改走同域名的 /nc-api
 直连入口（不过网页门禁，只认令牌）；特殊情况可用 NAMECLEAN_API 覆盖。
 客户端可从清洗台网页右上角「下载客户端」直接下载最新版。
-分段/套用算法与服务端保持一致（SEG_VERSION = 3）：中文长串按短语匹配，
+分段/套用算法与服务端保持一致（SEG_VERSION = 4）：中文长串按短语匹配，
 文件名里短语字符之间的符号会被忽略。
 """
-CLIENT_VERSION = "1.5.1"
+CLIENT_VERSION = "1.6.0"
 import argparse
 import json
 import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.request
 import urllib.error
 import urllib.parse
 
-SEG_VERSION = 3
+SEG_VERSION = 4
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
               ".rmvb", ".rm", ".webm", ".mpg", ".mpeg", ".m4v", ".3gp"}
 KNOWN_EXTS = {"mp4", "mkv", "avi", "mov", "wmv", "flv", "ts", "m2ts",
               "rmvb", "rm", "webm", "mpg", "mpeg", "m4v", "3gp",
               "srt", "ass", "ssa", "vtt"}
 
-# ------- segmentation (shared spec with the server, SEG_VERSION = 3) ------
+# ------- segmentation (shared spec with the server, SEG_VERSION = 4) ------
 SEP_CHARS = set("-_ \t|~·•・*+&@#%=,，;；'\"")
 BRACKET_CHARS = set("[]()（）《》〈〉{}<>「」『』") | {chr(12304), chr(12305)}
 DOMAIN_RE = re.compile(
@@ -123,7 +124,7 @@ def _cjk_runs(stem):
         if CJK_RE.match(ch):
             chars.append(ch)
             idxs.append(pos)
-        elif ch in PHRASE_CONNECTORS:
+        elif ch in PHRASE_CONNECTORS or unicodedata.category(ch) in ("So", "Sk"):
             continue
         else:
             if chars:
