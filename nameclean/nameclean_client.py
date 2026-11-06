@@ -23,7 +23,7 @@
 客户端可从清洗台网页右上角「下载客户端」直接下载最新版。
 分段/套用算法与服务端保持一致（SEG_VERSION = 1）。
 """
-CLIENT_VERSION = "1.2.0"
+CLIENT_VERSION = "1.2.1"
 import argparse
 import json
 import os
@@ -260,10 +260,15 @@ def interactive_main():
     cfg = load_config(cfg_path) or {}
     server = (os.environ.get("NAMECLEAN_SERVER") or cfg.get("server")
               or "https://debi.su7.dpdns.org/web/nameclean")
-    token = os.environ.get("NAMECLEAN_TOKEN") or cfg.get("token") or ""
+    _env_token = os.environ.get("NAMECLEAN_TOKEN") or ""
+    token = _env_token or cfg.get("token") or ""
+    if _env_token:
+        print("令牌来源：环境变量 NAMECLEAN_TOKEN（已读取，不用输入）")
+    elif cfg.get("token"):
+        print("令牌来源：配置文件（已读取，不用输入）")
     changed = False
     if not token:
-        token = _ask("请输入清洗台令牌（网页「设置」页里保存的那个）: ")
+        token = _ask("未检测到环境变量，请输入清洗台令牌（只输这一次，会存入配置）: ")
         if not token:
             print("没有令牌无法连接，退出。")
             return 2
