@@ -23,9 +23,10 @@
 接口入口自动推导：server 填网页地址即可，客户端会改走同域名的 /nc-api
 直连入口（不过网页门禁，只认令牌）；特殊情况可用 NAMECLEAN_API 覆盖。
 客户端可从清洗台网页右上角「下载客户端」直接下载最新版。
-分段/套用算法与服务端保持一致（SEG_VERSION = 1）。
+分段/套用算法与服务端保持一致（SEG_VERSION = 3）：中文长串按短语匹配，
+文件名里短语字符之间的符号会被忽略。
 """
-CLIENT_VERSION = "1.4.0"
+CLIENT_VERSION = "1.5.0"
 import argparse
 import json
 import os
@@ -36,14 +37,14 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
-SEG_VERSION = 2
+SEG_VERSION = 3
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
               ".rmvb", ".rm", ".webm", ".mpg", ".mpeg", ".m4v", ".3gp"}
 KNOWN_EXTS = {"mp4", "mkv", "avi", "mov", "wmv", "flv", "ts", "m2ts",
               "rmvb", "rm", "webm", "mpg", "mpeg", "m4v", "3gp",
               "srt", "ass", "ssa", "vtt"}
 
-# ------- segmentation (shared spec with the server, SEG_VERSION = 1) ------
+# ------- segmentation (shared spec with the server, SEG_VERSION = 3) ------
 SEP_CHARS = set("-_ \t|~·•・*+&@#%=,，;；'\"")
 BRACKET_CHARS = set("[]()（）《》〈〉{}<>「」『』") | {chr(12304), chr(12305)}
 DOMAIN_RE = re.compile(
@@ -74,9 +75,7 @@ def tkey(token):
     return token.lower() if token.isascii() else token
 
 
-def segments(name):
-    stem, _ext = split_ext(name)
-    stem = DOMAIN_RE.sub("\x00", stem)
+def _segments_stem(stem):
     out, cur = [], []
     for ch in stem:
         if ch in SEP_CHARS or ch in BRACKET_CHARS or ch == "." or ch == "\x00":
@@ -91,24 +90,102 @@ def segments(name):
             if t.strip() and t.strip().lower() not in KNOWN_EXTS]
 
 
+def segments(name):
+    stem, _ext = split_ext(name)
+    return _segments_stem(DOMAIN_RE.sub("\x00", stem))
+
+
 def is_protected(token):
     return bool(YEAR_RE.match(token) or EPISODE_RE.match(token)
                 or DIGITS_RE.match(token))
+
+
+# ------- Chinese phrase matching (SEG v3, shared spec with the server) ----
+CJK_RE = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002a6df]")
+PHRASE_CONNECTORS = set("-_ \t|~·•・/&+，,、：:；;！!？?。…—–")
+PHRASE_MIN_LEN = 4
+
+
+def is_phrase_pattern(pattern):
+    if len(pattern) < PHRASE_MIN_LEN:
+        return False
+    cjk = sum(1 for ch in pattern if CJK_RE.match(ch))
+    return cjk >= PHRASE_MIN_LEN and cjk * 2 >= len(pattern)
+
+
+def _cjk_runs(stem):
+    """[(offsets, normalized_text)] — symbols between CJK chars are
+    connectors (skipped in the normalized text, kept inside spans)."""
+    runs = []
+    chars = []
+    idxs = []
+    for pos, ch in enumerate(stem):
+        if CJK_RE.match(ch):
+            chars.append(ch)
+            idxs.append(pos)
+        elif ch in PHRASE_CONNECTORS:
+            continue
+        else:
+            if chars:
+                runs.append((idxs, "".join(chars)))
+                chars, idxs = [], []
+    if chars:
+        runs.append((idxs, "".join(chars)))
+    return runs
+
+
+def _apply_phrase(stem, pattern, repl):
+    """Remove/replace every occurrence of `pattern` in the stem's Chinese
+    runs (the original span, internal symbols included). Returns
+    (new_stem, applied_count)."""
+    spans = []
+    for idxs, norm in _cjk_runs(stem):
+        start = 0
+        while True:
+            j = norm.find(pattern, start)
+            if j < 0:
+                break
+            spans.append((idxs[j], idxs[j + len(pattern) - 1] + 1))
+            start = j + 1
+    if not spans:
+        return stem, 0
+    out = []
+    last = 0
+    applied = 0
+    for a, b in sorted(spans):
+        if a < last:
+            continue
+        out.append(stem[last:a])
+        out.append(repl)
+        last = b
+        applied += 1
+    out.append(stem[last:])
+    return "".join(out), applied
 
 
 # ---------------- apply engine ---------------------------------------------
 
 def apply_rules(filename, rules):
     """Return (new_name, hits). hits: pattern -> count for this file.
-    Rule lookup is case-insensitive for ASCII tokens (tkey)."""
+    Rule lookup is case-insensitive for ASCII tokens (tkey). Chinese phrase
+    rules (SEG v3) are applied first, on the whole stem, ignoring symbols
+    between the phrase's characters."""
     keep = {tkey(x) for x in (rules.get("keep") or [])}
     blacklist = {tkey(x) for x in (rules.get("blacklist") or [])}
     replace = {tkey(k): v for k, v in (rules.get("replace") or [])}
     substrs = list(rules.get("substr") or [])
-    _stem, ext = split_ext(filename)
+    stem0, ext = split_ext(filename)
+    work = DOMAIN_RE.sub("\x00", stem0)
     hits = {}
+    phrase_rules = [(k, "") for k in blacklist if is_phrase_pattern(k)]
+    phrase_rules += [(k, v) for k, v in replace.items()
+                     if is_phrase_pattern(k)]
+    for pat, repl in sorted(phrase_rules, key=lambda kv: -len(kv[0])):
+        work, n = _apply_phrase(work, pat, repl)
+        if n:
+            hits[pat] = hits.get(pat, 0) + n
     out = []
-    for tok in segments(filename):
+    for tok in _segments_stem(work):
         k = tkey(tok)
         if k in keep:
             out.append(tok)
@@ -301,12 +378,7 @@ def interactive_main():
             return 2
         cfg["token"] = token
         changed = True
-    s2 = _ask("服务器地址（直接回车 = %s）: " % server, server)
-    if s2 != server:
-        server = s2
-        cfg["server"] = server
-        changed = True
-    elif not cfg.get("server"):
+    if not cfg.get("server"):
         cfg["server"] = server
         changed = True
     if changed:
@@ -317,9 +389,9 @@ def interactive_main():
     if not path or not os.path.isdir(path):
         print("路径无效：", path)
         return 2
-    argv = ["--path", path, "--server", server, "--token", token]
-    if _ask("包含子文件夹？[y/N] ").lower() == "y":
-        argv.append("--recursive")
+    argv = ["--path", path, "--server", server, "--token", token,
+            "--recursive", "--yes"]
+    print("默认包含全部子文件夹；预览后自动改名。")
     print()
     return main(argv)
 
@@ -332,7 +404,10 @@ def main(argv=None):
     ap.add_argument("--token", help="客户端令牌（覆盖配置）")
     ap.add_argument("--config", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "nameclean_client.json"))
-    ap.add_argument("--recursive", action="store_true", help="递归子目录")
+    ap.add_argument("--recursive", dest="recursive", action="store_true",
+                    default=True, help="递归子目录（默认）")
+    ap.add_argument("--no-recursive", dest="recursive", action="store_false",
+                    help="只处理当前目录，不包含子文件夹")
     ap.add_argument("--all", action="store_true", help="处理所有文件（默认只视频）")
     ap.add_argument("--yes", action="store_true", help="预览后不询问直接改名")
     ap.add_argument("--dry-run", action="store_true", help="只预览不改名")

@@ -21,8 +21,10 @@ import sqlite3
 import threading
 import time
 
-SEG_VERSION = 2
+SEG_VERSION = 3
 CANDIDATE_CAP = 80
+PHRASE_MIN_LEN = 4
+PHRASE_MAX_CORPUS = 120000  # CJK chars; beyond this, phrase mining is skipped
 
 # ---------------- data dir / db (per-thread connections) ----------------
 
@@ -185,6 +187,155 @@ def is_protected(token):
                 or DIGITS_RE.match(token))
 
 
+# ---------------- Chinese phrase runs (SEG v3) ---------------------------
+# Chinese-first extraction: symbols between Chinese characters are treated
+# as connectors, not boundaries, so a symbol-joined Chinese sentence stays
+# one continuous string. Strong boundaries (brackets, Latin, digits, emoji)
+# still break a run.
+
+CJK_RE = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002a6df]")
+PHRASE_CONNECTORS = set("-_ \t|~·•・/&+，,、：:；;！!？?。…—–")
+
+
+def chinese_runs(name):
+    """Return [(original_span, normalized_cjk_text)] for one filename.
+    The span is the original text from the run's first to last CJK char
+    (internal connectors included); the normalized text is CJK chars only."""
+    stem, _ext = split_ext(name)
+    stem = strip_domains(stem)
+    runs = []
+    chars = []   # normalized CJK chars of the current run
+    idxs = []    # their offsets in stem
+    for pos, ch in enumerate(stem):
+        if CJK_RE.match(ch):
+            chars.append(ch)
+            idxs.append(pos)
+        elif ch in PHRASE_CONNECTORS:
+            continue  # connector: neither extends nor breaks the run
+        else:
+            if chars:
+                runs.append((stem[idxs[0]:idxs[-1] + 1], "".join(chars)))
+                chars, idxs = [], []
+    if chars:
+        runs.append((stem[idxs[0]:idxs[-1] + 1], "".join(chars)))
+    return runs
+
+
+def phrase_occurrences(name, pattern):
+    """How many Chinese runs of `name` contain `pattern` (normalized)."""
+    if not pattern:
+        return 0
+    return sum(1 for _span, norm in chinese_runs(name) if pattern in norm)
+
+
+def is_phrase_pattern(pattern):
+    """A rule pattern that should match as a Chinese phrase (symbols in the
+    filename between its characters are ignored)."""
+    if len(pattern) < PHRASE_MIN_LEN:
+        return False
+    cjk = sum(1 for ch in pattern if CJK_RE.match(ch))
+    return cjk >= PHRASE_MIN_LEN and cjk * 2 >= len(pattern)
+
+
+def _sam_phrase_candidates(runs, threshold):
+    """Mine the longest substrings repeated in >= threshold documents.
+    runs: list of (doc_id, normalized_text). Suffix automaton; for each
+    state we keep the longest string, its distinct-document count and one
+    sample occurrence, then suppress substrings covered by a longer
+    candidate occurring in at least as many documents."""
+    nexts = [{}]
+    link = [-1]
+    length = [0]
+    sample = [(-1, -1)]  # (run_id, end_pos)
+    docs = [set()]
+
+    def new_state(nxt, lnk, ln, smp, dset):
+        nexts.append(nxt)
+        link.append(lnk)
+        length.append(ln)
+        sample.append(smp)
+        docs.append(dset)
+        return len(nexts) - 1
+
+    for run_id, (doc_id, text) in enumerate(runs):
+        last = 0
+        for pos, ch in enumerate(text):
+            cur = new_state({}, 0, length[last] + 1, (run_id, pos), {doc_id})
+            p = last
+            while p != -1 and ch not in nexts[p]:
+                nexts[p][ch] = cur
+                p = link[p]
+            if p == -1:
+                link[cur] = 0
+            else:
+                q = nexts[p][ch]
+                if length[p] + 1 == length[q]:
+                    link[cur] = q
+                else:
+                    clone = new_state(dict(nexts[q]), link[q],
+                                      length[p] + 1, sample[q], set())
+                    while p != -1 and nexts[p].get(ch) == q:
+                        nexts[p][ch] = clone
+                        p = link[p]
+                    link[q] = link[cur] = clone
+            last = cur
+    for v in sorted(range(len(nexts)), key=lambda x: length[x], reverse=True):
+        parent = link[v]
+        if parent >= 0:
+            docs[parent].update(docs[v])
+    found = {}
+    for v in range(1, len(nexts)):
+        df = len(docs[v])
+        if df < threshold or length[v] < PHRASE_MIN_LEN:
+            continue
+        run_id, end = sample[v]
+        text = runs[run_id][1]
+        s = text[end - length[v] + 1:end + 1]
+        if len(s) == length[v] and df > found.get(s, 0):
+            found[s] = df
+    kept = []
+    for s, df in sorted(found.items(), key=lambda kv: (-len(kv[0]), -kv[1])):
+        if any(df <= kdf and s in ks for ks, kdf in kept):
+            continue
+        kept.append((s, df))
+    return kept
+
+
+def mine_phrases(filenames, threshold):
+    """Longest repeated Chinese substrings across the batch.
+    Returns {phrase: {cnt(df), head, tail, samples}}."""
+    runs = []
+    per_file = []
+    total = 0
+    for doc_id, fn in enumerate(filenames):
+        fruns = chinese_runs(fn)
+        per_file.append((fn, fruns))
+        for _span, norm in fruns:
+            if len(norm) >= PHRASE_MIN_LEN:
+                runs.append((doc_id, norm))
+                total += len(norm)
+    if not runs or total > PHRASE_MAX_CORPUS:
+        return {}
+    out = {}
+    for phrase, df in _sam_phrase_candidates(runs, threshold):
+        head = tail = 0
+        samples = []
+        for fn, fruns in per_file:
+            hit = False
+            for _span, norm in fruns:
+                if phrase in norm:
+                    hit = True
+                    if norm.startswith(phrase):
+                        head += 1
+                    if norm.endswith(phrase):
+                        tail += 1
+            if hit and len(samples) < 3:
+                samples.append(fn)
+        out[phrase] = {"cnt": df, "head": head, "tail": tail,
+                       "samples": samples}
+    return out
+
+
 # ---------------- hints for reviewers -----------------------------------
 
 AD_HINTS = ["影视", "电影", "资源", "首发", "独家", "免费", "下载", "最新",
@@ -205,6 +356,8 @@ def hint_of(token):
     for h in TECH_HINTS:
         if h in low:
             return "技术标签"
+    if len(token) >= 6 and any(CJK_RE.match(ch) for ch in token):
+        return "中文长串"
     return ""
 
 
@@ -238,8 +391,10 @@ def batch_rules(batch_id):
     c = _conn()
     toks = set()
     raw_toks = set()
+    filenames = []
     for r in c.execute("SELECT filename FROM batch_files WHERE batch_id = ?",
                        (batch_id,)):
+        filenames.append(r["filename"])
         segs = segments(r["filename"])
         raw_toks.update(segs)
         toks.update(tkey(t) for t in segs)
@@ -256,6 +411,13 @@ def batch_rules(batch_id):
             if any(r["pattern"] in t for t in raw_toks):
                 out["substr"].append(r["pattern"])
                 seen.add(key)
+        elif is_phrase_pattern(r["pattern"]):
+            if any(phrase_occurrences(fn, r["pattern"]) for fn in filenames):
+                seen.add(key)
+                if r["kind"] == "replace":
+                    out["replace"].append([r["pattern"], r["replace_to"]])
+                else:
+                    out[r["kind"]].append(r["pattern"])
         elif tkey(r["pattern"]) in toks:
             seen.add(key)
             if r["kind"] == "replace":
@@ -279,17 +441,28 @@ def candidate_threshold(nfiles):
     return max(3, -(-nfiles // 50))  # >=3 and >=2% of the batch
 
 
+def _cand_rank(item):
+    """Chinese first, longest-and-most-frequent first (SEG v3 ordering)."""
+    token, s = item
+    cjk = sum(1 for ch in token if CJK_RE.match(ch))
+    cat = 0 if cjk >= 2 else 1
+    score = s["cnt"] * min(len(token), 24) * (2 if cjk >= PHRASE_MIN_LEN else 1)
+    return (cat, -score, -s["cnt"], -len(token), -s["head"], token)
+
+
 def analyze_batch(batch_id):
     """(Re)compute candidates for a batch. Core-decided tokens and protected
-    tokens never become candidates; below-threshold tokens never reach the
-    review list at all; the list is capped at CANDIDATE_CAP by frequency.
-    Existing decisions survive a re-analysis."""
+    tokens never become candidates; below-threshold items never reach the
+    review list at all; the list is capped at CANDIDATE_CAP, Chinese longest
+    repeated substrings first. Existing decisions survive a re-analysis."""
     c = _conn()
     core = core_token_map()
+    filenames = [r["filename"] for r in c.execute(
+        "SELECT filename FROM batch_files WHERE batch_id = ? ORDER BY id",
+        (batch_id,))]
     stats = {}
-    for r in c.execute("SELECT filename FROM batch_files WHERE batch_id = ? "
-                       "ORDER BY id", (batch_id,)):
-        toks = segments(r["filename"])
+    for fn in filenames:
+        toks = segments(fn)
         last = len(toks) - 1
         for i, t in enumerate(toks):
             k = tkey(t)
@@ -303,16 +476,37 @@ def analyze_batch(batch_id):
                 s["head"] += 1
             if i == last and last > 0:
                 s["tail"] += 1
-            if len(s["samples"]) < 3 and r["filename"] not in s["samples"]:
-                s["samples"].append(r["filename"])
-    nfiles = c.execute("SELECT COUNT(*) AS n FROM batch_files WHERE batch_id = ?",
-                       (batch_id,)).fetchone()["n"]
+            if len(s["samples"]) < 3 and fn not in s["samples"]:
+                s["samples"].append(fn)
+    nfiles = len(filenames)
     threshold = candidate_threshold(nfiles)
+    # Chinese-first: longest repeated substrings over symbol-joined runs
+    phrases = mine_phrases(filenames, threshold)
+    for phrase, ps in phrases.items():
+        if phrase in core or is_protected(phrase):
+            continue
+        s = stats.get(phrase)
+        if s is None:
+            stats[phrase] = ps
+        else:
+            s["cnt"] = max(s["cnt"], ps["cnt"])
+            s["head"] = max(s["head"], ps["head"])
+            s["tail"] = max(s["tail"], ps["tail"])
+            for fn in ps["samples"]:
+                if len(s["samples"]) < 3 and fn not in s["samples"]:
+                    s["samples"].append(fn)
+    # a token fully covered by an equally-frequent mined phrase is redundant
+    for token in list(stats):
+        if token in phrases:
+            continue
+        for phrase, ps in phrases.items():
+            if ps["cnt"] >= stats[token]["cnt"] and token in phrase:
+                del stats[token]
+                break
     prev = {r["token"]: (r["decision"], r["replace_to"], r["scope"])
             for r in c.execute("SELECT * FROM candidates WHERE batch_id = ?",
                                (batch_id,))}
-    ranked = sorted(stats.items(),
-                    key=lambda kv: (-kv[1]["cnt"], -kv[1]["head"], kv[0]))
+    ranked = sorted(stats.items(), key=_cand_rank)
     above = [(k, s) for k, s in ranked if s["cnt"] >= threshold]
     shown = above[:CANDIDATE_CAP]
     lowfreq = len(ranked) - len(shown)
@@ -376,8 +570,10 @@ def confirm_batch(batch_id):
     # rules involved in this batch gain a batches_seen tick
     toks = set()
     raw_toks = set()
+    filenames = []
     for r in c.execute("SELECT filename FROM batch_files WHERE batch_id = ?",
                        (batch_id,)):
+        filenames.append(r["filename"])
         segs = segments(r["filename"])
         raw_toks.update(segs)
         toks.update(tkey(t) for t in segs)
@@ -386,6 +582,8 @@ def confirm_batch(batch_id):
                        (batch_id,)):
         if r["kind"] == "substr":
             hit = any(r["pattern"] in t for t in raw_toks)
+        elif is_phrase_pattern(r["pattern"]):
+            hit = any(phrase_occurrences(fn, r["pattern"]) for fn in filenames)
         else:
             hit = tkey(r["pattern"]) in toks
         if hit and r["pattern"] not in touched_tokens:
@@ -534,11 +732,12 @@ def api_batch_detail(environ, batch_id):
         "SELECT filename FROM batch_files WHERE batch_id = ? ORDER BY id",
         (batch_id,))]
     cands = []
-    for r in c.execute("SELECT * FROM candidates WHERE batch_id = ? "
-                       "ORDER BY cnt DESC, head DESC, token", (batch_id,)):
+    for r in c.execute("SELECT * FROM candidates WHERE batch_id = ?",
+                       (batch_id,)):
         d = dict(r)
         d["samples"] = json.loads(d["samples"] or "[]")
         cands.append(d)
+    cands.sort(key=lambda d: _cand_rank((d["token"], d)))
     bd = dict(b)
     bd["threshold"] = candidate_threshold(b["file_count"])
     return {"batch": bd, "files": files, "candidates": cands}, "200 OK"
