@@ -19,6 +19,7 @@ Design notes (from the project brief, adapted):
 import json
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -85,18 +86,27 @@ DRUG_FIELDS = [
 
 # ------------------------------------------------------------------ db
 
-_db_local = {}
+_tls = threading.local()
+_init_lock = threading.Lock()
+_init_done = False
 
 
 def db():
-    conn = _db_local.get("conn")
+    # One connection per thread: the panel launcher serves with several
+    # threads, and a sqlite3 connection may only be used in its own thread.
+    global _init_done
+    conn = getattr(_tls, "conn", None)
     if conn is None:
-        conn = sqlite3.connect(str(DB_PATH))
+        conn = sqlite3.connect(str(DB_PATH), timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA foreign_keys=ON")
-        _db_local["conn"] = conn
-        _init_db(conn)
+        with _init_lock:
+            if not _init_done:
+                _init_db(conn)
+                _init_done = True
+        _tls.conn = conn
     return conn
 
 
