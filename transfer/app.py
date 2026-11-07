@@ -281,7 +281,7 @@ def handle_drive_download(name):
 
 def _safe_name(name):
     name = (name or "").replace("\\", "/").split("/")[-1].strip()
-    if not name or name in (".", "..") or name.startswith("."):
+    if not name or name in (".", ".."):
         return None
     if "/" in name or "\x00" in name:
         return None
@@ -355,11 +355,36 @@ class _Reader:
 
 def _parse_disposition(value):
     params = {}
-    parts = value.split(";")
+    parts = []
+    cur = ""
+    in_quotes = False
+    for ch in value or "":
+        if ch == '"':
+            in_quotes = not in_quotes
+            cur += ch
+        elif ch == ";" and not in_quotes:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
     for part in parts[1:]:
         if "=" in part:
             k, v = part.split("=", 1)
-            params[k.strip().lower()] = v.strip().strip('"')
+            v = v.strip()
+            if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+                v = v[1:-1].replace('\\"', '"')
+            params[k.strip().lower()] = v
+    star = params.get("filename*")
+    if star and "'" in star:
+        try:
+            bits = star.split("'", 2)
+            charset = bits[0] or "utf-8"
+            encoded = bits[2] if len(bits) > 2 else ""
+            params["filename"] = urllib.parse.unquote_to_bytes(
+                encoded).decode(charset, "replace")
+        except Exception:
+            pass
     return params
 
 
@@ -379,6 +404,7 @@ def handle_upload(environ, dest_dir=None):
     reader = _Reader(environ["wsgi.input"], length)
     delim = b"\r\n" + marker
     saved = []
+    skipped = []
     # skip preamble up to first boundary
     for _ in reader.until(marker):
         pass
@@ -403,6 +429,8 @@ def handle_upload(environ, dest_dir=None):
         if filename:
             safe = _safe_name(filename)
             if not safe:
+                skipped.append({"name": filename[:80],
+                                "reason": "bad name"})
                 for _ in reader.until(delim):
                     pass
                 continue
@@ -423,7 +451,14 @@ def handle_upload(environ, dest_dir=None):
         # continues at the bytes right after the marker
         if reader.left <= 0 and not reader.buf:
             break
-    return {"ok": True, "saved": saved}, "200 OK"
+    if not saved and skipped:
+        return {"ok": False,
+                "error": "file rejected: " + skipped[0]["name"]}, \
+            "400 Bad Request"
+    out = {"ok": True, "saved": saved}
+    if skipped:
+        out["skipped"] = skipped
+    return out, "200 OK"
 
 
 def handle_download(name):
@@ -556,7 +591,7 @@ function upload(files){
     const xhr=new XMLHttpRequest();xhr.open("POST","api/upload");
     xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(100*e.loaded/e.total);fill.style.width=p+"%";st.textContent="上传 "+p+"%";}};
     xhr.onload=()=>{let d={};try{d=JSON.parse(xhr.responseText);}catch(_){}
-      if(xhr.status===200&&d.ok){item.classList.add("done");fill.style.width="100%";st.textContent="完成";refresh();}
+      if(xhr.status===200&&d.ok&&d.saved&&d.saved.length){item.classList.add("done");fill.style.width="100%";st.textContent=d.skipped&&d.skipped.length?"完成（有文件被拒绝）":"完成";refresh();}
       else{item.classList.add("err");st.textContent=(d.error||("失败 HTTP "+xhr.status));}};
     xhr.onerror=()=>{item.classList.add("err");st.textContent="网络错误";};
     xhr.send(fd);
@@ -599,7 +634,7 @@ function gupload(files){
     const xhr=new XMLHttpRequest();xhr.open("POST","api/drive/upload");
     xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(100*e.loaded/e.total);fill.style.width=p+"%";st.textContent=p>=100?"转存谷歌硬盘中…":"上传 "+p+"%";}};
     xhr.onload=()=>{let d={};try{d=JSON.parse(xhr.responseText);}catch(_){}
-      if(xhr.status===200&&d.ok){item.classList.add("done");fill.style.width="100%";st.textContent="已存入谷歌硬盘";grefresh();}
+      if(xhr.status===200&&d.ok&&d.saved&&d.saved.length){item.classList.add("done");fill.style.width="100%";st.textContent=d.skipped&&d.skipped.length?"已存入（有文件被拒绝）":"已存入谷歌硬盘";grefresh();}
       else{item.classList.add("err");st.textContent=(d.error||("失败 HTTP "+xhr.status));}};
     xhr.onerror=()=>{item.classList.add("err");st.textContent="网络错误";};
     xhr.send(fd);
