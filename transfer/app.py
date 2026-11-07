@@ -330,6 +330,7 @@ class _Reader:
         self.stream = stream
         self.left = length
         self.buf = b""
+        self.tee = b""
 
     def read_more(self):
         if self.left <= 0:
@@ -340,6 +341,8 @@ class _Reader:
             return False
         self.left -= len(chunk)
         self.buf += chunk
+        if len(self.tee) < 8192:
+            self.tee = (self.tee + chunk)[:8192]
         return True
 
     def until(self, marker):
@@ -462,6 +465,8 @@ def handle_upload(environ, dest_dir=None):
         # continues at the bytes right after the marker
         if reader.left <= 0 and not reader.buf:
             break
+    if length < 8192:
+        _dbg("raw body=%r" % (reader.tee,))
     _dbg("done saved=%r skipped=%r" % (saved, skipped))
     if not saved and skipped:
         return {"ok": False,
