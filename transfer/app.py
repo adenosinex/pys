@@ -13,15 +13,6 @@ Routes:
   POST /api/delete      {name}
 """
 import json
-import sys as _sys
-
-
-def _dbg(msg):
-    try:
-        _sys.stderr.write('[updbg] ' + str(msg) + '\n')
-        _sys.stderr.flush()
-    except Exception:
-        pass
 import os
 import shutil
 import threading
@@ -330,7 +321,6 @@ class _Reader:
         self.stream = stream
         self.left = length
         self.buf = b""
-        self.tee = b""
 
     def read_more(self):
         if self.left <= 0:
@@ -341,8 +331,6 @@ class _Reader:
             return False
         self.left -= len(chunk)
         self.buf += chunk
-        if len(self.tee) < 8192:
-            self.tee = (self.tee + chunk)[:8192]
         return True
 
     def until(self, marker):
@@ -405,7 +393,6 @@ def handle_upload(environ, dest_dir=None):
     if "multipart/form-data" not in ctype or "boundary=" not in ctype:
         return {"ok": False, "error": "需要 multipart/form-data 上传"}, "400 Bad Request"
     boundary = ctype.split("boundary=", 1)[1].strip().strip('"')
-    _dbg("ctype=%r len=%s boundary=%r" % (ctype, environ.get("CONTENT_LENGTH"), boundary))
     marker = ("--" + boundary).encode()
     length = int(environ.get("CONTENT_LENGTH") or 0)
     if length <= 0:
@@ -439,7 +426,6 @@ def handle_upload(environ, dest_dir=None):
                 headers[k.strip().lower()] = v.strip()
         disp = _parse_disposition(headers.get("content-disposition", ""))
         filename = disp.get("filename", "")
-        _dbg("part headers=%r filename=%r" % (headers, filename))
         if filename:
             safe = _safe_name(filename)
             if not safe:
@@ -465,9 +451,6 @@ def handle_upload(environ, dest_dir=None):
         # continues at the bytes right after the marker
         if reader.left <= 0 and not reader.buf:
             break
-    if length < 8192:
-        _dbg("raw body=%r" % (reader.tee,))
-    _dbg("done saved=%r skipped=%r" % (saved, skipped))
     if not saved and skipped:
         return {"ok": False,
                 "error": "file rejected: " + skipped[0]["name"]}, \
