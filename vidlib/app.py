@@ -36,6 +36,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import unicodedata
 import mimetypes
 import urllib.parse
 import urllib.request
@@ -86,7 +87,9 @@ def _kind(ext):
         return "video"
     if ext in IMAGE_EXTS:
         return "image"
-    return "other"
+    if ext == "txt":
+        return "novel"
+    return "file"
 
 
 _MIME_OVERRIDES = {"mkv": "video/x-matroska", "ts": "video/mp2t",
@@ -197,6 +200,109 @@ def init_db():
             conn.execute(
                 "ALTER TABLE entries ADD COLUMN mark_at "
                 "REAL DEFAULT 0")
+        # ---- v2: resource library. Kinds on files, libraries
+        # on entries, novel index/read state, file category
+        # rules. Everything below is idempotent.
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS libraries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            prefix TEXT DEFAULT '',
+            is_default INTEGER DEFAULT 0,
+            created_at REAL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS novel_meta (
+            hash TEXT PRIMARY KEY,
+            encoding TEXT DEFAULT '',
+            char_count INTEGER DEFAULT 0,
+            chapters TEXT DEFAULT '[]',
+            updated_at REAL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS novel_read (
+            entry_id INTEGER PRIMARY KEY,
+            chapter INTEGER DEFAULT 0,
+            offset INTEGER DEFAULT 0,
+            percent REAL DEFAULT 0,
+            updated_at REAL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS file_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            exts TEXT DEFAULT '',
+            sort INTEGER DEFAULT 0,
+            builtin INTEGER DEFAULT 0
+        );
+        """)
+        _ncols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(novel_meta)")}
+        if "title_len" not in _ncols:
+            conn.execute(
+                "ALTER TABLE novel_meta ADD COLUMN title_len "
+                "INTEGER DEFAULT 0")
+        if "split_stats" not in _ncols:
+            conn.execute(
+                "ALTER TABLE novel_meta ADD COLUMN split_stats "
+                "TEXT DEFAULT ''")
+        _fcols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(files)")}
+        if "kind" not in _fcols:
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN kind "
+                "TEXT DEFAULT 'video'")
+        if "category" not in _fcols:
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN category "
+                "TEXT DEFAULT ''")
+        if "library_id" not in _ecols:
+            conn.execute(
+                "ALTER TABLE entries ADD COLUMN library_id "
+                "INTEGER DEFAULT 0")
+        for _k, _n, _p in (("video", "默认库", "视频/默认库"),
+                           ("image", "默认库", "图片"),
+                           ("novel", "默认库", "小说"),
+                           ("file", "默认库", "文件")):
+            if conn.execute(
+                    "SELECT id FROM libraries WHERE kind = ? "
+                    "AND is_default = 1", (_k,)).fetchone() is None:
+                conn.execute(
+                    "INSERT INTO libraries(name, kind, prefix, "
+                    "is_default, created_at) VALUES(?,?,?,1,?)",
+                    (_n, _k, _p, time.time()))
+        if conn.execute(
+                "SELECT value FROM kv WHERE key = 'schema_v2'"
+        ).fetchone() is None:
+            for _r in conn.execute(
+                    "SELECT hash, ext FROM files").fetchall():
+                conn.execute(
+                    "UPDATE files SET kind = ? WHERE hash = ?",
+                    (_kind(_r["ext"]), _r["hash"]))
+            _defs = {r["kind"]: r["id"] for r in conn.execute(
+                "SELECT id, kind FROM libraries "
+                "WHERE is_default = 1")}
+            for _r in conn.execute(
+                    "SELECT e.id AS id, f.kind AS kind FROM entries e "
+                    "JOIN files f ON f.hash = e.hash "
+                    "WHERE e.library_id = 0").fetchall():
+                conn.execute(
+                    "UPDATE entries SET library_id = ? WHERE id = ?",
+                    (_defs.get(_r["kind"], 0), _r["id"]))
+            conn.execute(
+                "INSERT OR REPLACE INTO kv(key, value) "
+                "VALUES('schema_v2', '1')")
+        if conn.execute(
+                "SELECT COUNT(*) c FROM file_categories"
+        ).fetchone()["c"] == 0:
+            for _i, (_n, _e, _b) in enumerate((
+                    ("安装包", "apk exe msi dmg ipa pkg deb rpm", 0),
+                    ("压缩包", "zip 7z rar tar gz bz2 xz", 0),
+                    ("镜像", "iso img bin cue", 0),
+                    ("文档", "pdf doc docx xls xlsx ppt pptx odt "
+                             "rtf csv md", 0),
+                    ("其他", "", 1))):
+                conn.execute(
+                    "INSERT INTO file_categories(name, exts, sort, "
+                    "builtin) VALUES(?,?,?,?)", (_n, _e, _i, _b))
 
 
 init_db()
@@ -207,6 +313,122 @@ def kv_get(key, default=""):
         row = conn.execute("SELECT value FROM kv WHERE key = ?",
                            (key,)).fetchone()
     return row["value"] if row else default
+
+
+def _libraries(kind=None):
+    with _db() as conn:
+        if kind:
+            return conn.execute(
+                "SELECT * FROM libraries WHERE kind = ? "
+                "ORDER BY is_default DESC, id", (kind,)).fetchall()
+        return conn.execute(
+            "SELECT * FROM libraries "
+            "ORDER BY kind, is_default DESC, id").fetchall()
+
+
+def _default_library(kind):
+    with _db() as conn:
+        return conn.execute(
+            "SELECT * FROM libraries WHERE kind = ? "
+            "AND is_default = 1 ORDER BY id LIMIT 1",
+            (kind,)).fetchone()
+
+
+def _library_by_id(library_id):
+    try:
+        library_id = int(library_id)
+    except Exception:
+        return None
+    with _db() as conn:
+        return conn.execute(
+            "SELECT * FROM libraries WHERE id = ?",
+            (library_id,)).fetchone()
+
+
+def _resolve_library_id(kind, library_id):
+    """The library an entry belongs to: the requested one when
+    it exists and matches the kind, else the kind's default."""
+    lib = _library_by_id(library_id) if library_id else None
+    if lib is not None and lib["kind"] == kind:
+        return lib["id"]
+    d = _default_library(kind)
+    return d["id"] if d else 0
+
+
+def _file_categories():
+    with _db() as conn:
+        return conn.execute(
+            "SELECT * FROM file_categories ORDER BY sort, id"
+        ).fetchall()
+
+
+def _norm_exts(text):
+    seen = []
+    for e in re.split(r"[\s,，;；]+", text or ""):
+        e = e.strip().lower().lstrip(".")
+        if e and e not in seen:
+            seen.append(e)
+    return " ".join(seen)
+
+
+def _novel_chapter_spans(meta):
+    """Stored chapters are {t, o}; expand to {t, o, e} spans using
+    the next chapter's offset (or the total char count)."""
+    raw = (meta or {}).get("chapters") or []
+    total = (meta or {}).get("char_count") or 0
+    spans = []
+    for i, c in enumerate(raw):
+        o = c.get("o", 0)
+        e = raw[i + 1].get("o", total) if i + 1 < len(raw) else total
+        spans.append({"t": c.get("t", ""), "o": o, "e": e})
+    return spans
+
+
+def _category_for_ext(ext):
+    """Match an extension against the editable category rules;
+    the rule with an empty extension list is the fallback, so
+    an unknown future format can never fail ingest."""
+    ext = (ext or "").lower()
+    fallback = "其他"
+    for r in _file_categories():
+        exts = {e.strip().lower() for e in re.split(
+            r"[\s,，;；]+", r["exts"] or "") if e.strip()}
+        if not exts:
+            fallback = r["name"]
+        elif ext in exts:
+            return r["name"]
+    return fallback
+
+
+def _entry_library(hash_):
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT library_id FROM entries WHERE hash = ? "
+            "ORDER BY id LIMIT 1", (hash_,)).fetchone()
+    if row and row["library_id"]:
+        return _library_by_id(row["library_id"])
+    return None
+
+
+def _target_gpath(row):
+    """The single place physical Drive paths are composed:
+    category -> library/category -> month -> hash name, so a
+    future storage switch can move one category, one library
+    or one month as a unit."""
+    month = _folder_of(row["created_at"] or time.time())
+    name = row["hash"] + "." + (row["ext"] or "bin")
+    kind = row["kind"] or "video"
+    if kind == "video":
+        lib = _entry_library(row["hash"])
+        prefix = (lib["prefix"] if lib and lib["prefix"]
+                  else "视频/默认库")
+        return "/" + prefix.strip("/") + "/" + month + "/" + name
+    if kind == "image":
+        return "/图片/" + month + "/" + name
+    if kind == "novel":
+        return "/小说/" + month + "/" + name
+    return ("/文件/" + (row["category"] or "其他") + "/"
+            + month + "/" + name)
 
 
 def kv_set(key, value):
@@ -391,6 +613,11 @@ class AlistClient:
         return self.api("POST", "/api/fs/remove",
                         {"dir": dir_path, "names": names})
 
+    def fs_move(self, src_dir, dst_dir, names):
+        return self.api("POST", "/api/fs/move",
+                        {"src_dir": src_dir, "dst_dir": dst_dir,
+                         "names": names})
+
     def upload_file(self, local_path, remote_path):
         """Stream a local file to AList (PUT /api/fs/put)."""
         token = self.login()
@@ -511,6 +738,1813 @@ def _make_thumb(video_path, hash_):
 _probe_cache = {}
 
 
+def _make_image_thumb(path, hash_):
+    out_path = os.path.join(THUMB_DIR, hash_ + ".jpg")
+    if os.path.exists(out_path):
+        return True
+    try:
+        res = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", path, "-frames:v", "1",
+             "-vf", "scale=480:-2", "-q:v", "5", out_path, "-y"],
+            capture_output=True, timeout=60)
+        return res.returncode == 0 and os.path.exists(out_path)
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------- novels
+
+NOVEL_TEXT_DIR = os.path.join(RUNTIME_DIR, "novel_text")
+os.makedirs(NOVEL_TEXT_DIR, exist_ok=True)
+
+_MONTH_RE = re.compile(r"\d{4}-\d{2}")
+
+
+# ------------------------------------------------- AI title config
+_AI_DEFAULT_MODEL = "google/gemini-2.5-flash"
+
+
+def _ai_title_config():
+    """(key, model, enabled) for AI title delimitation. The
+    key is import-only in credentials.json (openrouter_key);
+    the model name and the on/off switch are plain kv
+    settings."""
+    return (_cred("openrouter_key"),
+            kv_get("ai_title_model") or _AI_DEFAULT_MODEL,
+            kv_get("ai_title_enabled") == "1")
+
+
+def _ai_cfg_if_active():
+    key, model, enabled = _ai_title_config()
+    if key and enabled:
+        return {"key": key, "model": model,
+                "batch": _ai_batch_size()}
+    return None
+
+
+# ------------------------------------------------------ chapter split
+# Smart chapter splitting. Matching runs on a normalized detection
+# copy (full-width chars folded to half-width, strictly one char to
+# one char, so offsets stay valid for the original text); titles
+# and body are always sliced from the original text. Anchors are
+# separator runs / symbol-only lines and chapter heads (the Nth
+# chapter pattern or a special name); embedded titles are
+# delimited by structural breaks, a per-book inferred title
+# length, or a fixed char count after the head. All title
+# lengths are PURE char counts (see _is_pure_char): letters and
+# numbers count, punctuation / symbols / spaces never do, so a
+# count-based delimitation skips decoration inside the span and
+# extends into the following text until the count is met.
+# Stored titles are purified to pure chars only. As a last
+# resort an AI model can judge the lengths of titles no rule
+# can delimit (see _ai_delimit_batch).
+
+_CH_NUM = "0-9零〇一二三四五六七八九十百千万两"
+_HEAD_RE = re.compile(r"第([" + _CH_NUM + r"]+)[章节回卷]")
+_LINE_TITLE_RE = re.compile(
+    r"^\s*(第[" + _CH_NUM + r"]+[章节回卷]"
+    r"|序章|楔子|引子|后记|尾声|番外[^\s]{0,6})")
+_SEP_RUN_RE = re.compile(r"(?:[*※◇◆][ \t]*){3,}")
+_SYMBOL_LINE_RE = re.compile(r"^[*※◇◆\-—–=~_#·•… ]+$")
+_SPECIAL_RE = re.compile(r"(序章|楔子|引子|后记|尾声|番外)")
+_TITLE_WINDOW = 60
+_TITLE_MAX_AFTER = 20
+_TITLE_FALLBACK = 20
+_TITLE_DEFAULT_N = 4
+_SEP_GAP_MAX = 40
+_MERGE_MIN = 200
+_MECH_MIN_CHARS = 50000
+_MECH_SPAN = 9000
+
+# Punctuation / symbols / spaces that may sit between a chapter
+# head and its title ( \u3001\uff0c\uff0e\uff1a\uff1b\u300c\u300d\u300e\u300f\u30fb\u2026 ):
+# decoration, not title chars. They never count toward a
+# title length (pure-char semantics), and purification drops
+# them from the stored title altogether.
+_LEAD_PUNCT = "\u3001\uff0c\uff0e\uff1a\uff1b\u300c\u300d\u300e\u300f\u30fb\u2026 ,.:;\t"
+_AI_WINDOW = 24
+# Head recovery for bare anchors: a separator chapter whose
+# own head the strict head pattern rejected (a corrupted
+# numeral char, say) may still carry its head in the first
+# chars of its fragment, right behind the decoration field.
+# The scan only crosses decoration (non-pure chars) and the
+# recovered span is the loose shape of a head: the head char
+# plus up to _RECOVER_INNER_MAX arbitrary chars plus the
+# chapter char, the numeral inside never validated. Real
+# books stack separator fields up to about 52 chars, so the
+# scan window is 64; the binding guard is that nothing but
+# decoration may precede the head.
+_RECOVER_SCAN = 64
+_RECOVER_INNER_MAX = 6
+
+_FW_TABLE = {0x3000: 0x20}
+for _fw_i in range(0x21, 0x7F):
+    _FW_TABLE[_fw_i + 0xFEE0] = _fw_i
+_FW_TABLE = str.maketrans(_FW_TABLE)
+
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
+              "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_UNITS = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+
+
+def _cn2num(s):
+    """Arabic or Chinese numeral string -> int, else None."""
+    if not s:
+        return None
+    if s.isdigit():
+        try:
+            return int(s)
+        except Exception:
+            return None
+    total = 0
+    section = 0
+    num = None
+    for ch in s:
+        if ch in _CN_DIGITS:
+            num = _CN_DIGITS[ch]
+        elif ch in _CN_UNITS:
+            unit = _CN_UNITS[ch]
+            if unit == 10000:
+                total += (section + (num or 0)) * unit
+                section = 0
+            else:
+                section += (1 if num is None else num) * unit
+            num = None
+        else:
+            return None
+    result = total + section + (num or 0)
+    return result if result > 0 else None
+
+
+def _normalize_detect(text):
+    """1:1 full-width -> half-width folding, detection only."""
+    return text.translate(_FW_TABLE)
+
+
+def _lead_punct_len(norm, pos):
+    """Length of the punctuation / symbol / space run at pos
+    in the detection copy: the decoration between a chapter
+    head and its title proper. Skipped before any fixed or
+    inferred title length is counted, and before an AI title
+    window is cut."""
+    j = pos
+    n = len(norm)
+    while j < n and norm[j] in _LEAD_PUNCT:
+        j += 1
+    return j - pos
+
+
+def _is_pure_char(ch):
+    """A pure title char: a letter or a number in the Unicode
+    sense (CJK ideographs are Lo; full-width digits and
+    letters count as themselves). Punctuation, symbols,
+    spaces and other decoration are not pure: they never
+    count toward a title length and never survive in a
+    stored chapter title."""
+    return unicodedata.category(ch)[:1] in ("L", "N")
+
+
+def _pure_len(s):
+    """How many pure chars a string contains."""
+    return sum(1 for ch in s if _is_pure_char(ch))
+
+
+def _purify_title(t):
+    """A stored chapter title reduced to its pure chars:
+    punctuation, symbols, spaces and decoration dropped,
+    so a chapter name is nothing but text and numbers."""
+    if not t:
+        return ""
+    return "".join(ch for ch in t if _is_pure_char(ch))
+
+
+def _pure_take_end(norm, start, k, bound):
+    """Offset just past the k-th pure char at/after start in
+    the detection copy (offsets are 1:1 with the original
+    text). Non-pure chars inside the span are skipped: they
+    do not count, so a count-based title extends forward
+    until k pure chars are gathered. The scan never crosses
+    bound (the next anchor, or the text end); a span with
+    fewer than k pure chars ends just past its last pure
+    char (at start when it has none)."""
+    if k <= 0:
+        return start
+    bound = min(bound, len(norm))
+    end = start
+    seen = 0
+    j = start
+    while j < bound:
+        if _is_pure_char(norm[j]):
+            seen += 1
+            end = j + 1
+            if seen >= k:
+                break
+        j += 1
+    return end
+
+
+def _match_head(norm, j):
+    """Chapter head at position j in the detection copy:
+    (head_end, num) or None; num is None for special names
+    (序章 / 楔子 / 番外 etc.)."""
+    m = _HEAD_RE.match(norm, j)
+    if m:
+        return m.end(), _cn2num(m.group(1))
+    m = _SPECIAL_RE.match(norm, j)
+    if m:
+        return m.end(), None
+    return None
+
+
+def _recover_head(norm, o):
+    """Loose head recovery at a bare anchor: skip the
+    decoration field at o (non-pure chars only, at most
+    _RECOVER_SCAN of them); when the first pure char is the
+    head char and the chapter char follows within
+    _RECOVER_INNER_MAX arbitrary chars, the span between
+    them is a recovered head, returned as (hs, he). The
+    numeral inside is never validated: a corrupted char
+    there is exactly what the strict pattern rejected.
+    None when the fragment does not open with such a head
+    (plain prose, or decoration longer than the scan)."""
+    n = len(norm)
+    j = o
+    while j < n and j - o < _RECOVER_SCAN \
+            and not _is_pure_char(norm[j]):
+        j += 1
+    if j >= n or norm[j] != "第":
+        return None
+    for e in range(j + 2,
+                   min(j + 2 + _RECOVER_INNER_MAX, n)):
+        if norm[e] == "章":
+            return j, e + 1
+    return None
+
+
+def _pure_chars_from(norm, start, bound):
+    """The first _AI_WINDOW pure chars at/after start in the
+    detection copy, gathered without crossing bound:
+    non-pure chars are skipped, never counted, exactly the
+    window a boundary-selection candidate is judged on."""
+    out = []
+    j = start
+    bound = min(bound, len(norm))
+    while j < bound and len(out) < _AI_WINDOW:
+        if _is_pure_char(norm[j]):
+            out.append(norm[j])
+        j += 1
+    return "".join(out)
+
+
+def _seg_words(s):
+    """jieba word list tiling s exactly, or None when jieba
+    is unavailable, raises, or its tokens do not reassemble
+    into s. Callers treat None as no segmentation: the
+    chapter falls back, splitting never breaks over it."""
+    if not s:
+        return None
+    try:
+        import jieba
+        try:
+            jieba.setLogLevel(60)
+        except Exception:
+            pass
+        words = [w for w in jieba.cut(s) if w]
+    except Exception:
+        return None
+    if not words or "".join(words) != s:
+        return None
+    return words
+
+
+def _strong_title_end(norm, hs, he):
+    """Structural end of an embedded title: earliest newline,
+    else earliest sentence punctuation, within the window and
+    at most _TITLE_MAX_AFTER chars past the head. None when the
+    title is glued to the body without a usable break."""
+    window = norm[hs:hs + _TITLE_WINDOW]
+    for marks in ("\n", "。！？!?"):
+        best = None
+        for mk in marks:
+            i = window.find(mk)
+            if i >= 0 and (best is None or i < best):
+                best = i
+        if best is not None and hs + best - he <= _TITLE_MAX_AFTER:
+            return hs + best
+    return None
+
+
+def _comma_title_end(norm, hs, he):
+    """Weak structural end: a comma shortly after the head
+    (full-width commas fold to half-width in the detection
+    copy, so both forms are searched)."""
+    best = None
+    for mk in ("，", ","):
+        i = norm.find(mk, hs, hs + _TITLE_WINDOW)
+        if i >= 0 and (best is None or i < best):
+            best = i
+    if best is not None and best - he <= _TITLE_MAX_AFTER:
+        return best
+    return None
+
+
+def _is_symbol_line(nstrip):
+    """A line made only of separator glyphs (a printed divider:
+    ***, ※※※, ---, ———, ===, ◇◇◇ ...)."""
+    if len(nstrip) < 3 or not _SYMBOL_LINE_RE.match(nstrip):
+        return False
+    return sum(1 for ch in nstrip if ch not in " \t") >= 3
+
+
+def _first_fragment(text, start):
+    """Auto-title fragment after a bare separator: the first
+    pure chars (at most 12) of the chapter's first sentence.
+    The leading separator field (stars / spaces / newlines,
+    possibly several printed lines of it) is skipped first,
+    so a decorative header can never leak into the name."""
+    seg = text[start:start + 400]
+    j = 0
+    while j < len(seg) and not _is_pure_char(seg[j]):
+        j += 1
+    seg = seg[j:]
+    cut = len(seg)
+    for mk in "。！？\n":
+        i = seg.find(mk)
+        if 0 <= i < cut:
+            cut = i
+    out = []
+    for ch in seg[:cut]:
+        if _is_pure_char(ch):
+            out.append(ch)
+            if len(out) >= 12:
+                break
+    return "".join(out)
+
+
+def _split_mechanical(text):
+    """Fallback: cut a long markerless book every ~9000 chars at
+    the nearest paragraph / sentence boundary."""
+    chapters = []
+    n = len(text)
+    start = 0
+    idx = 1
+    while n - start > _MECH_SPAN:
+        target = start + _MECH_SPAN
+        lo = max(start + 1000, target - 1500)
+        hi = min(n, target + 1500)
+        cut = -1
+        for marks in ("\n", "。！？!?"):
+            best = None
+            for p in range(lo, hi):
+                if text[p] in marks and (
+                        best is None
+                        or abs(p - target) < abs(best - target)):
+                    best = p
+            if best is not None:
+                cut = best + 1
+                break
+        if cut < 0:
+            cut = target
+        chapters.append({"t": "分段 %d" % idx, "o": start})
+        idx += 1
+        start = cut
+        while start < n and text[start] in "\r\n":
+            start += 1
+        if start >= n:
+            break
+    if start < n and (not chapters or chapters[-1]["o"] != start):
+        chapters.append({"t": "分段 %d" % idx, "o": start})
+    return chapters or [{"t": "正文", "o": 0}]
+
+
+def _decode_txt(raw):
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        try:
+            return raw.decode("utf-16"), "utf-16"
+        except Exception:
+            pass
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig", "replace"), "utf-8"
+    try:
+        return raw.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+    try:
+        return raw.decode("gb18030"), "gb18030"
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", "replace"), "utf-8"
+
+
+_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_AI_BATCH_DEFAULT = 10
+_AI_MAX_WORKERS = 4
+_AI_MARK = "（AI）"
+_AI_RAW_KEEP = 2000
+_AI_MAX_TOKENS_BASE = 40
+_AI_MAX_TOKENS_PER_ITEM = 16
+_AI_MAX_TOKENS_CAP = 512
+_AI_RESP_BYTES_PER_ITEM = 256
+_AI_RESP_BYTES_SLACK = 2048
+_AI_RESP_CHUNK = 8192
+_AI_PAIR_RE = re.compile(r"(\d{1,6})\s*[:：]\s*(\d{1,3})")
+_AI_SYSTEM = (
+    "你是小说章节标题定界助手。用户会给出带序号的文字片段，每条都"
+    "是一章开头处标题与正文连排在一起的片段：标题在前，正文紧随"
+    "其后，中间没有标点或换行。请判断每条片段中属于标题的字数："
+    "字数只数文字（汉字、字母、数字），片段里混入的标点、符号、"
+    "空格都不算字。标题是简短的名称性短语，正文是叙述句子的开始。逐条回答，每行"
+    "一条，格式为「序号:字数」，序号与用户给出的序号相同；只输出"
+    "这些行，不要输出任何其他文字。\n"
+    "示例：片段「101: 江湖夜雨十年灯他推开客栈的门」中，标题是"
+    "「江湖夜雨十年灯」共 7 字，应回答「101:7」；片段「102: 归乡"
+    "他背着行囊沿着山路往回走」中，标题是「归乡」共 2 字，应回答"
+    "「102:2」。")
+
+
+def _ai_batch_size():
+    """Configured AI batch size (kv ai_title_batch); the
+    code default applies when unset or invalid."""
+    try:
+        v = int(kv_get("ai_title_batch") or "")
+    except Exception:
+        return _AI_BATCH_DEFAULT
+    if v <= 0:
+        return _AI_BATCH_DEFAULT
+    return min(50, v)
+
+
+def _ai_parse_batch(content, batch):
+    """Tolerant per-batch reply parsing. Primary: explicit
+    id:length pairs, aligned by id. Fallbacks when no pair
+    matches a batch id: pair values in reply order (when
+    their count equals the batch size), then all integers
+    in the text (same count condition). Returns {id: k}
+    with batch ids only; k still needs range validation."""
+    want = [it["id"] for it in batch]
+    pairs = []
+    for m in _AI_PAIR_RE.finditer(content or ""):
+        try:
+            pairs.append((int(m.group(1)), int(m.group(2))))
+        except Exception:
+            pass
+    by_id = {}
+    for i, k in pairs:
+        if i in want and i not in by_id:
+            by_id[i] = k
+    if by_id:
+        return by_id
+    if pairs and len(pairs) == len(batch):
+        return {it["id"]: k for it, (_i, k) in zip(batch, pairs)}
+    ints = []
+    for x in re.findall(r"\d+", content or ""):
+        try:
+            ints.append(int(x))
+        except Exception:
+            pass
+    if ints and len(ints) == len(batch):
+        return {it["id"]: k for it, k in zip(batch, ints)}
+    return {}
+
+
+def _ai_max_tokens(n):
+    """Request-side reply budget for one batch. A batch
+    reply is one short id:length line per item, so the
+    allowance scales with the batch size under a hard cap
+    that also guards a bogus batch-size configuration."""
+    try:
+        n = int(n)
+    except Exception:
+        n = 1
+    return min(_AI_MAX_TOKENS_CAP, _AI_MAX_TOKENS_BASE
+               + _AI_MAX_TOKENS_PER_ITEM * max(1, n))
+
+
+def _ai_resp_bytes(n):
+    """Read-side hard cap, in bytes, on one batch response:
+    the JSON envelope plus one short reply line per item,
+    with slack. A reply anywhere near this cap is already
+    far outside the expected shape (runaway generation,
+    loops, long refusals); reading stops at the cap and
+    the batch fails instead of consuming the whole reply."""
+    try:
+        n = int(n)
+    except Exception:
+        n = 1
+    return _AI_RESP_BYTES_SLACK + _AI_RESP_BYTES_PER_ITEM * max(1, n)
+
+
+def _ai_ask_batch(batch, key, model):
+    """One OpenRouter chat-completions call for one small
+    batch of title windows (each window starts at its
+    title's first char: chapter head and leading
+    punctuation already skipped). Returns (lengths, raw,
+    error): lengths maps item id -> judged length
+    (range-validated) and may be partial or empty; raw is
+    the model's reply text (truncated), or None when the
+    request itself failed; error is a short reason or
+    None. Never raises; the key only travels in the
+    Authorization header. The reply size is bounded on
+    both sides: the request disables reasoning (a
+    reasoning model otherwise spends thousands of hidden
+    reasoning tokens before the tiny visible answer,
+    dwarfing the reply and eating any token budget),
+    carries a max_tokens budget scaled to the batch, and
+    the response is read under a byte cap; a reply that
+    overruns the cap is cut off
+    mid-read (connection closed) and the batch fails with
+    an over-limit reason, keeping only the in-cap prefix
+    as raw."""
+    listing = "\n".join("%d: %s" % (it["id"], it["window"])
+                        for it in batch)
+    payload = {"model": model, "temperature": 0,
+               "max_tokens": _ai_max_tokens(len(batch)),
+               "reasoning": {"effort": "none"},
+               "messages": [
+                   {"role": "system", "content": _AI_SYSTEM},
+                   {"role": "user", "content": listing}]}
+    try:
+        req = urllib.request.Request(
+            _OPENROUTER_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": "Bearer " + key,
+                     "Content-Type": "application/json"})
+        cap = _ai_resp_bytes(len(batch))
+        buf = bytearray()
+        over = False
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            while True:
+                chunk = resp.read(min(_AI_RESP_CHUNK,
+                                      cap + 1 - len(buf)))
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) > cap:
+                    over = True
+                    break
+        if over:
+            prefix = bytes(buf[:cap]).decode("utf-8", "replace")
+            return {}, prefix[:_AI_RAW_KEEP], "AI 输出超限终止"
+        data = json.loads(bytes(buf).decode("utf-8"))
+        content = data["choices"][0]["message"]["content"] or ""
+    except Exception as exc:
+        return {}, None, "AI 请求失败：%s" % str(exc)[:120]
+    raw = content[:_AI_RAW_KEEP]
+    got = _ai_parse_batch(content, batch)
+    if not got:
+        return {}, raw, "AI 返回不可解析"
+    out = {}
+    winlen = {it["id"]: len(it["window"]) for it in batch}
+    for i, k in got.items():
+        if (isinstance(k, int) and not isinstance(k, bool)
+                and 1 <= k <= winlen.get(i, _AI_WINDOW)):
+            out[i] = k
+    if not out:
+        return {}, raw, "AI 返回全部越界"
+    return out, raw, None
+
+
+def _ai_delimit_batch(items, key, model,
+                      batch_size=_AI_BATCH_DEFAULT):
+    """Protocol v2: judge title lengths for unique windows
+    in small numbered batches. items is a list of
+    {"id", "window"} with unique windows and stable ids
+    (the candidate's chapter number where available).
+    Batches are independent requests and run concurrently
+    (up to _AI_MAX_WORKERS in flight); each batch keeps its
+    own tolerant parsing, fallback and raw record, and the
+    records are reassembled in batch order, so the outcome
+    is identical to running the batches one by one. Only
+    the HTTP calls and parsing run in worker threads; the
+    aggregation here is single-threaded. Returns
+    (results, batches): results maps id -> validated
+    length for the items the model settled; batches is a
+    per-batch record {"ids", "raw", "error"} kept for
+    observability (the raw reply text is what v1 never
+    surfaced). A failed batch only leaves its own items
+    unsettled. Never raises."""
+    results = {}
+    batches = []
+    if not items:
+        return results, batches
+    try:
+        bs = int(batch_size)
+    except Exception:
+        bs = _AI_BATCH_DEFAULT
+    bs = max(1, min(50, bs))
+    chunks = [items[s:s + bs] for s in range(0, len(items), bs)]
+    slots = [None] * len(chunks)
+
+    def run(pair):
+        i, batch = pair
+        try:
+            got, raw, err = _ai_ask_batch(batch, key, model)
+        except Exception as exc:
+            # _ai_ask_batch never raises by contract; keep
+            # the batch-isolation guarantee regardless.
+            got, raw, err = {}, None, (
+                "AI 请求失败：%s" % str(exc)[:120])
+        return i, got, {"ids": [it["id"] for it in batch],
+                        "raw": raw, "error": err}
+
+    if len(chunks) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        workers = min(_AI_MAX_WORKERS, len(chunks))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for i, got, rec in ex.map(run, enumerate(chunks)):
+                slots[i] = (got, rec)
+    else:
+        for pair in enumerate(chunks):
+            i, got, rec = run(pair)
+            slots[i] = (got, rec)
+    for got, rec in slots:
+        results.update(got)
+        batches.append(rec)
+    return results, batches
+
+
+_AI_BOUND_SYSTEM = (
+    "你是小说章节标题定界助手。用户会给出带序号的若干条片段，"
+    "每条是一个章节的开头：先是章首（如「第土四章」，章首里可"
+    "能有个别错字，不用管它），紧跟着是标题与正文连排在一起"
+    "的文字：标题在前，正文紧随其后，中间没有标点或换行。"
+    "每条的候选文字已经按词切分并逐词编号。请判断每条的标题"
+    "在第几个词之后结束：标题是简短的名称性短语，正文是叙述"
+    "句子的开始。逐条回答，每行一条，格式为「序号:界号」，"
+    "序号与用户给出的序号相同；只输出这些行，不要输出任何"
+    "其他文字。\n"
+    "示例：片段「101: 章首：「第三章」候选（已分词编号）："
+    "[1]江湖 [2]夜雨 [3]十年 [4]灯 [5]他 [6]推开 [7]客栈」中，"
+    "标题是「江湖夜雨十年灯」，在第 4 个词之后结束，应回答"
+    "「101:4」。")
+
+
+def _ai_ask_bounds(batch, key, model):
+    """One OpenRouter call for one small batch of recovered
+    head boundary items (each item carries its head span and
+    its candidate window already segmented into numbered
+    words). Returns (bounds, raw, error): bounds maps item
+    id -> chosen word boundary (range-validated against the
+    item's word count) and may be partial or empty; raw is
+    the model's reply text (truncated), or None when the
+    request itself failed; error is a short reason or None.
+    Same transport discipline as _ai_ask_batch: reasoning
+    off, a max_tokens budget scaled to the batch, and a
+    byte cap on the read with an over-limit abort. Never
+    raises; the key only travels in the Authorization
+    header."""
+    listing = "\n".join(
+        "%d: 章首：「%s」候选（已分词编号）：%s"
+        % (it["id"], it["head"], it["numbered"])
+        for it in batch)
+    payload = {"model": model, "temperature": 0,
+               "max_tokens": _ai_max_tokens(len(batch)),
+               "reasoning": {"effort": "none"},
+               "messages": [
+                   {"role": "system", "content": _AI_BOUND_SYSTEM},
+                   {"role": "user", "content": listing}]}
+    try:
+        req = urllib.request.Request(
+            _OPENROUTER_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": "Bearer " + key,
+                     "Content-Type": "application/json"})
+        cap = _ai_resp_bytes(len(batch))
+        buf = bytearray()
+        over = False
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            while True:
+                chunk = resp.read(min(_AI_RESP_CHUNK,
+                                      cap + 1 - len(buf)))
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) > cap:
+                    over = True
+                    break
+        if over:
+            prefix = bytes(buf[:cap]).decode("utf-8", "replace")
+            return {}, prefix[:_AI_RAW_KEEP], "AI 输出超限终止"
+        data = json.loads(bytes(buf).decode("utf-8"))
+        content = data["choices"][0]["message"]["content"] or ""
+    except Exception as exc:
+        return {}, None, "AI 请求失败：%s" % str(exc)[:120]
+    raw = content[:_AI_RAW_KEEP]
+    got = _ai_parse_batch(content, batch)
+    if not got:
+        return {}, raw, "AI 返回不可解析"
+    out = {}
+    nwords = {it["id"]: it["nwords"] for it in batch}
+    for i, k in got.items():
+        if (isinstance(k, int) and not isinstance(k, bool)
+                and 1 <= k <= nwords.get(i, 0)):
+            out[i] = k
+    if not out:
+        return {}, raw, "AI 返回全部越界"
+    return out, raw, None
+
+
+def _ai_delimit_bounds(items, key, model,
+                       batch_size=_AI_BATCH_DEFAULT):
+    """Boundary selection for recovered heads: judge, in
+    small numbered batches under the same concurrency and
+    per-batch isolation as _ai_delimit_batch, after which
+    word each item's title ends. items is a list of
+    {"id", "head", "numbered", "nwords"} with stable unique
+    ids. Returns (results, batches) with the same shapes as
+    _ai_delimit_batch: results maps id -> validated word
+    boundary for the items the model settled; a failed
+    batch only leaves its own items unsettled. Never
+    raises."""
+    results = {}
+    batches = []
+    if not items:
+        return results, batches
+    try:
+        bs = int(batch_size)
+    except Exception:
+        bs = _AI_BATCH_DEFAULT
+    bs = max(1, min(50, bs))
+    chunks = [items[s:s + bs] for s in range(0, len(items), bs)]
+    slots = [None] * len(chunks)
+
+    def run(pair):
+        i, batch = pair
+        try:
+            got, raw, err = _ai_ask_bounds(batch, key, model)
+        except Exception as exc:
+            got, raw, err = {}, None, (
+                "AI 请求失败：%s" % str(exc)[:120])
+        return i, got, {"ids": [it["id"] for it in batch],
+                        "raw": raw, "error": err}
+
+    if len(chunks) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        workers = min(_AI_MAX_WORKERS, len(chunks))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for i, got, rec in ex.map(run, enumerate(chunks)):
+                slots[i] = (got, rec)
+    else:
+        for pair in enumerate(chunks):
+            i, got, rec = run(pair)
+            slots[i] = (got, rec)
+    for got, rec in slots:
+        results.update(got)
+        batches.append(rec)
+    return results, batches
+
+
+def _split_chapters_full(text, fixed_n=0, ai_cfg=None,
+                         ai_all_glued=False, defer_ai=False,
+                         ai_only_offsets=None):
+    """Chapter splitting with a breakdown of how each title
+    was delimited. Returns (chapters, stats, ai_debug):
+    stats counts delimitation methods per anchor (pre-merge)
+    as rule / ai / fixed, or a mechanical count when the
+    whole book fell back to mechanical segmentation;
+    ai_debug carries per-candidate detail for the admin
+    dry-run test. ai_cfg is {"key", "model"} or None.
+    defer_ai runs the rules only (any ai_cfg is ignored and
+    no AI request is made) and instead marks the chapters
+    AI could still improve: they carry a "pend" flag here
+    and stats gains an ai_pending count. ai_only_offsets
+    restricts AI candidacy to anchors at those offsets
+    (the deferred pass for one book, run on first read)."""
+    if defer_ai:
+        ai_cfg = None
+    norm = _normalize_detect(text)
+    n = len(text)
+    claimed = bytearray(n)
+    anchors = []    # {"o","hs","he","num","title","ahl"}
+
+    def claim(a, b):
+        b = min(n, b)
+        if b > a:
+            claimed[a:b] = b"\x01" * (b - a)
+
+    def gap_head(e):
+        j = e
+        while j < n and j - e <= _SEP_GAP_MAX and norm[j] in " \t\r\n":
+            j += 1
+        if j < n:
+            hd = _match_head(norm, j)
+            if hd:
+                return j, hd[0], hd[1]
+        return None
+
+    def bare(o):
+        return {"o": o, "hs": None, "he": None, "num": None,
+                "title": None, "ahl": None}
+
+    # Pass 1: inline separator runs (asterisk / ※ / ◇◆ groups).
+    # A chapter head right after the run (same line or immediately
+    # following) starts the chapter at the run; a bare run also
+    # starts a chapter and gets an auto title below.
+    for m in _SEP_RUN_RE.finditer(norm):
+        s, e = m.start(), m.end()
+        gh = gap_head(e)
+        if gh:
+            j, he, num = gh
+            anchors.append({"o": s, "hs": j, "he": he, "num": num,
+                            "title": None, "ahl": None})
+            claim(s, j + _TITLE_WINDOW)
+        else:
+            anchors.append(bare(s))
+            claim(s, e)
+
+    # Pass 2: line pass — symbol-only separator lines, whole-line
+    # titles, and paragraph-style lines starting with a head.
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        lend = pos + len(line)
+        raw = line.rstrip("\r\n")
+        stripped = raw.strip()
+        nstrip = norm[pos:lend].rstrip("\r\n").strip()
+        head_pos = pos + (len(raw) - len(raw.lstrip()))
+        if stripped and not (head_pos < n and claimed[head_pos]):
+            if _is_symbol_line(nstrip):
+                gh = gap_head(lend)
+                if gh:
+                    j, he, num = gh
+                    anchors.append({"o": pos, "hs": j, "he": he,
+                                    "num": num, "title": None,
+                                    "ahl": None})
+                    claim(pos, j + _TITLE_WINDOW)
+                else:
+                    anchors.append(bare(pos))
+                    claim(pos, lend)
+            elif _LINE_TITLE_RE.match(norm[pos:lend].rstrip("\r\n")):
+                hd = _match_head(norm, head_pos)
+                if len(stripped) <= 60:
+                    anchors.append({
+                        "o": pos, "hs": head_pos,
+                        "he": hd[0] if hd else None,
+                        "num": hd[1] if hd else None,
+                        "title": stripped[:80],
+                        "tend": pos + len(raw),
+                        "ahl": (_pure_len(stripped[:80]
+                                          [hd[0] - head_pos:])
+                                if hd else None)})
+                elif hd:
+                    anchors.append({"o": pos, "hs": head_pos,
+                                    "he": hd[0], "num": hd[1],
+                                    "title": None, "ahl": None})
+        pos = lend
+
+    anchors.sort(key=lambda c: c["o"])
+    dedup = []
+    for a in anchors:
+        if dedup and dedup[-1]["o"] == a["o"]:
+            if dedup[-1]["title"] is None and a["title"] is not None:
+                dedup[-1] = a
+            continue
+        dedup.append(a)
+    anchors = dedup
+
+    stats = {"rule": 0, "ai": 0, "fixed": 0, "mechanical": 0,
+             "chapters": 0, "model": None, "fallback": None}
+    debug = []
+    debug_by_idx = {}
+
+    # Head recovery: a bare anchor whose fragment opens with
+    # a loosely shaped head (corrupted numeral, decoration
+    # the gap scan could not cross) is promoted to a
+    # recovered head. Recovered heads are delimited only by
+    # boundary selection further down; when that cannot
+    # settle one (no AI, no segmentation, a failed batch),
+    # the anchor is demoted back to bare and keeps the auto
+    # title it would have had today.
+    recovered_n = 0
+    recovered_idx = set()
+    for idx, a in enumerate(anchors):
+        if a["hs"] is None:
+            rec = _recover_head(norm, a["o"])
+            if rec and idx + 1 < len(anchors) \
+                    and rec[1] > anchors[idx + 1]["o"]:
+                # The head lies past the next anchor: it is
+                # that chapter's head, not this one's (a
+                # stack of separator fields before one head
+                # promotes only the closest anchor).
+                rec = None
+            if rec:
+                a["hs"], a["he"] = rec
+                a["recovered"] = True
+                recovered_idx.add(idx)
+                num = _cn2num(norm[rec[0] + 1:rec[1] - 1])
+                if num is not None:
+                    a["num"] = num
+                recovered_n += 1
+    if recovered_n:
+        stats["recovered"] = recovered_n
+
+    # Mechanical fallback: smart splitting found almost nothing
+    # in a long book.
+    if len(anchors) < 3 and n > _MECH_MIN_CHARS:
+        chs = _split_mechanical(text)
+        chs = [{"t": _purify_title(c["t"]), "o": c["o"]}
+               for c in chs]
+        stats["mechanical"] = len(chs)
+        stats["chapters"] = len(chs)
+        return chs, stats, debug
+
+    # Resolve embedded titles: strong structural breaks first;
+    # the after-head lengths they yield feed a per-book median
+    # inference for titles glued to the body without a break.
+    for a in anchors:
+        if a["title"] is None and a["hs"] is not None \
+                and not a.get("recovered"):
+            end = _strong_title_end(norm, a["hs"], a["he"])
+            if end is not None:
+                a["title"] = text[a["hs"]:end].strip()[:60]
+                a["how"] = "rule"
+                a["tend"] = end
+                a["ahl"] = _pure_len(norm[a["he"]:end])
+    ahls = sorted(a["ahl"] for a in anchors
+                  if a["ahl"] is not None and a["num"] is not None)
+    num_anchors = sum(1 for a in anchors
+                      if a["hs"] is not None and a["num"] is not None
+                      and not a.get("recovered"))
+    inferred = None
+    if len(ahls) >= 3 and len(ahls) * 2 >= num_anchors:
+        mid = len(ahls) // 2
+        inferred = (ahls[mid] if len(ahls) % 2
+                    else int((ahls[mid - 1] + ahls[mid]) / 2 + 0.5))
+    # AI candidates: embedded titles still unsettled. In a
+    # real split, titles the inference can settle are not
+    # candidates; the dry-run test passes ai_all_glued=True
+    # to judge every glued title. Each window is cut on the
+    # detection copy starting at the title's first char
+    # (head and leading punctuation already skipped), and a
+    # returned length k is a PURE char count: the title end
+    # is where the k-th pure char after the head sits in the
+    # original text (symbols inside the span are skipped,
+    # never counted).
+    ai_map = {}
+    if ai_cfg:
+        stats["model"] = ai_cfg.get("model") or ""
+        cand = []
+        for idx, a in enumerate(anchors):
+            if a["title"] is not None or a["hs"] is None \
+                    or a.get("recovered"):
+                continue
+            if (not ai_all_glued and a["num"] is not None
+                    and inferred):
+                continue
+            if ai_only_offsets is not None \
+                    and a["o"] not in ai_only_offsets:
+                continue
+            lead = _lead_punct_len(norm, a["he"])
+            window = norm[a["he"] + lead:
+                          a["he"] + lead + _AI_WINDOW]
+            if window:
+                cand.append((idx, lead, window))
+        if cand:
+            # Protocol v2: identical windows are asked once
+            # and the verdict maps back to every copy; the
+            # rest go in small numbered batches, so a bad
+            # batch can only hurt its own items.
+            uniq = []
+            by_win = {}
+            used_ids = set()
+            synth = 900000
+            for ci, (idx, lead, window) in enumerate(cand):
+                ent = by_win.get(window)
+                if ent is None:
+                    num = anchors[idx]["num"]
+                    if num is not None and num not in used_ids:
+                        uid = num
+                    else:
+                        while synth in used_ids:
+                            synth += 1
+                        uid = synth
+                        synth += 1
+                    used_ids.add(uid)
+                    ent = {"id": uid, "members": []}
+                    by_win[window] = ent
+                    uniq.append(ent)
+                ent["members"].append(ci)
+            items = [{"id": e["id"],
+                      "window": cand[e["members"][0]][2]}
+                     for e in uniq]
+            results, batches = _ai_delimit_batch(
+                items, ai_cfg.get("key") or "",
+                ai_cfg.get("model") or "",
+                ai_cfg.get("batch") or _AI_BATCH_DEFAULT)
+            raw_by_id = {}
+            reasons = []
+            for b in batches:
+                for i in b["ids"]:
+                    raw_by_id[i] = b["raw"]
+                if b["error"] and b["error"] not in reasons:
+                    reasons.append(b["error"])
+            stats["ai_batches"] = [
+                {"ids": b["ids"],
+                 "raw": (b["raw"] or "")[:300] or None,
+                 "error": b["error"]} for b in batches]
+            unresolved = 0
+            for e in uniq:
+                k = results.get(e["id"])
+                raw = raw_by_id.get(e["id"])
+                for ci in e["members"]:
+                    idx, lead, window = cand[ci]
+                    if k is not None:
+                        he_i = anchors[idx]["he"]
+                        bnd = (anchors[idx + 1]["o"]
+                               if idx + 1 < len(anchors) else n)
+                        ai_map[idx] = _pure_take_end(
+                            norm, he_i, k, max(bnd, he_i))
+                    else:
+                        unresolved += 1
+                    debug_by_idx[idx] = {
+                        "o": anchors[idx]["o"],
+                        "num": anchors[idx]["num"],
+                        "window": window,
+                        "ai_len": k,
+                        "ai_raw": (raw or "")[:1000] or None,
+                        "ai_title": None}
+            if unresolved:
+                reasons.append(
+                    "AI %d 项未判，已单独回退" % unresolved)
+            if reasons:
+                stats["fallback"] = "；".join(reasons[:3])
+        debug = [debug_by_idx[i] for i in sorted(debug_by_idx)]
+
+    # Boundary selection for recovered heads: the candidate
+    # window after the recovered head is segmented into
+    # numbered words and the model picks the word boundary
+    # the title ends at, instead of counting raw chars over
+    # a head the rules could not even recognise. A chapter
+    # the model settles is applied below; every other
+    # recovered anchor is demoted back to bare there and
+    # keeps its auto title, so a recovered chapter can never
+    # end up worse than it is today.
+    bound_map = {}
+    if ai_cfg:
+        stats["model"] = ai_cfg.get("model") or ""
+        rec_cand = []
+        for idx, a in enumerate(anchors):
+            if not a.get("recovered") or a["title"] is not None:
+                continue
+            if ai_only_offsets is not None \
+                    and a["o"] not in ai_only_offsets:
+                continue
+            bnd = (anchors[idx + 1]["o"]
+                   if idx + 1 < len(anchors) else n)
+            pure = _pure_chars_from(norm, a["he"],
+                                    max(bnd, a["he"]))
+            words = _seg_words(pure) if pure else None
+            if words and len(words) >= 2:
+                rec_cand.append((idx, pure, words))
+        if rec_cand:
+            used_ids = set()
+            synth = 800000
+            items = []
+            meta_by_id = {}
+            for idx, pure, words in rec_cand:
+                while synth in used_ids:
+                    synth += 1
+                uid = synth
+                used_ids.add(uid)
+                synth += 1
+                numbered = " ".join(
+                    "[%d]%s" % (i, w)
+                    for i, w in enumerate(words, 1))
+                items.append({
+                    "id": uid,
+                    "head": text[anchors[idx]["hs"]:
+                                 anchors[idx]["he"]],
+                    "numbered": numbered,
+                    "nwords": len(words)})
+                meta_by_id[uid] = (idx, pure, words)
+            results, rbatches = _ai_delimit_bounds(
+                items, ai_cfg.get("key") or "",
+                ai_cfg.get("model") or "",
+                ai_cfg.get("batch") or _AI_BATCH_DEFAULT)
+            raw_by_id = {}
+            reasons = []
+            for b in rbatches:
+                for i in b["ids"]:
+                    raw_by_id[i] = b["raw"]
+                if b["error"] and b["error"] not in reasons:
+                    reasons.append(b["error"])
+            stats["ai_batches"] = (stats.get("ai_batches")
+                                   or []) + [
+                {"ids": b["ids"],
+                 "raw": (b["raw"] or "")[:300] or None,
+                 "error": b["error"]} for b in rbatches]
+            unresolved = 0
+            for it in items:
+                idx, pure, words = meta_by_id[it["id"]]
+                k = results.get(it["id"])
+                pure_k = None
+                if k is not None:
+                    pure_k = sum(len(w) for w in words[:k])
+                    he_i = anchors[idx]["he"]
+                    bnd = (anchors[idx + 1]["o"]
+                           if idx + 1 < len(anchors) else n)
+                    bound_map[idx] = _pure_take_end(
+                        norm, he_i, pure_k, max(bnd, he_i))
+                else:
+                    unresolved += 1
+                debug_by_idx[idx] = {
+                    "o": anchors[idx]["o"],
+                    "num": anchors[idx]["num"],
+                    "window": pure,
+                    "ai_len": pure_k,
+                    "ai_raw": (raw_by_id.get(it["id"])
+                               or "")[:1000] or None,
+                    "ai_title": None}
+            if unresolved:
+                reasons.append(
+                    "AI %d 项未判，已单独回退" % unresolved)
+            if reasons:
+                prev = stats.get("fallback")
+                stats["fallback"] = "；".join(
+                    ([prev] if prev else []) + reasons[:3])
+            debug = [debug_by_idx[i] for i in sorted(debug_by_idx)]
+
+    for idx, a in enumerate(anchors):
+        if not a.get("recovered"):
+            continue
+        if idx in bound_map:
+            a["title"] = text[a["hs"]:bound_map[idx]].strip()[:60]
+            a["tend"] = bound_map[idx]
+            a["how"] = "ai"
+            a["rec_ok"] = True
+        else:
+            a["hs"] = None
+            a["he"] = None
+            a.pop("recovered", None)
+
+    # Deferred-pass bare chapters (ai_only_offsets mode
+    # only, i.e. the on-read completion pass for one marked
+    # book): a bare anchor has no head for either protocol,
+    # but its auto title is a blind slice of the opening
+    # sentence, so the char-count protocol judges where the
+    # opening fragment should end. The fragment is applied
+    # by the numbering loop below; a chapter the model does
+    # not settle keeps its auto title and stays pending.
+    if ai_cfg and ai_only_offsets is not None:
+        bare_cand = []
+        for idx, a in enumerate(anchors):
+            if a["hs"] is not None or a["title"] is not None \
+                    or idx in recovered_idx:
+                continue
+            if a["o"] not in ai_only_offsets:
+                continue
+            j = a["o"]
+            while j < n and not _is_pure_char(norm[j]):
+                j += 1
+            if j >= n:
+                continue
+            window = norm[j:j + _AI_WINDOW]
+            if window:
+                bare_cand.append((idx, j, window))
+        if bare_cand:
+            stats["model"] = ai_cfg.get("model") or ""
+            used_ids = set()
+            synth = 700000
+            items = []
+            meta_by_id = {}
+            for idx, j, window in bare_cand:
+                while synth in used_ids:
+                    synth += 1
+                uid = synth
+                used_ids.add(uid)
+                synth += 1
+                items.append({"id": uid, "window": window})
+                meta_by_id[uid] = (idx, j, window)
+            results, bbatches = _ai_delimit_batch(
+                items, ai_cfg.get("key") or "",
+                ai_cfg.get("model") or "",
+                ai_cfg.get("batch") or _AI_BATCH_DEFAULT)
+            raw_by_id = {}
+            reasons = []
+            for b in bbatches:
+                for i in b["ids"]:
+                    raw_by_id[i] = b["raw"]
+                if b["error"] and b["error"] not in reasons:
+                    reasons.append(b["error"])
+            stats["ai_batches"] = (stats.get("ai_batches")
+                                   or []) + [
+                {"ids": b["ids"],
+                 "raw": (b["raw"] or "")[:300] or None,
+                 "error": b["error"]} for b in bbatches]
+            unresolved = 0
+            for it in items:
+                idx, j, window = meta_by_id[it["id"]]
+                k = results.get(it["id"])
+                if k is not None:
+                    bnd = (anchors[idx + 1]["o"]
+                           if idx + 1 < len(anchors) else n)
+                    end = _pure_take_end(norm, j, k,
+                                         max(bnd, j))
+                    frag = text[j:end].strip()
+                    if frag:
+                        anchors[idx]["bare_frag"] = frag
+                        anchors[idx]["how"] = "ai"
+                    else:
+                        k = None
+                if k is None:
+                    unresolved += 1
+                debug_by_idx[idx] = {
+                    "o": anchors[idx]["o"],
+                    "num": anchors[idx]["num"],
+                    "window": window,
+                    "ai_len": k,
+                    "ai_raw": (raw_by_id.get(it["id"])
+                               or "")[:1000] or None,
+                    "ai_title": None}
+            if unresolved:
+                reasons.append(
+                    "AI %d 项未判，已单独回退" % unresolved)
+            if reasons:
+                prev = stats.get("fallback")
+                stats["fallback"] = "；".join(
+                    ([prev] if prev else []) + reasons[:3])
+            debug = [debug_by_idx[i] for i in sorted(debug_by_idx)]
+
+    # Deferred (lazy) splits: the anchors AI could still
+    # improve are the recovered heads, every bare anchor
+    # (auto titles), and the glued heads the eager candidate
+    # collection would have sent to the model. Their
+    # chapters are flagged "pend" below and counted into
+    # stats["ai_pending"]; nothing was asked of the model.
+    pending_idx = set()
+    if defer_ai:
+        for idx, a in enumerate(anchors):
+            if idx in recovered_idx or a["hs"] is None:
+                pending_idx.add(idx)
+            elif a["title"] is None and not (
+                    a["num"] is not None and inferred):
+                pending_idx.add(idx)
+
+    for idx, a in enumerate(anchors):
+        if a["title"] is not None or a["hs"] is None:
+            continue
+        end = None
+        bnd = (anchors[idx + 1]["o"] if idx + 1 < len(anchors)
+               else n)
+        if idx in ai_map:
+            end = ai_map[idx]
+            a["how"] = "ai"
+        elif a["num"] is not None:
+            if fixed_n and fixed_n > 0:
+                end = _pure_take_end(norm, a["he"], fixed_n,
+                                     max(bnd, a["he"]))
+                a["how"] = "fixed"
+            elif inferred:
+                end = _pure_take_end(norm, a["he"], inferred,
+                                     max(bnd, a["he"]))
+                a["how"] = "rule"
+        if end is None:
+            end = _comma_title_end(norm, a["hs"], a["he"])
+            if end is not None:
+                a["how"] = "rule"
+        if end is None:
+            end = (_pure_take_end(norm, a["he"],
+                                  _TITLE_DEFAULT_N,
+                                  max(bnd, a["he"]))
+                   if a["num"] is not None
+                   else _pure_take_end(norm, a["hs"],
+                                       _TITLE_FALLBACK,
+                                       max(bnd, a["hs"])))
+            a["how"] = "fixed"
+        a["title"] = text[a["hs"]:end].strip()[:60]
+        a["tend"] = end
+
+    # Auto titles for bare separator chapters, numbered after the
+    # previous known chapter number when there is one.
+    ordinal = 0
+    last_num = 0
+    for a in anchors:
+        ordinal += 1
+        if a["title"] is None:
+            num = last_num + 1 if last_num else ordinal
+            frag = a.get("bare_frag") or _first_fragment(
+                text, a["o"])
+            a["title"] = ("第%d章 %s" % (num, frag)).strip()
+            a["num"] = num
+        elif a["num"] is None and a.pop("rec_ok", False):
+            # A recovered head settled by boundary selection
+            # still consumes the chapter-number slot its auto
+            # title would have used, so the numbering of the
+            # bare chapters after it does not drift.
+            a["num"] = last_num + 1 if last_num else ordinal
+        if a["num"]:
+            last_num = a["num"]
+
+    # Final titles: purify every title to its pure chars. A
+    # head chapter whose delimited segment carried decoration
+    # but no pure char beyond the head itself (an
+    # all-decoration segment, e.g. a head followed by a star
+    # field) is extended into the following body text to
+    # collect its first pure chars: a chapter never ends up
+    # with an empty or decoration-only name, and no
+    # placeholder is ever invented. A clean bare head (a
+    # heading-only line with nothing after it) is left as is.
+    for idx, a in enumerate(anchors):
+        if a["title"] is None:
+            continue
+        if a["hs"] is not None and a["he"] is not None:
+            head_raw = text[a["hs"]:a["he"]]
+            headpart = _purify_title(head_raw)
+            pure = _purify_title(a["title"])
+            content = (pure[len(headpart):]
+                       if headpart and pure.startswith(headpart)
+                       else pure)
+            raw_after = a["title"][len(head_raw):] \
+                if a["title"].startswith(head_raw) else ""
+            if (not content and raw_after
+                    and _pure_len(raw_after) < len(raw_after)):
+                bnd = (anchors[idx + 1]["o"]
+                       if idx + 1 < len(anchors) else n)
+                start = a.get("tend") or a["he"]
+                fend = _pure_take_end(norm, start, 12,
+                                      max(bnd, start))
+                if fend > start:
+                    a["title"] = a["title"] + text[start:fend]
+        a["title"] = _purify_title(a["title"])
+        if idx in debug_by_idx and a.get("how") == "ai":
+            debug_by_idx[idx]["ai_title"] = a["title"]
+
+    chapters = []
+    for aidx, a in enumerate(anchors):
+        c = {"t": a["title"], "o": a["o"]}
+        if aidx in pending_idx:
+            c["pend"] = True
+        if a.get("how") == "ai":
+            # Per-chapter provenance: this title's length was
+            # judged by the AI. Stored on the chapter itself
+            # so the AI-delimited subset stays exactly
+            # identifiable (batch ids and chapter numbers
+            # cannot reconstruct it once duplicate windows
+            # and merge folding have had their say) and can
+            # be exported for the data repo.
+            c["ai"] = True
+        chapters.append(c)
+    if not chapters:
+        stats["chapters"] = 1
+        return [{"t": "正文", "o": 0}], stats, debug
+    if chapters[0]["o"] > 0:
+        chapters.insert(0, {"t": "正文", "o": 0})
+
+    # Merge protection (single pass): a chapter shorter than
+    # _MERGE_MIN chars is folded into the following chapter.
+    merged = []
+    for c in chapters:
+        if merged and c["o"] - merged[-1]["o"] < _MERGE_MIN:
+            merged[-1] = c
+        else:
+            merged.append(c)
+    for a in anchors:
+        stats[a.get("how") or "rule"] += 1
+    stats["chapters"] = len(merged)
+    if defer_ai:
+        pend_n = sum(1 for c in merged if c.get("pend"))
+        if pend_n:
+            stats["ai_pending"] = pend_n
+    return merged, stats, debug
+
+
+def _split_chapters(text, fixed_n=0):
+    chapters, _stats, _debug = _split_chapters_full(text, fixed_n)
+    return chapters
+
+
+def _persist_novel_split(hash_, text, enc, chapters, stats,
+                         fixed):
+    """Single persistence point for a finished split: the
+    AI first-chapter mark, the split timestamp, and the
+    novel_meta row. Internal per-chapter "pend" flags (from
+    a deferred split) never reach storage; the pending
+    count lives in split_stats."""
+    for c in chapters:
+        c.pop("pend", None)
+    # AI split marker: when this split settled at least
+    # one title via AI, the first chapter's stored title
+    # carries a trailing full-width "（AI）" mark, so every
+    # surface (web reader, book source, admin) shows the
+    # provenance. Any stale mark is stripped first, so
+    # re-splits never stack it, and a pure-rule re-split
+    # makes it disappear again: the mark always reflects
+    # the current split.
+    if chapters:
+        t0 = chapters[0].get("t") or ""
+        while t0.endswith(_AI_MARK):
+            t0 = t0[:-len(_AI_MARK)]
+        if (stats.get("ai") or 0) > 0:
+            t0 += _AI_MARK
+            stats["ai_marked"] = True
+        chapters[0]["t"] = t0
+    stats["at"] = time.time()
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO novel_meta(hash, encoding, "
+            "char_count, chapters, title_len, split_stats, "
+            "updated_at) VALUES(?,?,?,?,?,?,?)",
+            (hash_, enc, len(text),
+             json.dumps(chapters, ensure_ascii=False), fixed,
+             json.dumps(stats, ensure_ascii=False), time.time()))
+    return {"encoding": enc, "char_count": len(text),
+            "chapters": chapters, "title_len": fixed}
+
+
+def _store_novel_meta(hash_, text, enc, defer_ai=False):
+    fixed = 0
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT title_len FROM novel_meta WHERE hash = ?",
+            (hash_,)).fetchone()
+        if row is not None:
+            fixed = row["title_len"] or 0
+    if defer_ai:
+        # Import path: rules only, no AI request; the split
+        # itself records how many chapters AI could still
+        # improve (stats["ai_pending"]) and the first read
+        # of the book completes them in the background.
+        chapters, stats, _dbg = _split_chapters_full(
+            text, fixed, defer_ai=True)
+    else:
+        chapters, stats, _dbg = _split_chapters_full(
+            text, fixed, ai_cfg=_ai_cfg_if_active())
+    return _persist_novel_split(hash_, text, enc, chapters,
+                                stats, fixed)
+
+
+# --------------------------------------- deferred AI completion
+# A book imported with a pending mark is completed lazily:
+# the first reader (web reader opening the book, or the
+# phone book source pulling its table of contents) starts a
+# background single-flight pass that runs AI delimitation
+# for the pending chapters only. Readers always get the
+# current titles immediately; a failed pass leaves the mark
+# in place so the next visit retries.
+_AI_FLIGHT = {}
+_AI_FLIGHT_LOCK = threading.Lock()
+
+
+def _set_ai_pending(hash_, count):
+    """Rewrite only the ai_pending field of a book's stored
+    split_stats (0 removes the mark)."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT split_stats FROM novel_meta WHERE hash = ?",
+            (hash_,)).fetchone()
+        if row is None:
+            return
+        try:
+            stats = json.loads(row["split_stats"] or "")
+        except Exception:
+            stats = {}
+        if not isinstance(stats, dict):
+            stats = {}
+        if count:
+            stats["ai_pending"] = count
+        else:
+            stats.pop("ai_pending", None)
+        conn.execute(
+            "UPDATE novel_meta SET split_stats = ? "
+            "WHERE hash = ?",
+            (json.dumps(stats, ensure_ascii=False), hash_))
+
+
+def _ai_trigger_run(hash_, cfg):
+    try:
+        file_row = get_file(hash_)
+        if file_row is None:
+            return
+        text = _novel_text(file_row)
+        meta = _novel_meta(hash_)
+        fixed = (meta or {}).get("title_len") or 0
+        enc = (meta or {}).get("encoding") or ""
+        stored = (meta or {}).get("chapters") or []
+        d_chs, _dst, _dbg = _split_chapters_full(
+            text, fixed, defer_ai=True)
+        # Pending chapters are matched to the stored split
+        # by chapter index, not by offset: for books whose
+        # source had CRLF line endings, the stored offsets
+        # sit on the untranslated text while _novel_text
+        # reads the cache with newline translation, so the
+        # two offset bases drift apart even though the
+        # chapter sequence is identical. Index mapping is
+        # exact whenever the chapter counts agree; offset
+        # intersection is the fallback when they do not.
+        pend_idx = {i for i, c in enumerate(d_chs)
+                    if c.get("pend")}
+        if len(stored) == len(d_chs):
+            pend_idx = {i for i in pend_idx
+                        if not stored[i].get("ai")}
+            pend = {d_chs[i]["o"] for i in pend_idx}
+        else:
+            stored_open = {c.get("o") for c in stored
+                           if not c.get("ai")}
+            pend = {c["o"] for c in d_chs if c.get("pend")}
+            pend &= stored_open
+            pend_idx = {i for i, c in enumerate(d_chs)
+                        if c["o"] in pend}
+        if not pend:
+            _set_ai_pending(hash_, 0)
+            return
+        chapters, stats, _dbg = _split_chapters_full(
+            text, fixed, ai_cfg=cfg, ai_only_offsets=pend)
+        residual = [c for i, c in enumerate(chapters)
+                    if i in pend_idx and not c.get("ai")]
+        if residual:
+            stats["ai_pending"] = len(residual)
+        _persist_novel_split(hash_, text, enc, chapters,
+                             stats, fixed)
+    except Exception:
+        pass
+    finally:
+        with _AI_FLIGHT_LOCK:
+            _AI_FLIGHT.pop(hash_, None)
+
+
+def _maybe_ai_trigger(hash_):
+    """Start the deferred AI pass for one book when it
+    carries a pending mark and AI is active. Returns True
+    when a pass is running for the book (just started or
+    already in flight), for the reader's analysing hint."""
+    cfg = _ai_cfg_if_active()
+    if not cfg:
+        return False
+    meta = _novel_meta(hash_)
+    if not meta:
+        return False
+    stats = meta.get("split_stats") or {}
+    if not (stats.get("ai_pending") or 0):
+        return False
+    with _AI_FLIGHT_LOCK:
+        if hash_ in _AI_FLIGHT:
+            return True
+        _AI_FLIGHT[hash_] = True
+    threading.Thread(target=_ai_trigger_run, args=(hash_, cfg),
+                     daemon=True).start()
+    return True
+
+
+def _read_text_file(path):
+    """The single way novel text is read back from a
+    text file: Python text mode with universal-newline
+    translation (CRLF / CR become LF). Every stored
+    chapter offset lives on this basis, so the import /
+    index paths must split the text exactly as this
+    function returns it — never the raw decoded string,
+    whose carriage returns would silently shift every
+    offset after the first line break (the CRLF drift
+    rooted out 2026-11-07)."""
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _index_novel(path, hash_):
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    text, enc = _decode_txt(raw)
+    cache = os.path.join(NOVEL_TEXT_DIR, hash_ + ".txt")
+    with open(cache, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return _store_novel_meta(hash_, _read_text_file(cache),
+                             enc, defer_ai=True)
+
+
+def _novel_meta(hash_):
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM novel_meta WHERE hash = ?",
+            (hash_,)).fetchone()
+    if row is None:
+        return None
+    try:
+        stats = json.loads(row["split_stats"] or "")
+    except Exception:
+        stats = None
+    return {"encoding": row["encoding"],
+            "char_count": row["char_count"],
+            "title_len": row["title_len"] or 0,
+            "split_stats": stats,
+            "chapters": json.loads(row["chapters"] or "[]")}
+
+
+def _novel_text(file_row):
+    """Decoded full text of a novel: normalized cache first,
+    else decode the original bytes (staging copy, server cache
+    copy, or a loopback pull of the archived object)."""
+    cache = os.path.join(NOVEL_TEXT_DIR, file_row["hash"] + ".txt")
+    if os.path.exists(cache):
+        return _read_text_file(cache)
+    raw = None
+    local = _local_path(file_row)
+    cached = _cache_file(file_row)
+    if os.path.exists(local):
+        with open(local, "rb") as fh:
+            raw = fh.read()
+    elif cached:
+        with open(cached, "rb") as fh:
+            raw = fh.read()
+    elif file_row["status"] == "archived":
+        url = resolve_loopback_url(file_row)
+        with urllib.request.urlopen(url, timeout=120) as resp:
+            raw = resp.read()
+    if raw is None:
+        raise ValueError("小说文件不可用。")
+    text, enc = _decode_txt(raw)
+    with open(cache, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    text = _read_text_file(cache)
+    if _novel_meta(file_row["hash"]) is None:
+        _store_novel_meta(file_row["hash"], text, enc,
+                          defer_ai=True)
+    return text
+
+
+
+# ------------------------------------------------- ext book source
+# Phone reader channel (Legado-format sources, e.g. Soushu Dashi /
+# Yuedu): token-guarded JSON endpoints under /ext, reached from the
+# internet via Caddy at /vidlib-api/* (the panel /web gate cannot
+# serve phone app clients). The token lives in credentials.json as
+# ext_token; the admin page shows the full import URL because it
+# sits behind the panel gate.
+
+EXT_BASE = "https://debi.su7.dpdns.org/vidlib-api"
+
+
+def _ext_token():
+    tok = _cred("ext_token")
+    if not tok:
+        creds = _load_creds()
+        tok = secrets.token_urlsafe(24)
+        creds["ext_token"] = tok
+        _save_creds(creds)
+    return tok
+
+
+def _ext_import_url():
+    return EXT_BASE + "/ext/source.json?t=" + _ext_token()
+
+
+def _ext_check(params):
+    given = params.get("t") or ""
+    return bool(given) and secrets.compare_digest(given, _ext_token())
+
+
+def _ext_words(chars):
+    chars = chars or 0
+    if chars >= 10000:
+        return "%.1f \u4e07\u5b57" % (chars / 10000.0)
+    return "%d \u5b57" % chars
+
+
+def _ext_book_row(r, tok):
+    try:
+        raw = json.loads(r["chaps"] or "[]")
+    except Exception:
+        raw = []
+    words = _ext_words(r["chars"])
+    return {
+        "id": r["e_id"],
+        "title": r["e_title"] or "",
+        "author": "",
+        "intro": "%d \u7ae0 \u00b7 %s" % (len(raw), words),
+        "chapters": len(raw),
+        "words": words,
+        "lastChapter": (raw[-1].get("t") or "") if raw else "",
+        "tocUrl": "%s/ext/toc?id=%d&t=%s" % (EXT_BASE, r["e_id"], tok),
+    }
+
+
+def _ext_search(params):
+    key = (params.get("key") or "").strip()
+    tok = _ext_token()
+    where = ["f.kind = 'novel'"]
+    args = []
+    if key:
+        where.append("(e.title LIKE ? OR e.tags LIKE ?)")
+        like = "%" + key + "%"
+        args += [like, like]
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT e.id AS e_id, e.title AS e_title, "
+            "m.char_count AS chars, m.chapters AS chaps "
+            "FROM entries e JOIN files f ON f.hash = e.hash "
+            "LEFT JOIN novel_meta m ON m.hash = e.hash WHERE "
+            + " AND ".join(where)
+            + " ORDER BY e.id DESC LIMIT 50", args).fetchall()
+    return {"books": [_ext_book_row(r, tok) for r in rows]}
+
+
+def _ext_toc(params):
+    entry = get_entry(params.get("id") or "")
+    if entry is None or entry["f_kind"] != "novel":
+        return None
+    # Pulling the table of contents counts as reading the
+    # book: a pending mark starts the deferred AI pass in
+    # the background; this response still serves the
+    # current titles.
+    _maybe_ai_trigger(entry["hash"])
+    tok = _ext_token()
+    meta = _novel_meta(entry["hash"]) or {}
+    spans = _novel_chapter_spans(meta)
+    words = _ext_words(meta.get("char_count"))
+    return {
+        "title": entry["title"] or "",
+        "author": "",
+        "intro": "%d \u7ae0 \u00b7 %s" % (len(spans), words),
+        "words": words,
+        "tocUrl": "%s/ext/toc?id=%d&t=%s" % (EXT_BASE, entry["id"], tok),
+        "chapters": [
+            {"title": c["t"],
+             "url": "%s/ext/chapter?id=%d&idx=%d&t=%s"
+                    % (EXT_BASE, entry["id"], i, tok)}
+            for i, c in enumerate(spans)],
+    }
+
+
+def _ext_chapter(params):
+    entry = get_entry(params.get("id") or "")
+    if entry is None or entry["f_kind"] != "novel":
+        return None
+    meta = _novel_meta(entry["hash"]) or {}
+    spans = _novel_chapter_spans(meta)
+    try:
+        idx = int(params.get("idx") or "0")
+    except Exception:
+        idx = 0
+    if not spans or idx < 0 or idx >= len(spans):
+        return None
+    text = _novel_text(get_file(entry["hash"]))
+    ch = spans[idx]
+    return {"title": ch["t"], "content": text[ch["o"]:ch["e"]]}
+
+
+def _ext_source():
+    tok = _ext_token()
+    return [{
+        "bookSourceName": "\u8d44\u6e90\u5e93 \u00b7 \u6211\u7684\u5c0f\u8bf4",
+        "bookSourceGroup": "\u81ea\u5efa",
+        "bookSourceUrl": EXT_BASE,
+        "bookSourceType": 0,
+        "bookSourceComment": "\u81ea\u5efa\u8d44\u6e90\u5e93\u5c0f\u8bf4\u4e66\u6e90",
+        "customOrder": 0,
+        "enabled": True,
+        "enabledExplore": False,
+        "searchUrl": (EXT_BASE + "/ext/search?key={{key}}"
+                      "&page={{page}}&t=" + tok),
+        "ruleSearch": {
+            "bookList": "$.books",
+            "name": "$.title",
+            "author": "$.author",
+            "intro": "$.intro",
+            "lastChapter": "$.lastChapter",
+            "wordCount": "$.words",
+            "bookUrl": "$.tocUrl",
+        },
+        "ruleBookInfo": {
+            "name": "$.title",
+            "author": "$.author",
+            "intro": "$.intro",
+            "wordCount": "$.words",
+            "tocUrl": "$.tocUrl",
+        },
+        "ruleToc": {
+            "chapterList": "$.chapters",
+            "chapterName": "$.title",
+            "chapterUrl": "$.url",
+        },
+        "ruleContent": {
+            "content": "$.content",
+        },
+    }]
+
+
+def ext_handle(environ, start_response, params):
+    if not _ext_check(params):
+        return _json(start_response, "404 Not Found", {"ok": False})
+    path = environ.get("PATH_INFO", "") or ""
+    try:
+        if path == "/ext/search":
+            return _json(start_response, "200 OK", _ext_search(params))
+        if path == "/ext/toc":
+            data = _ext_toc(params)
+            if data is None:
+                return _json(start_response, "404 Not Found",
+                             {"ok": False})
+            return _json(start_response, "200 OK", data)
+        if path == "/ext/chapter":
+            data = _ext_chapter(params)
+            if data is None:
+                return _json(start_response, "404 Not Found",
+                             {"ok": False})
+            return _json(start_response, "200 OK", data)
+        if path == "/ext/source.json":
+            return _json(start_response, "200 OK", _ext_source())
+    except Exception:
+        return _json(start_response, "503 Service Unavailable",
+                     {"ok": False})
+    return _json(start_response, "404 Not Found", {"ok": False})
+
+
 def _fmt_duration(sec):
     sec = int(sec or 0)
     if sec >= 3600:
@@ -526,6 +2560,13 @@ def _fmt_size(n):
                     else "%.1f %s") % (n, unit)
         n /= 1024.0
     return "%.1f TB" % n
+
+
+def _fmt_wchars(n):
+    n = int(n or 0)
+    if n >= 10000:
+        return "%.1fw字" % (n / 10000.0)
+    return "%d字" % n
 
 
 def _staging_bytes():
@@ -573,7 +2614,8 @@ def get_entry(entry_id):
             "SELECT e.*, f.ext AS f_ext, f.size AS f_size, "
             "f.duration AS f_duration, f.width AS f_width, "
             "f.height AS f_height, f.status AS f_status, "
-            "f.gpath AS f_gpath, f.error AS f_error "
+            "f.gpath AS f_gpath, f.error AS f_error, "
+            "f.kind AS f_kind, f.category AS f_category "
             "FROM entries e JOIN files f ON f.hash = e.hash "
             "WHERE e.id = ?", (entry_id,)).fetchone()
 
@@ -597,15 +2639,21 @@ def _unique_title(conn, folder, title, exclude_id=None):
         n += 1
 
 
-def insert_entry(hash_, title, folder, tags="", source=""):
+def insert_entry(hash_, title, folder, tags="", source="",
+                 library_id=None):
     now = time.time()
+    if library_id is None:
+        f = get_file(hash_)
+        library_id = _resolve_library_id(
+            (f["kind"] if f else "video") or "video", None)
     with _db() as conn:
         title = _unique_title(conn, folder, title[:200])
         cur = conn.execute(
             "INSERT INTO entries(hash, title, folder, tags, source, "
-            "created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+            "library_id, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
             (hash_, title, folder, (tags or "")[:200],
-             (source or "")[:120], now, now))
+             (source or "")[:120], library_id, now, now))
         return cur.lastrowid
 
 
@@ -718,6 +2766,9 @@ def _cache_keep_local(file_row, local):
     """After archiving, keep a short video's local copy in the
     cache instead of deleting it: the feed's fast path."""
     try:
+        if ((file_row["kind"] if "kind" in file_row.keys() else "video")
+                != "video"):
+            return False
         if (int(file_row["size"] or 0) <= SHORT_MAX_BYTES
                 and os.path.exists(local)):
             os.replace(local, _cache_path(file_row))
@@ -789,7 +2840,7 @@ def _cache_warm(file_row):
 
 
 def ingest_staged_file(staged_path, display_name, folder=None, tags="",
-                       source=""):
+                       source="", library_id=None):
     """Hash a fully-received staging file, dedupe, and register it.
 
     Returns (entry_id, file_hash, is_duplicate_file). The staging
@@ -816,24 +2867,46 @@ def ingest_staged_file(staged_path, display_name, folder=None, tags="",
                 "UPDATE files SET dup_count = dup_count + 1, "
                 "orphaned_at = 0, updated_at = ? WHERE hash = ?",
                 (now, digest))
-        entry_id = insert_entry(digest, title, folder, tags, source)
+        entry_id = insert_entry(
+            digest, title, folder, tags, source,
+            library_id=_resolve_library_id(
+                (existing["kind"] if "kind" in existing.keys()
+                 else None) or _kind(existing["ext"]), library_id))
         return entry_id, digest, True
-    if ext not in VIDEO_EXTS:
-        ext = ext if ext else "mp4"
+    if not ext:
+        ext = "mp4"
+    kind = _kind(ext)
     final = os.path.join(STAGING_DIR, digest + "." + ext)
     os.replace(staged_path, final)
-    meta = _probe(final)
-    _probe_cache[digest] = meta
-    _make_thumb(final, digest)
+    meta = {"duration": 0, "width": 0, "height": 0}
+    category = ""
+    if kind == "video":
+        meta = _probe(final)
+        _probe_cache[digest] = meta
+        _make_thumb(final, digest)
+    elif kind == "image":
+        meta = _probe(final)
+        _probe_cache[digest] = meta
+        _make_image_thumb(final, digest)
+    elif kind == "novel":
+        try:
+            _index_novel(final, digest)
+        except Exception:
+            pass
+    elif kind == "file":
+        category = _category_for_ext(ext)
     size = os.path.getsize(final)
     with _db() as conn:
         conn.execute(
-            "INSERT INTO files(hash, ext, size, duration, width, height, "
-            "status, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,'local',?,?)",
+            "INSERT INTO files(hash, ext, size, duration, width, "
+            "height, status, kind, category, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,'local',?,?,?,?)",
             (digest, ext, size, meta.get("duration") or 0,
-             meta.get("width") or 0, meta.get("height") or 0, now, now))
-    entry_id = insert_entry(digest, title, folder, tags, source)
+             meta.get("width") or 0, meta.get("height") or 0,
+             kind, category, now, now))
+    entry_id = insert_entry(
+        digest, title, folder, tags, source,
+        library_id=_resolve_library_id(kind, library_id))
     _ensure_worker()
     return entry_id, digest, False
 
@@ -858,7 +2931,7 @@ def _merge_chute(tags, relpath):
     return tags
 
 
-def register_dup(digest, name, tags, source):
+def register_dup(digest, name, tags, source, library_id=None):
     """Create an entry for an already-stored file without any
     upload (the client-side precheck's fast path). Mirrors the
     duplicate branch of ingest_staged_file."""
@@ -871,10 +2944,15 @@ def register_dup(digest, name, tags, source):
             "UPDATE files SET dup_count = dup_count + 1, "
             "orphaned_at = 0, updated_at = ? WHERE hash = ?",
             (now, digest))
-    return insert_entry(digest, title, _folder_of(now), tags, source)
+    f = get_file(digest)
+    return insert_entry(
+        digest, title, _folder_of(now), tags, source,
+        library_id=_resolve_library_id(
+            (f["kind"] if f else "video") or "video", library_id))
 
 
-def upload_init(name, size, title, tags, source, relpath=""):
+def upload_init(name, size, title, tags, source, relpath="",
+                library_id=None):
     tags = _merge_chute(tags, relpath)
     size = int(size or 0)
     if size <= 0:
@@ -889,7 +2967,7 @@ def upload_init(name, size, title, tags, source, relpath=""):
         _uploads[uid] = {"name": name, "size": size, "title": title,
                          "tags": tags, "source": source,
                          "path": part_path, "at": time.time(),
-                         "got": set()}
+                         "got": set(), "library_id": library_id}
     return uid
 
 
@@ -924,7 +3002,8 @@ def upload_complete(uid):
         raise ValueError("文件不完整：收到 %d / 应为 %d 字节。"
                          % (actual, sess["size"]))
     entry_id, digest, dup = ingest_staged_file(
-        part, sess["name"], tags=sess["tags"], source=sess["source"])
+        part, sess["name"], tags=sess["tags"], source=sess["source"],
+        library_id=sess.get("library_id"))
     return {"entry_id": entry_id, "hash": digest, "duplicate": dup}
 
 
@@ -1037,7 +3116,8 @@ def _remote_size_drive(remote_path):
     so the caller can fall back to the AList listing."""
     _, _, name = remote_path.rpartition("/")
     base_q = "name = '%s' and trashed = false" % name
-    folder = _drive_videos_dir()
+    folder = (_drive_videos_dir()
+              if remote_path.startswith("/videos/") else None)
     files = []
     if folder:
         files = _drive_list(base_q + " and '%s' in parents" % folder)
@@ -1088,15 +3168,19 @@ def _remote_size(remote_path):
     return None
 
 
+_mkdir_done = set()
+
+
 def _archive_one(row):
     local = _local_path(row)
-    remote = "/videos/" + row["hash"] + "." + (row["ext"] or "mp4")
-    if not kv_get("videos_dir_ready"):
+    remote = _target_gpath(row)
+    dir_path = remote.rpartition("/")[0]
+    if dir_path and dir_path not in _mkdir_done:
         try:
-            ALIST.fs_mkdir("/videos")
+            ALIST.fs_mkdir(dir_path)
         except Exception:
             pass
-        kv_set("videos_dir_ready", "1")
+        _mkdir_done.add(dir_path)
     # Idempotent: a matching object already on Drive (e.g. an
     # earlier attempt whose upload landed but whose bookkeeping
     # failed) is adopted, never uploaded again.
@@ -1387,7 +3471,7 @@ def _page(title, body, extra_head="", base_href=""):
     base_tag = ('<base href="%s">' % _esc(base_href)) if base_href else ""
     return ("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-            "<title>%s · 视频库</title>%s<style>%s</style>%s</head>"
+            "<title>%s · 资源库</title>%s<style>%s</style>%s</head>"
             "<body><div class=\"wrap\">%s</div></body></html>"
             % (_esc(title), base_tag, BASE_CSS, extra_head,
                body)).encode("utf-8")
@@ -1396,7 +3480,7 @@ def _page(title, body, extra_head="", base_href=""):
 
 FEED_PAGE = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>刷视频 · 视频库</title>__BASE_TAG__
+<title>刷视频 · 资源库</title>__BASE_TAG__
 <style>
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;background:#000;color:#eee;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden}
@@ -1410,20 +3494,20 @@ a{color:#9ec1ff;text-decoration:none}
 body.chrome-off #bar{transform:translateY(-110%);opacity:0;pointer-events:none}
 #peek{position:fixed;top:calc(8px + env(safe-area-inset-top));right:10px;z-index:21;width:40px;height:40px;border-radius:50%;background:rgba(20,20,26,.55);border:1px solid rgba(255,255,255,.22);color:#eee;font-size:19px;line-height:1;backdrop-filter:blur(6px);opacity:.55;transition:opacity .28s;cursor:pointer}
 body:not(.chrome-off) #peek{opacity:0;pointer-events:none}
-#feed{height:100vh;height:100dvh;overflow-y:auto;scroll-snap-type:y mandatory;scrollbar-width:none}
+#feed{height:100vh;height:100dvh;overflow-y:auto;scroll-snap-type:y mandatory;scrollbar-width:none;background:#15151b}
 #feed::-webkit-scrollbar{display:none}
-.slide{height:100vh;height:100dvh;scroll-snap-align:start;scroll-snap-stop:always;position:relative;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden}
-.slide .bgimg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:blur(26px) brightness(.55);transform:scale(1.25)}
-.slide video{position:relative;width:100%;height:100%;background:transparent}
+.slide{height:100vh;height:100dvh;padding:13px 0;scroll-snap-align:start;scroll-snap-stop:always;position:relative;display:flex;align-items:center;justify-content:center;background:#15151b;overflow:hidden}
+.slide .bgimg{position:absolute;inset:13px 0;border-radius:14px;width:100%;height:100%;object-fit:cover;filter:blur(26px) brightness(.55);transform:scale(1.25)}
+.slide video{position:relative;width:100%;height:100%;background:transparent;border-radius:14px}
 .slide video.fit-cover{object-fit:cover}
 .slide video.fit-contain{object-fit:contain}
-.meta{position:absolute;left:0;right:76px;bottom:34px;padding:0 14px;pointer-events:none;z-index:5;text-shadow:0 1px 4px rgba(0,0,0,.8)}
+.meta{position:absolute;left:0;right:76px;bottom:47px;padding:0 14px;pointer-events:none;z-index:5;text-shadow:0 1px 4px rgba(0,0,0,.8)}
 .meta .ttl{font-size:16px;font-weight:600;line-height:1.35;word-break:break-word;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;pointer-events:auto}
 .meta .ttl.open{display:block}
 .meta .sub{font-size:12.5px;color:#dfe2e8;margin-top:5px;line-height:1.5;word-break:break-all}
 .badge{display:inline-block;background:#2f6fd0;border-radius:4px;padding:0 5px;font-size:11px;color:#fff}
 .badge.gray{background:#4a4d55}
-.rail{position:absolute;right:10px;bottom:96px;z-index:6;display:flex;flex-direction:column;gap:14px;align-items:center}
+.rail{position:absolute;right:10px;bottom:109px;z-index:6;display:flex;flex-direction:column;gap:14px;align-items:center}
 .rail button{width:46px;height:46px;border-radius:50%;border:1px solid rgba(255,255,255,.25);background:rgba(18,18,22,.55);color:#fff;font-size:19px;backdrop-filter:blur(6px);cursor:pointer}
 .rail button.on{background:#2f6fd0;border-color:#2f6fd0}
 .rail button.like.on{background:#e5484d;border-color:#e5484d}
@@ -1431,7 +3515,7 @@ body:not(.chrome-off) #peek{opacity:0;pointer-events:none}
 .seenflag{display:inline-block;width:15px;color:rgba(255,255,255,.42);font-size:11px;vertical-align:2px;visibility:hidden}
 .seenflag.show{visibility:visible}
 .rail .lab{font-size:10.5px;color:#dfe2e8;text-align:center;margin-top:-10px;text-shadow:0 1px 3px rgba(0,0,0,.9)}
-.seek{position:absolute;left:0;right:0;bottom:0;height:30px;z-index:7;touch-action:none;cursor:pointer}
+.seek{position:absolute;left:0;right:0;bottom:13px;height:30px;z-index:7;touch-action:none;cursor:pointer}
 .seek .track{position:absolute;left:0;right:0;bottom:0;height:3px;background:rgba(255,255,255,.22);transition:height .15s}
 .seek .buf{position:absolute;left:0;bottom:0;height:100%;background:rgba(255,255,255,.35);width:0}
 .seek .fill{position:absolute;left:0;bottom:0;height:100%;background:#e8442e;width:0}
@@ -1451,11 +3535,11 @@ body:not(.chrome-off) #peek{opacity:0;pointer-events:none}
 </style></head>
 <body class="chrome-off">
 <div id="bar">
-  <a class="home" href="./">← 图库</a>
+  <a class="home" href="./">← 资源库</a>
   <input id="q" type="search" placeholder="搜索标题 / 标签 / 来源">
   <select id="mode"><option value="random">随机</option><option value="new">最新</option></select>
   <select id="seenf"><option value="unseen">未看</option><option value="all">全部</option><option value="seen">已看</option></select>
-  <select id="markf"><option value="">标记:全部</option><option value="liked">❤ 喜欢</option><option value="disliked">不喜欢</option></select>
+  <select id="markf"><option value="">标记:全部</option><option value="liked">❤ 喜欢</option><option value="disliked">不喜欢</option></select><select id="libf">__LIB_OPTIONS__</select>
   <button id="go">筛选</button>
   <button id="bsound" class="ico" title="声音">🔇</button>
   <button id="bdetail" class="ico" title="详情">⤢</button>
@@ -1874,7 +3958,7 @@ async function loadMore(){
   if(loading||done)return;loading=true;
   try{
     const qs=new URLSearchParams({mode:$("mode").value,
-      seen:$("seenf").value,mark:$("markf").value,q:$("q").value.trim(),
+      seen:$("seenf").value,mark:$("markf").value,lib:$("libf").value,q:$("q").value.trim(),
       seed:seed,offset:offset,limit:12});
     const d=await (await fetch("api/feed?"+qs)).json();
     total=d.total;
@@ -1898,7 +3982,7 @@ $("go").onclick=()=>{reset();};
 $("q").addEventListener("keydown",e=>{if(e.key==="Enter")reset();});
 $("mode").onchange=reset;
 $("seenf").onchange=reset;
-$("markf").onchange=reset;
+$("markf").onchange=reset;$("libf").onchange=reset;
 document.addEventListener("visibilitychange",()=>{
   if(document.hidden){const v=slideVideo(cur);
     if(v&&!v.paused)v.pause();}});
@@ -1912,7 +3996,8 @@ loadMore();
 def page_feed(base_href=""):
     base_tag = ('<base href="%s">' % _esc(base_href)) \
         if base_href else ""
-    return FEED_PAGE.replace("__BASE_TAG__", base_tag).encode("utf-8")
+    return FEED_PAGE.replace("__BASE_TAG__", base_tag) \
+        .replace("__LIB_OPTIONS__", _lib_options_html()).encode("utf-8")
 
 
 _ENTRY_COLS = (
@@ -1920,10 +4005,496 @@ _ENTRY_COLS = (
     "e.folder AS folder, e.tags AS tags, e.source AS source, "
     "e.play_pos AS play_pos, e.play_count AS play_count, "
     "e.seen_at AS seen_at, e.mark AS mark, e.mark_at AS mark_at, "
-    "e.created_at AS created_at, f.ext AS ext, f.size AS size, "
+    "e.created_at AS created_at, e.library_id AS library_id, "
+    "f.kind AS kind, f.category AS category, "
+    "f.ext AS ext, f.size AS size, "
     "f.duration AS duration, f.width AS width, f.height AS height, "
     "f.status AS status, f.gpath AS gpath, f.error AS error "
     "FROM entries e JOIN files f ON f.hash = e.hash ")
+
+
+def _safe_lib(value):
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _validate_lib_name(name, exclude_id=None):
+    if not name or len(name) > 30:
+        return "库名长度需在 1-30 字。"
+    if "/" in name or "\\" in name:
+        return "库名不能含斜杠。"
+    if _MONTH_RE.fullmatch(name):
+        return "库名不能是日期形（YYYY-MM）。"
+    for l in _libraries("video"):
+        if l["name"] == name and l["id"] != exclude_id:
+            return "已有同名库。"
+    return ""
+
+
+def _lib_options_html():
+    parts = []
+    for l in _libraries("video"):
+        parts.append('<option value="%d"%s>%s%s</option>' % (
+            l["id"], " selected" if l["is_default"] else "",
+            _esc(l["name"]), "（默认）" if l["is_default"] else ""))
+    return "".join(parts)
+
+
+def page_hub(params, base_href=""):
+    with _db() as conn:
+        counts = {}
+        for r in conn.execute(
+                "SELECT f.kind AS kind, COUNT(*) AS c FROM entries e "
+                "JOIN files f ON f.hash = e.hash GROUP BY f.kind"):
+            counts[r["kind"] or "video"] = r["c"]
+        vlibs = conn.execute(
+            "SELECT l.*, (SELECT COUNT(*) FROM entries e "
+            "WHERE e.library_id = l.id) AS n FROM libraries l "
+            "WHERE l.kind = 'video' ORDER BY l.is_default DESC, l.id"
+        ).fetchall()
+    libbits = "、".join(
+        "%s（%d）" % (_esc(l["name"]), l["n"]) for l in vlibs) or "默认库"
+    cards = (
+        '<a class="card" href="wall?kind=video">'
+        '<span class="t">🎬 视频</span>'
+        '<div class="m">%d 条 · 主题库：%s</div></a>'
+        '<a class="card" href="feed">'
+        '<span class="t">▶ 刷视频</span>'
+        '<div class="m">默认只刷默认库，页面里可切库</div></a>'
+        '<a class="card" href="images">'
+        '<span class="t">🖼 图片</span>'
+        '<div class="m">%d 张 · 网格浏览 + 灯箱</div></a>'
+        '<a class="card" href="novels">'
+        '<span class="t">📖 小说</span>'
+        '<div class="m">%d 本 · txt，带章节与阅读进度</div></a>'
+        '<a class="card" href="files">'
+        '<span class="t">📦 文件</span>'
+        '<div class="m">%d 个 · 按类别规则归档</div></a>'
+        '<a class="card" href="upload">'
+        '<span class="t">⬆ 上传</span>'
+        '<div class="m">视频 / 图片 / txt 小说 / 任意文件</div></a>'
+        '<a class="card" href="admin">'
+        '<span class="t">⚙ 管理</span>'
+        '<div class="m">主题库、文件类别、DAV、补传、清理</div></a>'
+    ) % (counts.get("video", 0), libbits, counts.get("image", 0),
+         counts.get("novel", 0), counts.get("file", 0))
+    body = ('<div class="topbar"><h1>资源库</h1></div>'
+            '<div class="grid">' + cards + "</div>")
+    return _page("资源库", body, base_href=base_href)
+
+
+def page_images(params, base_href=""):
+    try:
+        page = max(1, int(params.get("page") or "1"))
+    except Exception:
+        page = 1
+    q = (params.get("q") or "").strip()
+    per = 60
+    with _db() as conn:
+        where = ["f.kind = 'image'"]
+        args = []
+        if q:
+            where.append("(e.title LIKE ? OR e.tags LIKE ?)")
+            like = "%" + q + "%"
+            args += [like, like]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM entries e JOIN files f "
+            "ON f.hash = e.hash WHERE " + " AND ".join(where),
+            args).fetchone()[0]
+        rows = conn.execute(
+            _ENTRY_COLS + " WHERE " + " AND ".join(where)
+            + " ORDER BY e.id DESC LIMIT ? OFFSET ?",
+            args + [per, (page - 1) * per]).fetchall()
+    items = []
+    cards = []
+    for i, r in enumerate(rows):
+        items.append({"i": i, "id": r["id"], "t": r["title"],
+                      "f": "file/" + r["hash"]})
+        cards.append(
+            '<div class="card lbopen" data-i="%d" style="cursor:pointer">'
+            '<img class="thumb" loading="lazy" src="%s" alt="">'
+            '<span class="t">%s</span>'
+            '<div class="m">%s · %s · <a href="watch/%d">详情</a></div></div>'
+            % (i, _esc(base_href + "thumb/" + r["hash"]),
+               _esc(r["title"]), r["folder"],
+               _fmt_size(r["size"] or 0), r["id"]))
+    pages = max(1, (total + per - 1) // per)
+    pager = ""
+    if pages > 1:
+        bits = []
+        for n in range(1, pages + 1):
+            bits.append("<strong>%d</strong>" % n if n == page else
+                        '<a href="?page=%d">%d</a>' % (n, n))
+        pager = ('<div style="display:flex;gap:8px;justify-content:center;'
+                 'margin:16px 0;font-size:14px">' + " ".join(bits) + "</div>")
+    lb = (
+        '<div id="lb" style="display:none;position:fixed;inset:0;'
+        'background:rgba(5,6,10,.95);z-index:60;flex-direction:column;'
+        'align-items:center;justify-content:center;padding:14px">'
+        '<img id="lbimg" style="max-width:96vw;max-height:82vh;'
+        'object-fit:contain;border-radius:10px">'
+        '<div style="margin-top:12px;display:flex;gap:8px;'
+        'align-items:center;flex-wrap:wrap;justify-content:center">'
+        '<button type="button" id="lbprev">← 上一张</button>'
+        '<span id="lbcap" style="color:#c8cfdd;font-size:13px"></span>'
+        '<a class="btn" id="lbfull" target="_blank" rel="noopener">原图</a>'
+        '<a class="btn ghost" id="lbwatch">详情</a>'
+        '<button type="button" id="lbnext">下一张 →</button>'
+        '<button type="button" class="ghost" id="lbclose">关闭</button>'
+        '</div></div>')
+    js = ('<script>const LB=' + json.dumps(items, ensure_ascii=False)
+          + ';let lbi=0;const lb=document.getElementById("lb");'
+          'function showLb(){const it=LB[lbi];if(!it)return;'
+          'document.getElementById("lbimg").src=it.f;'
+          'document.getElementById("lbcap").textContent='
+          '"（"+(lbi+1)+" / "+LB.length+"）"+it.t;'
+          'document.getElementById("lbfull").href=it.f;'
+          'document.getElementById("lbwatch").href="watch/"+it.id;}'
+          'function openLb(i){lbi=i;lb.style.display="flex";showLb();}'
+          'document.querySelectorAll(".lbopen").forEach(function(el){'
+          'el.addEventListener("click",function(ev){'
+          'if(ev.target.tagName==="A")return;'
+          'openLb(parseInt(el.dataset.i,10));});});'
+          'function stepLb(d){if(!LB.length)return;'
+          'lbi=(lbi+d+LB.length)%LB.length;showLb();}'
+          'document.getElementById("lbprev").onclick=function(){stepLb(-1);};'
+          'document.getElementById("lbnext").onclick=function(){stepLb(1);};'
+          'document.getElementById("lbclose").onclick=function(){'
+          'lb.style.display="none";};'
+          'lb.addEventListener("click",function(ev){'
+          'if(ev.target===lb)lb.style.display="none";});'
+          'document.addEventListener("keydown",function(ev){'
+          'if(lb.style.display!=="flex")return;'
+          'if(ev.key==="ArrowLeft")stepLb(-1);'
+          'if(ev.key==="ArrowRight")stepLb(1);'
+          'if(ev.key==="Escape")lb.style.display="none";});'
+          '</script>')
+    body = (
+        '<div class="topbar"><h1>图片</h1>'
+        '<form class="search" method="get">'
+        '<input type="search" name="q" value="%s" placeholder="搜索标题/标签">'
+        '</form>'
+        '<a class="btn ghost" href="./">← 资源库</a>'
+        '<a class="btn ghost" href="upload">上传</a></div>'
+        '<div style="margin-bottom:12px;font-size:13px">共 %d 张</div>'
+        '<div class="grid">%s</div>%s%s%s'
+        % (_esc(q), total, "".join(cards) or
+           '<div class="muted">暂无图片。</div>', pager, lb, js))
+    return _page("图片", body, base_href)
+
+
+_NOVELS_PER_PAGE = 20
+
+_NOVELS_CSS = (
+    "<style>"
+    ".nvlist{display:flex;flex-direction:column;gap:8px}"
+    ".nvrow{display:block;background:#171c27;border:1px solid #242c3f;"
+    "border-radius:11px;padding:11px 13px;text-decoration:none}"
+    ".nvrow:hover{border-color:#3a4a6b}"
+    ".nvt{display:block;font-size:15px;line-height:1.45;color:#e8ebf1}"
+    ".nvm{display:block;font-size:12.5px;color:#8b94a7;"
+    "margin-top:3px;line-height:1.65}"
+    ".pager{display:flex;gap:8px;align-items:center;"
+    "flex-wrap:wrap;margin-top:14px}"
+    ".pager a{background:#232a3a;border-radius:8px;"
+    "padding:7px 12px;text-decoration:none;font-size:13.5px}"
+    ".pgcur{background:#2f6fd0;color:#fff;border-radius:8px;"
+    "padding:7px 12px;font-size:13.5px}"
+    "</style>")
+
+
+def _split_summary(stats):
+    """One-line split composition for a novel, from its
+    split_stats dict. 'AI 定界 N 章' leads when AI settled
+    any title; a split settled by rules alone reads '纯规则'."""
+    if not isinstance(stats, dict):
+        return ""
+    ai = stats.get("ai") or 0
+    rule = stats.get("rule") or 0
+    fixed = stats.get("fixed") or 0
+    mech = stats.get("mechanical") or 0
+    rec = stats.get("recovered") or 0
+    if not (ai or rule or fixed or mech):
+        return ""
+    if rule and not (ai or fixed or mech) and not rec:
+        return "纯规则"
+    segs = []
+    if ai:
+        segs.append("AI 定界 %d 章" % ai)
+    if rule:
+        segs.append("规则 %d 章" % rule)
+    if fixed:
+        segs.append("固定 %d 章" % fixed)
+    if mech:
+        segs.append("机械 %d 段" % mech)
+    if rec:
+        segs.append("找回章首 %d 章" % rec)
+    return " · ".join(segs)
+
+
+def page_novels(params, base_href=""):
+    q = (params.get("q") or "").strip()
+    try:
+        page = int(params.get("p") or 1)
+    except Exception:
+        page = 1
+    where = ["f.kind = 'novel'"]
+    args = []
+    if q:
+        where.append("(e.title LIKE ? OR e.tags LIKE ?)")
+        like = "%" + q + "%"
+        args += [like, like]
+    wsql = " AND ".join(where)
+    with _db() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) c FROM entries e "
+            "JOIN files f ON f.hash = e.hash WHERE " + wsql,
+            args).fetchone()["c"]
+        pages = max(1, (total + _NOVELS_PER_PAGE - 1)
+                    // _NOVELS_PER_PAGE)
+        page = min(max(1, page), pages)
+        rows = conn.execute(
+            "SELECT e.id AS e_id, e.title AS e_title, "
+            "e.created_at AS created, "
+            "m.char_count AS chars, m.chapters AS chaps, "
+            "m.split_stats AS stats, "
+            "r.chapter AS rchap, r.percent AS pct FROM entries e "
+            "JOIN files f ON f.hash = e.hash "
+            "LEFT JOIN novel_meta m ON m.hash = e.hash "
+            "LEFT JOIN novel_read r ON r.entry_id = e.id WHERE "
+            + wsql + " ORDER BY e.id DESC LIMIT ? OFFSET ?",
+            args + [_NOVELS_PER_PAGE,
+                    (page - 1) * _NOVELS_PER_PAGE]).fetchall()
+    items = []
+    for r in rows:
+        try:
+            chlist = json.loads(r["chaps"] or "[]")
+        except Exception:
+            chlist = []
+        nch = len(chlist)
+        try:
+            stats = json.loads(r["stats"] or "")
+        except Exception:
+            stats = None
+        if not isinstance(stats, dict):
+            ai_n = sum(1 for c in chlist
+                       if isinstance(c, dict) and c.get("ai"))
+            stats = {"ai": ai_n} if ai_n else None
+        bits = [_fmt_wchars(r["chars"] or 0), "%d 章" % nch]
+        summ = _split_summary(stats)
+        if summ:
+            if (stats.get("ai") or 0) and stats.get("model"):
+                summ += " · 模型 " + str(stats["model"])
+            bits.append(summ)
+        rchap = r["rchap"]
+        pct = r["pct"] or 0
+        if rchap is not None and ((rchap or 0) > 0 or pct > 0):
+            seg = "读到第 %d 章" % ((rchap or 0) + 1)
+            if pct:
+                seg += " · 已读 %.0f%%" % pct
+            bits.append(seg)
+        if r["created"]:
+            bits.append("入库 " + time.strftime(
+                "%Y-%m-%d", time.localtime(r["created"])))
+        items.append(
+            '<a class="nvrow" href="read/%d">'
+            '<span class="nvt">%s</span>'
+            '<span class="nvm">%s</span></a>'
+            % (r["e_id"], _esc(r["e_title"]),
+               _esc(" · ".join(bits))))
+
+    def _plink(n, label):
+        u = "novels?p=%d" % n
+        if q:
+            u += "&q=" + urllib.parse.quote(q)
+        return '<a href="%s">%s</a>' % (u, label)
+
+    pager = ""
+    if total:
+        nav = []
+        if page > 1:
+            nav.append(_plink(page - 1, "← 上一页"))
+        nums = sorted(set(
+            [1, pages] + [n for n in range(page - 2, page + 3)
+                          if 1 <= n <= pages]))
+        last = 0
+        for n in nums:
+            if n - last > 1:
+                nav.append('<span class="muted">…</span>')
+            if n == page:
+                nav.append('<span class="pgcur">%d</span>' % n)
+            else:
+                nav.append(_plink(n, "%d" % n))
+            last = n
+        if page < pages:
+            nav.append(_plink(page + 1, "下一页 →"))
+        pager = ('<div class="pager">%s</div>'
+                 '<div class="muted" style="margin-top:6px">'
+                 '第 %d / %d 页 · 共 %d 本</div>'
+                 % (" ".join(nav), page, pages, total))
+    body = (
+        '<div class="topbar"><h1>小说</h1>'
+        '<form class="search" method="get">'
+        '<input type="search" name="q" value="%s" placeholder="搜索书名/标签">'
+        '</form>'
+        '<a class="btn ghost" href="./">← 资源库</a>'
+        '<a class="btn ghost" href="upload">上传</a></div>'
+        '<div class="nvlist">%s</div>%s'
+        % (_esc(q), "".join(items) or
+           '<div class="muted">暂无小说。上传 .txt 即可入库。</div>',
+           pager))
+    return _page("小说", body, extra_head=_NOVELS_CSS,
+                 base_href=base_href)
+
+
+def page_reader(entry, base_href=""):
+    body = (
+        '<div class="topbar"><a class="btn ghost" href="novels">← 小说</a>'
+        '<h1 style="font-size:17px">%s</h1>'
+        '<select id="chsel" style="max-width:44vw"></select>'
+        '<button type="button" class="ghost" id="fdec">A-</button>'
+        '<button type="button" class="ghost" id="finc">A+</button></div>'
+        '<div id="nmeta" class="muted" style="margin-bottom:10px"></div>'
+        '<div id="novel" style="font-size:19px;line-height:1.95;'
+        'max-width:760px;margin:0 auto;color:#dfe5f0"></div>'
+        '<div style="display:flex;gap:10px;justify-content:center;'
+        'margin:22px 0">'
+        '<button type="button" id="prevch">← 上一章</button>'
+        '<button type="button" id="nextch">下一章 →</button></div>'
+        '<script>const EID=%d;let CH=[],CUR=0,TOTAL=0,READ=null,FS=19;'
+        'try{FS=parseInt(localStorage.getItem("novelFont")||"19",10)||19;}'
+        'catch(e){}'
+        'const NOV=document.getElementById("novel");'
+        'function applyFs(){NOV.style.fontSize=FS+"px";}'
+        'document.getElementById("fdec").onclick=function(){'
+        'FS=Math.max(14,FS-1);applyFs();'
+        'try{localStorage.setItem("novelFont",FS);}catch(e){}};'
+        'document.getElementById("finc").onclick=function(){'
+        'FS=Math.min(30,FS+1);applyFs();'
+        'try{localStorage.setItem("novelFont",FS);}catch(e){}};'
+        'async function loadCh(i,frac){if(i<0||i>=CH.length)return;CUR=i;'
+        'document.getElementById("chsel").value=String(i);'
+        'const r=await fetch("api/novel/"+EID+"/chapter?i="+i);'
+        'const j=await r.json();if(!j.ok)return;NOV.innerHTML="";'
+        'const h=document.createElement("h2");h.textContent=CH[i].t;'
+        'h.style.fontSize="1.25em";NOV.appendChild(h);'
+        'j.text.split(/\\n+/).forEach(function(pa){if(!pa.trim())return;'
+        'const p=document.createElement("p");p.textContent=pa;'
+        'p.style.margin="0 0 .9em";p.style.textIndent="2em";'
+        'NOV.appendChild(p);});'
+        'if(frac&&frac>0){const y=frac*(document.documentElement.scrollHeight'
+        '-window.innerHeight);window.scrollTo(0,Math.max(0,y));}'
+        'else window.scrollTo(0,0);saveProg(frac||0);}'
+        'let saving=false;'
+        'async function saveProg(frac){if(saving||!CH.length)return;'
+        'saving=true;'
+        'try{const ch=CH[CUR];'
+        'const off=Math.round(ch.o+(frac||0)*(ch.e-ch.o));'
+        'const pct=TOTAL>0?Math.min(100,off/TOTAL*100):0;'
+        'await fetch("api/novel/progress",{method:"POST",'
+        'headers:{"Content-Type":"application/json"},'
+        'body:JSON.stringify({entry_id:EID,chapter:CUR,offset:off,'
+        'percent:pct})});}catch(e){}saving=false;}'
+        'let tick=false;window.addEventListener("scroll",function(){'
+        'if(tick)return;tick=true;setTimeout(function(){tick=false;'
+        'const mx=document.documentElement.scrollHeight-window.innerHeight;'
+        'saveProg(mx>0?window.scrollY/mx:0);},1800);});'
+        'document.getElementById("prevch").onclick=function(){'
+        'loadCh(CUR-1,0);};'
+        'document.getElementById("nextch").onclick=function(){'
+        'loadCh(CUR+1,0);};'
+        'document.getElementById("chsel").onchange=function(ev){'
+        'loadCh(parseInt(ev.target.value,10),0);};'
+        '(async function(){applyFs();'
+        'const r=await fetch("api/novel/"+EID);const j=await r.json();'
+        'if(!j.ok){NOV.textContent=j.message||"加载失败";return;}'
+        'CH=j.chapters;TOTAL=j.char_count||0;READ=j.read;'
+        'document.getElementById("nmeta").textContent='
+        '"共 "+CH.length+" 章 · "+TOTAL+" 字 · 编码 "+(j.encoding||"");'
+        'const sel=document.getElementById("chsel");'
+        'CH.forEach(function(c,ix){const o=document.createElement("option");'
+        'o.value=String(ix);o.textContent=c.t;sel.appendChild(o);});'
+        'let start=0,frac=0;'
+        'if(READ){start=Math.min(READ.chapter||0,CH.length-1);'
+        'const c=CH[start];'
+        'frac=c&&c.e>c.o?Math.max(0,Math.min(1,'
+        '(READ.offset-c.o)/(c.e-c.o))):0;}'
+        'loadCh(start,frac);})();</script>'
+        % (_esc(entry["title"]), entry["id"]))
+    return _page(entry["title"], body, base_href=base_href)
+
+
+def page_files(params, base_href=""):
+    cat = (params.get("cat") or "").strip()
+    q = (params.get("q") or "").strip()
+    cats = _file_categories()
+    with _db() as conn:
+        counts = {}
+        for r in conn.execute(
+                "SELECT f.category AS category, COUNT(*) AS c "
+                "FROM entries e JOIN files f ON f.hash = e.hash "
+                "WHERE f.kind = 'file' GROUP BY f.category"):
+            counts[r["category"] or "其他"] = r["c"]
+        where = ["f.kind = 'file'"]
+        args = []
+        if cat:
+            where.append("f.category = ?")
+            args.append(cat)
+        if q:
+            where.append("(e.title LIKE ? OR e.tags LIKE ?)")
+            like = "%" + q + "%"
+            args += [like, like]
+        rows = conn.execute(
+            _ENTRY_COLS + " WHERE " + " AND ".join(where)
+            + " ORDER BY e.id DESC LIMIT 300", args).fetchall()
+    total_all = sum(counts.values())
+    chips = ['<a class="tag" href="files">全部（%d）</a>' % total_all]
+    for c in cats:
+        n = counts.get(c["name"], 0)
+        chips.append('<a class="tag" href="files?cat=%s">%s（%d）</a>'
+                     % (urllib.parse.quote(c["name"]), _esc(c["name"]), n))
+    opts = "".join('<option value="%s">%s</option>'
+                   % (_esc(c["name"]), _esc(c["name"])) for c in cats)
+    lines = []
+    for r in rows:
+        cur = _esc(r["category"] or "其他")
+        sel = ('<select class="recat" data-id="%d">%s</select>'
+               % (r["id"], opts)).replace(
+                   'value="%s"' % cur, 'value="%s" selected' % cur, 1)
+        lines.append(
+            '<div class="panel" style="display:flex;gap:10px;'
+            'align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+            '<a href="watch/%d" style="font-weight:600;color:#e8ecf4;'
+            'text-decoration:none">%s</a>'
+            '<span class="muted">.%s · %s · %s</span>%s'
+            '<a class="btn ghost" href="file/%s">下载</a></div>'
+            % (r["id"], _esc(r["title"]), _esc(r["ext"]),
+               _fmt_size(r["size"] or 0),
+               time.strftime("%Y-%m-%d", time.localtime(
+                   r["created_at"] or 0)), sel, r["hash"]))
+    js = ('<script>document.querySelectorAll(".recat").forEach(function(el){'
+          'el.addEventListener("change",async function(){'
+          'const r=await fetch("api/files/recategorize",{method:"POST",'
+          'headers:{"Content-Type":"application/json"},'
+          'body:JSON.stringify({id:parseInt(el.dataset.id,10),'
+          'category:el.value})});const j=await r.json();'
+          'if(j.ok){location.reload();}'
+          'else{alert(j.message||"改类失败");location.reload();}});});'
+          '</script>')
+    body = (
+        '<div class="topbar"><h1>文件</h1>'
+        '<form class="search" method="get">'
+        '<input type="search" name="q" value="%s" placeholder="搜索标题/标签">'
+        '</form>'
+        '<a class="btn ghost" href="./">← 资源库</a>'
+        '<a class="btn ghost" href="upload">上传</a></div>'
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'
+        '%s</div>%s%s'
+        % (_esc(q), "".join(chips),
+           "".join(lines) or '<div class="muted">暂无文件。</div>', js))
+    return _page("文件", body, base_href)
 
 
 def page_wall(params, base_href=""):
@@ -1953,14 +4524,16 @@ def page_wall(params, base_href=""):
         where.append("e.mark = 1")
     elif markf == "disliked":
         where.append("e.mark = 2")
-    if kind in ("video", "image"):
-        exts = sorted(VIDEO_EXTS if kind == "video" else IMAGE_EXTS)
-        where.append("LOWER(f.ext) IN (%s)" % ",".join("?" * len(exts)))
-        args += exts
+    if kind in ("video", "image", "novel", "file"):
+        where.append("f.kind = ?")
+        args.append(kind)
     elif kind == "other":
-        exts = sorted(VIDEO_EXTS | IMAGE_EXTS)
-        where.append("LOWER(f.ext) NOT IN (%s)" % ",".join("?" * len(exts)))
-        args += exts
+        where.append("f.kind IN ('novel', 'file')")
+    lib_param = (params.get("lib") or "").strip()
+    lib_row = _library_by_id(lib_param) if lib_param else None
+    if lib_row is not None and lib_row["kind"] == "video":
+        where.append("e.library_id = ?")
+        args.append(lib_row["id"])
     sql_where = (" WHERE " + " AND ".join(where)) if where else ""
     per = 60
     with _db() as conn:
@@ -1998,9 +4571,9 @@ def page_wall(params, base_href=""):
                _fmt_duration(r["duration"]), _esc(r["title"]),
                _status_chip(r["status"]),
                _fmt_size(r["size"]), date,
-               {"image": " · 图片",
-                "other": " · 文件(.%s)" % (r["ext"] or "?")}.get(
-                    _kind(r["ext"]), "")
+               {"image": " · 图片", "novel": " · 小说",
+                "file": " · 文件(.%s)" % (r["ext"] or "?")}.get(
+                    r["kind"] or _kind(r["ext"]), "")
                + ((" · " + _esc(r["tags"])) if r["tags"] else "")
                + (" · ❤ 喜欢" if (r["mark"] or 0) == 1 else
                   " · 不喜欢" if (r["mark"] or 0) == 2 else "")))
@@ -2015,8 +4588,20 @@ def page_wall(params, base_href=""):
                 links.append('<a href="?%spage=%d">%d</a>'
                              % ((qs + "&") if qs else "", p, p))
         pager = '<div style="margin-top:16px">%s</div>' % " ".join(links)
+    lib_tabs = ""
+    vlibs = _libraries("video")
+    if len(vlibs) > 1:
+        tbits = ['<a class="tag" href="?kind=video">全部库</a>']
+        for l in vlibs:
+            mark = (" <strong>· 当前</strong>"
+                    if lib_row is not None and lib_row["id"] == l["id"]
+                    else "")
+            tbits.append('<a class="tag" href="?kind=video&lib=%d">%s</a>%s'
+                         % (l["id"], _esc(l["name"]), mark))
+        lib_tabs = ('<div style="display:flex;gap:6px;flex-wrap:wrap;'
+                    'margin-bottom:12px">' + "".join(tbits) + "</div>")
     body = (
-        '<div class="topbar"><h1>视频库</h1>'
+        '<div class="topbar"><h1>资源库</h1>'
         '<form method="get"><input type="text" name="q" value="%s" '
         'placeholder="搜索标题 / 标签 / 来源…">'
         '<select name="dur">'
@@ -2029,16 +4614,17 @@ def page_wall(params, base_href=""):
         '<option value="">全部类型</option>'
         '<option value="video"%s>视频</option>'
         '<option value="image"%s>图片</option>'
-        '<option value="other"%s>其他</option></select>'
+        '<option value="novel"%s>小说</option>'
+        '<option value="file"%s>文件</option></select>'
         '<select name="mark">'
         '<option value="">全部标记</option>'
         '<option value="liked"%s>❤ 喜欢</option>'
         '<option value="disliked"%s>不喜欢</option></select>'
         '<button type="submit">搜索</button></form>'
-        '<a class="btn" href="feed">刷视频</a>'
+        '<a class="btn ghost" href="./">总览</a>''<a class="btn" href="feed">刷视频</a>'
         '<a class="btn" href="upload">上传</a>'
         '<a class="btn ghost" href="admin">管理</a></div>'
-        '<div style="margin-bottom:12px;font-size:13px">共 %d 个条目 %s</div>'
+        '<div style="margin-bottom:8px;font-size:13px">共 %d 个条目 %s</div>%s'
         '<div class="grid">%s</div>%s'
         '<div class="batchbar" id="batchbar"><span id="batchn"></span>'
         '<button type="button" id="batchexport">导出下载列表</button>'
@@ -2064,27 +4650,35 @@ def page_wall(params, base_href=""):
            ' selected' if dur == "2" else '', ' selected' if dur == "3" else '',
            ' selected' if kind == "video" else '',
            ' selected' if kind == "image" else '',
-           ' selected' if kind == "other" else '',
+           ' selected' if kind == "novel" else '',
+           ' selected' if kind == "file" else '',
            ' selected' if markf == "liked" else '',
            ' selected' if markf == "disliked" else '',
-           total, ("· 标签：" + tag_links) if tag_links else "",
+           total, ("· 标签：" + tag_links) if tag_links else "", lib_tabs,
            "".join(cards) or '<div class="empty">还没有视频。点右上角「上传」添加第一个。</div>',
            pager))
-    return _page("视频库", body, base_href=base_href)
+    return _page("视频", body, base_href=base_href)
 
 
 def page_watch(entry, base_href=""):
     if entry is None:
         return None
     playable = (entry["f_ext"] or "") in PLAYABLE_EXTS
-    kind = _kind(entry["f_ext"])
+    kind = entry["f_kind"] or _kind(entry["f_ext"])
     if kind == "image":
         media_html = (
             '<img id="v" src="thumb/%s" alt="" '
             'style="width:100%%;border-radius:12px;background:#111">'
             % entry["hash"])
         note_html = ""
-    elif kind == "other":
+    elif kind == "novel":
+        media_html = (
+            '<div id="v" class="panel" style="text-align:center">'
+            '<a class="btn" href="read/%d">📖 打开阅读</a>'
+            '<div style="margin-top:8px;color:#9db2c8">txt 小说 · '
+            '在线阅读带章节目录与进度记忆。</div></div>' % entry["id"])
+        note_html = ""
+    elif kind == "file":
         media_html = (
             '<div id="v" class="panel" style="text-align:center;'
             'color:#9db2c8">这个文件（.%s）不支持在线预览，'
@@ -2191,6 +4785,7 @@ UPLOAD_PAGE = r"""<div class="topbar"><a class="btn ghost" href="./">← 返回<
 <span id="picked" style="font-size:13px;color:#8b94a7"></span>
 </div>
 <div style="color:#8b94a7;font-size:13px">也可以把文件或整个文件夹拖到这个面板里松手。文件夹上传会保留目录路径并自动变成标签（和 WebDAV 拖文件夹一致，如 trip/day1）；0 字节和系统文件（.DS_Store、Thumbs.db 等）会自动跳过。</div>
+<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span style="font-size:13px;color:#8b94a7">视频入库到</span><select id="libsel">__LIB_OPTIONS__</select><span style="font-size:12px;color:#8b94a7">（仅对视频生效；图片 / 小说 / 文件自动归类）</span></div>
 <input type="text" id="tags" placeholder="标签（应用于本批，逗号分隔）" maxlength="200">
 <input type="text" id="source" placeholder="来源（应用于本批）" maxlength="120">
 <span><button id="go" type="button">开始上传</button> <span class="msg" id="msg"></span></span>
@@ -2357,7 +4952,8 @@ async function runJob(job){const f=job.file;
       try{reg=await jpost("api/uploads/register",{digest:digest,
         name:f.name,tags:document.getElementById("tags").value,
         source:document.getElementById("source").value,
-        relpath:job.rel});}catch(e){reg=null;}
+        relpath:job.rel,
+        library_id:document.getElementById("libsel").value});}catch(e){reg=null;}
       if(reg&&reg.ok){
         job.done=true;job.state="ok";job.dup=true;
         job.barEl.style.width="100%";hideX(job);
@@ -2369,7 +4965,8 @@ async function runJob(job){const f=job.file;
   title:base.replace(/\.[^.]+$/,""),
   tags:document.getElementById("tags").value,
   source:document.getElementById("source").value,
-  relpath:job.rel});}catch(e){init=null;}
+  relpath:job.rel,
+  library_id:document.getElementById("libsel").value});}catch(e){init=null;}
   if(!init){noteNetFail();job.state="queue";
   job.stEl.textContent="初始化遇网络异常，恢复后自动重试";layout();return;}
   if(!init.ok){job.state="fail";job.done=true;
@@ -2551,7 +5148,8 @@ dz.addEventListener("drop",async e=>{e.preventDefault();dz.style.outline="";
 
 def page_upload(base_href=""):
     body = UPLOAD_PAGE.replace(
-        "__BUDGET__", _fmt_size(STAGING_BUDGET))
+        "__BUDGET__", _fmt_size(STAGING_BUDGET)).replace(
+        "__LIB_OPTIONS__", _lib_options_html())
     return _page("上传", body, base_href=base_href)
 
 def _admin_data():
@@ -2565,7 +5163,8 @@ def _admin_data():
             "dav_set": bool(_load_creds().get("dav_pass_hash")),
             "last_backup": kv_get("last_backup_at", ""),
             "last_backup_error": kv_get("last_backup_error", ""),
-            "queue": []}
+            "queue": [], "video_libraries": [], "file_categories": [],
+            "novels": [], "kind_counts": {}, "kind_status": {}}
     with _db() as conn:
         for r in conn.execute(
                 "SELECT status, COUNT(*) c FROM files GROUP BY status"):
@@ -2576,6 +5175,29 @@ def _admin_data():
             "SELECT hash, ext, status, error, retries FROM files "
             "WHERE status IN ('local', 'uploading', 'error') "
             "ORDER BY created_at LIMIT 50")]
+        data["video_libraries"] = [dict(r) for r in conn.execute(
+            "SELECT l.*, (SELECT COUNT(*) FROM entries e "
+            "WHERE e.library_id = l.id) AS n FROM libraries l "
+            "WHERE l.kind = 'video' ORDER BY l.is_default DESC, l.id")]
+        data["file_categories"] = _file_categories()
+        data["novels"] = [dict(r) for r in conn.execute(
+            "SELECT e.id AS id, e.title AS title, "
+            "m.char_count AS chars, m.chapters AS chaps, "
+            "COALESCE(m.title_len, 0) AS title_len, "
+            "COALESCE(m.split_stats, '') AS split_stats "
+            "FROM entries e JOIN files f ON f.hash = e.hash "
+            "LEFT JOIN novel_meta m ON m.hash = e.hash "
+            "WHERE f.kind = 'novel' ORDER BY e.id")]
+        data["kind_counts"] = {r["kind"]: r["c"] for r in conn.execute(
+            "SELECT f.kind AS kind, COUNT(*) AS c "
+            "FROM entries e JOIN files f "
+            "ON f.hash = e.hash GROUP BY f.kind")}
+        data["kind_status"] = {}
+        for r in conn.execute(
+                "SELECT kind, status, COUNT(*) AS c "
+                "FROM files GROUP BY kind, status"):
+            data["kind_status"].setdefault(
+                r["kind"], {})[r["status"]] = r["c"]
     try:
         st = ALIST.drive_storage()
         data["alist_ok"] = True
@@ -2587,7 +5209,7 @@ def _admin_data():
     return data
 
 
-def page_admin(base_href=""):
+def _admin_sections():
     d = _admin_data()
     counts = " · ".join("%s %d" % ({"archived": "已归档", "local": "待归档",
                                     "uploading": "归档中",
@@ -2610,9 +5232,398 @@ def page_admin(base_href=""):
     if d["storage"]:
         storage_line = "%s · 状态 %s" % (d["storage"]["driver"],
                                          d["storage"]["status"])
-    body = (
-        '<div class="topbar"><a class="btn ghost" href="./">← 返回</a>'
-        '<h1>管理</h1></div>'
+    lib_rows = []
+    for l in d["video_libraries"]:
+        dele = ('<button type="button" class="danger" data-del="%d">删除</button>'
+                % l["id"]) if (not l["is_default"] and not l["n"]) else ""
+        lib_rows.append(
+            '<div style="display:flex;gap:8px;align-items:center;margin:6px 0">'
+            '<input type="text" class="libname" data-id="%d" value="%s" '
+            'style="flex:1">'
+            '<span class="muted">%d 条%s</span>%s</div>'
+            % (l["id"], _esc(l["name"]), l["n"],
+               " · 默认库" if l["is_default"] else "", dele))
+    cat_rows = []
+    for c in d["file_categories"]:
+        cat_rows.append(
+            '<div style="display:flex;gap:8px;align-items:center;margin:6px 0">'
+            '<input type="text" class="fcname" value="%s" style="width:130px">'
+            '<input type="text" class="fcexts" value="%s" style="flex:1" '
+            'placeholder="扩展名，空格分隔；留空 = 兜底类别">'
+            '<button type="button" class="danger fcdel">删除行</button></div>'
+            % (_esc(c["name"]), _esc(c["exts"])))
+    ntl_rows = []
+    for nv in d["novels"]:
+        try:
+            _nch = len(json.loads(nv["chaps"] or "[]"))
+        except Exception:
+            _nch = 0
+        try:
+            _st = json.loads(nv["split_stats"] or "")
+        except Exception:
+            _st = None
+        _stline = ""
+        if isinstance(_st, dict) and (
+                _st.get("rule") or _st.get("ai")
+                or _st.get("fixed") or _st.get("mechanical")):
+            _seg = []
+            if _st.get("rule"):
+                _seg.append("规则 %d 章" % _st["rule"])
+            if _st.get("ai"):
+                _seg.append("AI %d 章" % _st["ai"])
+            if _st.get("fixed"):
+                _seg.append("固定 %d 章" % _st["fixed"])
+            if _st.get("mechanical"):
+                _seg.append("机械 %d 段" % _st["mechanical"])
+            _txt = "上次切分定界：" + " · ".join(_seg)
+            if _st.get("ai") and _st.get("model"):
+                _txt += "（模型 %s）" % _st["model"]
+            if _st.get("fallback"):
+                _txt += "；回退：%s" % _st["fallback"]
+            _stline = ('<div class="muted" '
+                       'style="margin:-2px 0 6px">%s</div>'
+                       % _esc(_txt))
+        ntl_rows.append(
+            '<div class="ntlitem"><div style="display:flex;'
+            'gap:8px;align-items:center;margin:6px 0">'
+            '<span class="ntltitle" style="flex:1">%s</span>'
+            '<span class="muted">%d 章 · %s · 标题字数</span>'
+            '<input type="number" class="ntlen" data-id="%d" '
+            'value="%d" min="0" max="30" style="width:64px">'
+            '<button type="button" class="ntlsave" data-id="%d">'
+            '保存并重切</button></div>'
+            % (_esc(nv["title"] or ""), _nch, _fmt_wchars(nv["chars"]),
+               nv["id"], nv["title_len"] or 0, nv["id"])
+            + _stline + '</div>')
+    sec_videos = (
+        '<div class="panel"><h2>视频主题库</h2>'
+        + "".join(lib_rows)
+        + '<div style="display:flex;gap:8px;margin-top:10px">'
+        '<button type="button" id="libsave">保存名称</button>'
+        '<input type="text" id="libnew" placeholder="新库名" style="flex:1">'
+        '<button type="button" id="libadd">＋ 添加库</button></div>'
+        '<div id="libmsg" class="muted"></div></div>'
+        )
+    sec_filecats = (
+        '<div class="panel"><h2>文件类别规则</h2>'
+        '<div id="fcrows">' + "".join(cat_rows) + '</div>'
+        + '<div style="display:flex;gap:8px;margin-top:10px">'
+        '<button type="button" id="fcadd">＋ 添加一行</button>'
+        '<button type="button" id="fcsave">保存全部规则</button></div>'
+        '<div class="muted">入库时按扩展名自上而下命中第一个类别；'
+        '扩展名留空的一行是兜底类别（命不中进它）。改规则只影响新入库；'
+        '已入库文件在「文件」页逐个改类。</div>'
+        '<div id="fcmsg" class="muted"></div></div>')
+    sec_ext = (
+        '<div class="panel"><h2>\u624b\u673a\u4e66\u6e90'
+        '\uff08\u641c\u4e66\u5927\u5e08 / \u9605\u8bfb\uff09</h2>'
+        '<div class="kv">\u5bfc\u5165\u5730\u5740\uff1a<code>'
+        + _esc(_ext_import_url()) +
+        '</code></div>'
+        '<p style="color:#8b94a7;font-size:13px;line-height:1.7">'
+        '\u5728\u624b\u673a\u9605\u8bfb App \u91cc\u9009'
+        '\u300c\u5bfc\u5165\u4e66\u6e90 \u2192 \u7f51\u7edc'
+        '\u5bfc\u5165\u300d\uff0c\u7c98\u8d34\u4e0a\u9762'
+        '\u7684\u5730\u5740\uff0c\u5373\u53ef\u628a\u8d44'
+        '\u6e90\u5e93\u91cc\u7684\u5c0f\u8bf4\u5f53\u4f5c'
+        '\u4e00\u4e2a\u4e66\u6e90\u641c\u7d22\u3001\u9605'
+        '\u8bfb\u3002\u91cd\u7f6e\u4ee4\u724c\u540e\u65e7'
+        '\u5730\u5740\u7acb\u5373\u5931\u6548\u3002</p>'
+        '<p><button type="button" id="extreset">'
+        '\u91cd\u7f6e\u4ee4\u724c</button> '
+        '<span class="msg" id="extmsg"></span></p></div>')
+    sec_js_videos = (
+        '<script>'
+        'async function postJ(u,b){const r=await fetch(u,{method:"POST",'
+        'headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});'
+        'return r.json();}'
+        'const lm=document.getElementById("libmsg");'
+        'document.getElementById("libsave").onclick=async function(){'
+        'const ren={};'
+        'document.querySelectorAll(".libname").forEach(function(el){'
+        'ren[el.dataset.id]=el.value;});'
+        'const j=await postJ("api/admin/libraries",{renames:ren});'
+        'lm.textContent=j.message||(j.ok?"已保存。":"失败");'
+        'if(j.ok)setTimeout(function(){location.reload();},700);};'
+        'document.getElementById("libadd").onclick=async function(){'
+        'const v=document.getElementById("libnew").value.trim();if(!v)return;'
+        'const j=await postJ("api/admin/libraries",{add_name:v});'
+        'lm.textContent=j.message||"";if(j.ok)location.reload();};'
+        'document.querySelectorAll("[data-del]").forEach(function(el){'
+        'el.onclick=async function(){'
+        'if(!confirm("删除这个空库？"))return;'
+        'const j=await postJ("api/admin/libraries",'
+        '{delete_id:parseInt(el.dataset.del,10)});'
+        'lm.textContent=j.message||"";if(j.ok)location.reload();};});'
+        '</script>')
+    sec_js_filecats = (
+        '<script>'
+        'async function postJ(u,b){const r=await fetch(u,{method:"POST",'
+        'headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});'
+        'return r.json();}'
+        'const fcrows=document.getElementById("fcrows");'
+        'const fm=document.getElementById("fcmsg");'
+        'function bindDel(){document.querySelectorAll(".fcdel").forEach('
+        'function(el){el.onclick=function(){'
+        'el.parentElement.remove();};});}'
+        'bindDel();'
+        'document.getElementById("fcadd").onclick=function(){'
+        'const dv=document.createElement("div");'
+        'dv.style.cssText="display:flex;gap:8px;align-items:center;margin:6px 0";'
+        'dv.innerHTML="<input type=\'text\' class=\'fcname\' '
+        'style=\'width:130px\'>'
+        '<input type=\'text\' class=\'fcexts\' style=\'flex:1\' '
+        'placeholder=\'扩展名，空格分隔；留空 = 兜底类别\'>'
+        '<button type=\'button\' class=\'danger fcdel\'>删除行</button>\";'
+        'fcrows.appendChild(dv);bindDel();};'
+        'document.getElementById("fcsave").onclick=async function(){'
+        'const items=[];'
+        'fcrows.querySelectorAll(":scope > div").forEach(function(row){'
+        'const n=row.querySelector(".fcname"),e=row.querySelector(".fcexts");'
+        'if(n&&e)items.push({name:n.value,exts:e.value});});'
+        'const j=await postJ("api/admin/filecats",{items:items});'
+        'fm.textContent=j.message||(j.ok?"已保存。":"失败");'
+        'if(j.ok)setTimeout(function(){location.reload();},700);};'
+        '</script>')
+    sec_js_ext = (
+        '<script>'
+        'document.getElementById("extreset").onclick=async function(){'
+        'if(!confirm("\u91cd\u7f6e\u540e\u65e7\u5bfc\u5165'
+        '\u5730\u5740\u7acb\u5373\u5931\u6548\uff0c\u624b'
+        '\u673a\u4e0a\u9700\u91cd\u65b0\u5bfc\u5165\u3002'
+        '\u7ee7\u7eed\uff1f"))return;'
+        'const j=await postJ("api/admin/ext-token",{});'
+        'const m=document.getElementById("extmsg");'
+        'm.textContent=j.ok?"\u5df2\u91cd\u7f6e\uff0c\u9875'
+        '\u9762\u5237\u65b0\u4e2d\u2026":'
+        '("\u5931\u8d25\uff1a"+(j.message||""));'
+        'if(j.ok)setTimeout(function(){location.reload();},700);};'
+        '</script>')
+    _ai_key, _ai_model, _ai_on = _ai_title_config()
+    _ai_batch = _ai_batch_size()
+    _ai_stats_rows = []
+    _ai_latest = None
+    for nv in d["novels"]:
+        try:
+            _s = json.loads(nv["split_stats"] or "")
+        except Exception:
+            _s = None
+        if not isinstance(_s, dict):
+            _s = None
+        _ai_stats_rows.append((nv, _s))
+        if _s and (_s.get("ai") or 0) > 0:
+            if _ai_latest is None or (_s.get("at") or 0) > (
+                    _ai_latest[1].get("at") or 0):
+                _ai_latest = (nv, _s)
+    _ai_recent = "暂无"
+    if _ai_latest is not None:
+        _nv0, _s0 = _ai_latest
+        _when0 = "时间未记录"
+        if _s0.get("at"):
+            _when0 = time.strftime("%Y-%m-%d %H:%M",
+                                   time.localtime(_s0["at"]))
+        _ai_recent = "《%s》 · %s · AI 定界 %d 章%s" % (
+            _nv0["title"] or "", _when0, _s0.get("ai") or 0,
+            (" · 模型 " + str(_s0["model"]))
+            if _s0.get("model") else "")
+    _ais_rows = []
+    for nv, _s in _ai_stats_rows:
+        if _s is None:
+            _comp = "尚无切分记录"
+            _badge = ""
+            _when = ""
+        else:
+            _segs = []
+            if _s.get("rule"):
+                _segs.append("规则 %d" % _s["rule"])
+            if _s.get("ai"):
+                _segs.append("AI %d" % _s["ai"])
+            if _s.get("fixed"):
+                _segs.append("固定 %d" % _s["fixed"])
+            if _s.get("mechanical"):
+                _segs.append("机械 %d" % _s["mechanical"])
+            _comp = " · ".join(_segs) if _segs else "无定界记录"
+            if _s.get("model"):
+                _comp += " · 模型 " + str(_s["model"])
+            _badge = ('<span class="chip" style="background:#7a2e2e;'
+                      'color:#ffc9c9">AI 定界</span> ') \
+                if (_s.get("ai") or 0) > 0 else ""
+            if (_s.get("ai_pending") or 0) > 0:
+                _badge += ('<span class="chip" '
+                           'style="background:#6b5510;'
+                           'color:#ffe1a8">待分析 %d 章</span> '
+                           % _s["ai_pending"])
+            _when = ""
+            if _s.get("at"):
+                _when = " · " + time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(_s["at"]))
+        _ais_rows.append(
+            '<div class="aiitem"><div style="display:flex;'
+            'gap:8px;align-items:center;margin:5px 0">'
+            '<span class="aititle" style="flex:1">%s%s</span>'
+            '<span class="muted">%s%s</span></div></div>'
+            % (_badge, _esc(nv["title"] or ""),
+               _esc(_comp), _esc(_when)))
+    ai_block = (
+        '<div style="border-top:1px solid #262c3d;'
+        'margin-top:12px;padding-top:10px">'
+        '<div class="kv">AI 标题定界（OpenRouter）：'
+        'key <b>%s</b> · AI 定界 <b>%s</b></div>'
+        % ("已配置" if _ai_key else "未配置",
+           "已启用" if _ai_on else "未启用"))
+    _ai_pend_books = sum(
+        1 for _nv, _s in _ai_stats_rows
+        if _s and (_s.get("ai_pending") or 0) > 0)
+    _ai_pend_chs = sum(
+        (_s.get("ai_pending") or 0)
+        for _nv, _s in _ai_stats_rows if _s)
+    ai_block += (
+        '<div class="kv">状态总览：模型 <b>%s</b> · 批大小 '
+        '<b>%d</b> · 并发 <b>%d</b> · 单批 max_tokens 上限 '
+        '<b>%d</b>（硬顶 %d） · 单批响应字节顶 <b>%d</b></div>'
+        '<div class="kv">最近一次 AI 切分：%s</div>'
+        '<div class="kv">待分析：<b>%d 本 · %d 章</b>'
+        '（导入时只切了规则；这些书被打开阅读或被手机书源'
+        '拉目录时，才在后台补跑 AI）</div>'
+        % (_esc(_ai_model), _ai_batch, _AI_MAX_WORKERS,
+           _ai_max_tokens(_ai_batch), _AI_MAX_TOKENS_CAP,
+           _ai_resp_bytes(_ai_batch), _esc(_ai_recent),
+           _ai_pend_books, _ai_pend_chs))
+    ai_block += (
+        '<p style="color:#8b94a7;font-size:13px;line-height:1.7;'
+        'margin:8px 0 2px">触发说明：导入新书只跑规则切分，'
+        '不调用 AI；切分后仍留有可改善章节的书会被标为「待分析」。'
+        '待分析的书第一次被打开阅读、或被手机书源拉目录时，'
+        '后台才对那一本的待处理章节补跑 AI（找回章首走选界、'
+        '其余走字数判定），完成后清标记；分析中页面照常显示'
+        '旧标题，失败则保留标记、下次打开重试。管理页对某本书'
+        '「保存并重切」是明确意图，立即全量跑完（含 AI）并清'
+        '标记。平台没有后台定时调用。开关关闭或未配置 key 时，'
+        '切分全程只用规则，待分析标记也不会被触发。</p>')
+    ai_block += (
+        '<div style="display:grid;gap:9px;max-width:520px;'
+        'margin-top:8px">'
+        '<input type="password" id="aiorkey" '
+        'autocomplete="off" placeholder="填入 OpenRouter '
+        'API key（只写不回显，留空不改）">'
+        '<input type="text" id="aiormodel" value="%s" '
+        'placeholder="模型名，如 google/gemini-2.5-flash">'
+        '<label style="font-size:13px;color:#8b94a7">'
+        '<input type="checkbox" id="aioren"%s> 启用 AI 定界'
+        '（导入只切规则并标记待分析，阅读待分析的书时自动'
+        '补跑；管理页手动重切立即全量跑 AI；失败自动回退'
+        '规则）</label>'
+        '<span><button type="button" id="aiorsave">'
+        '保存 AI 设置</button> '
+        '<span class="msg" id="aiormsg"></span></span>'
+        '</div>'
+        % (_esc(_ai_model), " checked" if _ai_on else ""))
+    ai_block += (
+        '<div style="border-top:1px solid #262c3d;'
+        'margin-top:12px;padding-top:10px">'
+        '<div style="display:flex;align-items:center;'
+        'margin:6px 0"><b style="flex:1">全库切分构成</b>'
+        '<button type="button" id="aistoggle" class="ghost">'
+        '收起</button></div>'
+        '<div id="aisbody">'
+        '<div style="display:flex;gap:8px;align-items:center;'
+        'margin:6px 0">'
+        '<input type="text" id="aisearch" '
+        'placeholder="搜索书名" style="flex:1">'
+        '<span class="muted" id="aicount">共 %d 本</span></div>'
+        '<div id="aisbox" style="max-height:40vh;'
+        'overflow-y:auto">'
+        % len(_ais_rows)
+        + "".join(_ais_rows)
+        + '</div></div></div></div>')
+    sec_novels = (
+        '<div class="panel"><h2>小说切分（标题字数）'
+        '<button type="button" id="ntltoggle" class="ghost" '
+        'style="float:right">收起</button></h2>'
+        '<div id="ntlbody">'
+        '<div style="display:flex;gap:8px;align-items:center;'
+        'margin:6px 0">'
+        '<input type="text" id="ntlsearch" '
+        'placeholder="搜索书名" style="flex:1">'
+        '<span class="muted" id="ntlcount">共 %d 本</span></div>'
+        '<div id="ntlbox" style="max-height:50vh;overflow-y:auto">'
+        % len(ntl_rows)
+        + "".join(ntl_rows)
+        + '</div>'
+        + '<div class="muted">标题字数 0 = 自动：先用结构断点'
+        '定界，定不出时按本书标题长度推断，再不行默认 4 字；'
+        '填 N 时，标题与正文连排无标点则按「第X章」后固定 '
+        'N 字定界。「第X章」后紧跟的顿号等标点不计入字数。'
+        '保存后立即按新值重切该书。</div>'
+        '<div id="ntlmsg" class="muted"></div>' + ai_block
+        + '</div></div>')
+    sec_js_novels = (
+        '<script>'
+        'document.querySelectorAll(".ntlsave").forEach(function(b){'
+        'b.onclick=async function(){'
+        'let inp=null;'
+        'document.querySelectorAll(".ntlen").forEach(function(x){'
+        'if(x.dataset.id===b.dataset.id)inp=x;});'
+        'const j=await postJ("api/admin/novel/title-len",'
+        '{entry_id:parseInt(b.dataset.id),'
+        'title_len:parseInt((inp&&inp.value)||"0")});'
+        'const m=document.getElementById("ntlmsg");'
+        'm.textContent=j.ok?("已重切：" + j.chapters + " 章"):'
+        '("失败：" + (j.message || ""));'
+        'if(j.ok)setTimeout(function(){location.reload();},900);};});'
+        'var ntg=document.getElementById("ntltoggle"),'
+        'nbd=document.getElementById("ntlbody");'
+        'if(ntg&&nbd)ntg.onclick=function(){'
+        'var hid=nbd.style.display==="none";'
+        'nbd.style.display=hid?"":"none";'
+        'ntg.textContent=hid?"收起":"展开";};'
+        'var nsr=document.getElementById("ntlsearch"),'
+        'nct=document.getElementById("ntlcount"),'
+        'nitems=document.querySelectorAll(".ntlitem");'
+        'if(nsr)nsr.oninput=function(){'
+        'var q=nsr.value.trim().toLowerCase(),vis=0;'
+        'nitems.forEach(function(it){'
+        'var t=it.querySelector(".ntltitle");'
+        'var hit=!q||(t&&t.textContent.toLowerCase()'
+        '.indexOf(q)>=0);'
+        'it.style.display=hit?"":"none";if(hit)vis++;});'
+        'if(nct)nct.textContent=q?(vis+" / "+nitems.length):'
+        '("共 "+nitems.length+" 本");};'
+        '</script>')
+    sec_js_novels += (
+        '<script>'
+        'document.getElementById("aiorsave").onclick=async function(){'
+        'const j=await postJ("api/admin/novel/ai-config",'
+        '{openrouter_key:document.getElementById("aiorkey").value,'
+        'model:document.getElementById("aiormodel").value,'
+        'enabled:document.getElementById("aioren").checked});'
+        'const m=document.getElementById("aiormsg");'
+        'm.textContent=j.ok?"已保存，页面刷新中…":'
+        '("失败：" + (j.message || ""));'
+        'if(j.ok)setTimeout(function(){location.reload();},800);};'
+        '</script>')
+    sec_js_novels += (
+        '<script>'
+        'var atg=document.getElementById("aistoggle"),'
+        'abd=document.getElementById("aisbody");'
+        'if(atg&&abd)atg.onclick=function(){'
+        'var hid=abd.style.display==="none";'
+        'abd.style.display=hid?"":"none";'
+        'atg.textContent=hid?"收起":"展开";};'
+        'var asr=document.getElementById("aisearch"),'
+        'act=document.getElementById("aicount"),'
+        'aitems=document.querySelectorAll(".aiitem");'
+        'if(asr)asr.oninput=function(){'
+        'var q=asr.value.trim().toLowerCase(),vis=0;'
+        'aitems.forEach(function(it){'
+        'var t=it.querySelector(".aititle");'
+        'var hit=!q||(t&&t.textContent.toLowerCase()'
+        '.indexOf(q)>=0);'
+        'it.style.display=hit?"":"none";if(hit)vis++;});'
+        'if(act)act.textContent=q?(vis+" / "+aitems.length):'
+        '("共 "+aitems.length+" 本");};'
+        '</script>')
+    sec_status = (
         '<div class="panel"><h2>状态</h2><div class="kv">'
         'AList：<b>%s</b>%s<br>谷歌硬盘存储：<b>%s</b><br>'
         '文件：<b>%s</b> · 条目：<b>%d</b><br>'
@@ -2621,17 +5632,33 @@ def page_admin(base_href=""):
         '数据库备份：<b>%s</b>%s</div>'
         '<p><button type="button" id="backup">立即备份数据库</button> '
         '<span class="msg" id="bmsg"></span></p></div>'
+        ) % ("已连接" if d["alist_ok"] else "不可达",
+           ("（" + _esc(d["alist_error"]) + "）") if d["alist_error"] else "",
+           storage_line, counts, d["entries"],
+           _fmt_size(d["staging"]), _fmt_size(STAGING_BUDGET),
+           _fmt_size(d["disk_free"]),
+           "已配置" if d["alist_pass_set"] else "未配置",
+           "已导入" if d["google_token_set"] else "未导入",
+           "已导入" if d["google_client_set"] else "未导入",
+           "已设置" if d["dav_set"] else "未设置",
+           last_backup,
+           ("<br><span class='err'>上次备份错误：" + _esc(d["last_backup_error"]) + "</span>")
+           if d["last_backup_error"] else "",
+        )
+    sec_dav = (
         '<div class="panel"><h2>WebDAV（RaiDrive / rclone 挂载）</h2>'
         '<div class="kv">地址：<code>https://debi.su7.dpdns.org/dav/</code>'
         '（IPv4 可用 debi4 同地址）<br>用户名：<code>dav</code> · 密码：<b>%s</b></div>'
         '<p style="color:#8b94a7;font-size:13px;line-height:1.7">'
-        '目录按上传月份自动生成（YYYY-MM），文件名就是条目标题；改名、删除只动数据库条目，'
+        '顶层是视频库名，库内按上传月份自动生成（YYYY-MM），根目录上传仍进默认库当月；文件名就是条目标题；改名、删除只动数据库条目，'
         '源文件按哈希存放在谷歌硬盘，删条目后无引用的源文件保留一周再清理。'
         '跨月份移动请在网页里改（WebDAV 内会拒绝）。</p>'
         '<div style="display:grid;gap:9px;max-width:420px">'
         '<input type="password" id="davpw" placeholder="设置 / 修改 WebDAV 密码（至少 8 位）" autocomplete="new-password">'
         '<span><button type="button" id="davset">保存 WebDAV 密码</button> '
         '<span class="msg" id="davmsg"></span></span></div></div>'
+        ) % ("已设置" if d["dav_set"] else "未设置（WebDAV 暂不可用）",)
+    sec_connect = (
         '<div class="panel"><h2>连接谷歌硬盘</h2>'
         '<p style="color:#8b94a7;font-size:13px;line-height:1.75;margin-top:0">'
         '令牌工具需要用你自己的谷歌 OAuth 客户端（它不再提供可用的默认客户端），一次性设置：'
@@ -2651,7 +5678,9 @@ def page_admin(base_href=""):
         '<input type="text" id="gfolder" placeholder="根目录文件夹 ID（可选）" value="%s">'
         '<span><button type="button" id="connect">保存并连接</button> '
         '<span class="msg" id="cmsg"></span></span></div></div>'
-        '<div class="panel"><h2>归档队列</h2>%s</div>'
+        ) % (_esc(_cred("google_root_folder_id")),)
+    sec_queue = '<div class="panel"><h2>归档队列</h2>%s</div>' % queue_rows
+    sec_js_settings = (
         '<script>'
         'async function jpost(u,b){const r=await fetch(u,{method:"POST",'
         'headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});'
@@ -2675,22 +5704,130 @@ def page_admin(base_href=""):
         'document.querySelectorAll(".retry").forEach(b=>b.onclick=async()=>{'
         'await jpost("api/admin/retry",{hash:b.dataset.h});location.reload();});'
         '</script>'
-        % ("已连接" if d["alist_ok"] else "不可达",
-           ("（" + _esc(d["alist_error"]) + "）") if d["alist_error"] else "",
-           storage_line, counts, d["entries"],
-           _fmt_size(d["staging"]), _fmt_size(STAGING_BUDGET),
-           _fmt_size(d["disk_free"]),
-           "已配置" if d["alist_pass_set"] else "未配置",
-           "已导入" if d["google_token_set"] else "未导入",
-           "已导入" if d["google_client_set"] else "未导入",
-           "已设置" if d["dav_set"] else "未设置",
-           last_backup,
-           ("<br><span class='err'>上次备份错误：" + _esc(d["last_backup_error"]) + "</span>")
-           if d["last_backup_error"] else "",
-           "已设置" if d["dav_set"] else "未设置（WebDAV 暂不可用）",
-           _esc(_cred("google_root_folder_id")),
-           queue_rows))
+    )
+    sec_settings = (sec_status + sec_dav + sec_connect + sec_queue)
+    return {"videos": sec_videos, "js_videos": sec_js_videos,
+            "filecats": sec_filecats, "js_filecats": sec_js_filecats,
+            "ext": sec_ext, "js_ext": sec_js_ext,
+            "novels": sec_novels, "js_novels": sec_js_novels,
+            "settings": sec_settings, "js_settings": sec_js_settings}
+
+
+_ADMIN_TITLES = {"videos": "视频", "images": "图片",
+                 "novels": "小说", "files": "文件",
+                 "settings": "通用设置"}
+
+
+def _admin_topbar(section=None):
+    if section is None:
+        return ('<div class="topbar"><a class="btn ghost" '
+                'href="./">← 返回</a><h1>管理</h1></div>')
+    return ('<div class="topbar"><a class="btn ghost" '
+            'href="admin">← 管理</a><h1>管理 · %s</h1></div>'
+            % _ADMIN_TITLES[section])
+
+
+def page_admin(base_href=""):
+    d = _admin_data()
+    kc = d["kind_counts"]
+    ks = d["kind_status"]
+    pend_books = 0
+    pend_chs = 0
+    for nv in d["novels"]:
+        try:
+            _s = json.loads(nv["split_stats"] or "")
+        except Exception:
+            _s = None
+        if isinstance(_s, dict):
+            _p = _s.get("ai_pending") or 0
+            if _p:
+                pend_books += 1
+                pend_chs += _p
+    queue_n = sum(d["counts"].get(k, 0)
+                  for k in ("local", "uploading", "error"))
+    last_backup = ("从未" if not d["last_backup"] else
+                   time.strftime("%Y-%m-%d %H:%M",
+                                 time.localtime(
+                                     float(d["last_backup"]))))
+    cards = (
+        ("admin/videos", "视频",
+         "%d 个主题库 · %d 条视频"
+         % (len(d["video_libraries"]), kc.get("video", 0))),
+        ("admin/images", "图片",
+         "共 %d 张 · 已归档 %d"
+         % (kc.get("image", 0),
+            ks.get("image", {}).get("archived", 0))),
+        ("admin/novels", "小说",
+         "共 %d 本 · 待分析 %d 本 · %d 章"
+         % (len(d["novels"]), pend_books, pend_chs)),
+        ("admin/files", "文件",
+         "%d 个类别 · %d 个文件"
+         % (len(d["file_categories"]), kc.get("file", 0))),
+        ("admin/settings", "通用设置",
+         "AList %s · 待归档 %d · 上次备份 %s"
+         % ("已连接" if d["alist_ok"] else "不可达",
+            queue_n, last_backup)),
+    )
+    body = (_admin_topbar()
+            + '<div class="grid">'
+            + "".join(
+                '<a class="card" href="%s"><div class="t">%s</div>'
+                '<div class="m">%s</div></a>' % c for c in cards)
+            + '</div>')
     return _page("管理", body, base_href=base_href)
+
+
+def page_admin_videos(base_href=""):
+    s = _admin_sections()
+    return _page("管理 · 视频",
+                 _admin_topbar("videos") + s["videos"]
+                 + s["js_videos"],
+                 base_href=base_href)
+
+
+def page_admin_images(base_href=""):
+    d = _admin_data()
+    ks = d["kind_status"].get("image", {})
+    labels = {"archived": "已归档", "local": "待归档",
+              "uploading": "归档中", "error": "失败"}
+    dist = " · ".join("%s %d" % (labels.get(k, k), v)
+                      for k, v in sorted(ks.items())) or "暂无"
+    body = (_admin_topbar("images")
+            + '<div class="panel"><h2>图片</h2>'
+            '<div class="kv">图片条目：<b>%d</b><br>'
+            '文件状态：<b>%s</b></div>'
+            '<p style="color:#8b94a7;font-size:13px;'
+            'line-height:1.7">图片没有专属的管理项：上传与'
+            '浏览在图片页完成，归档走全库统一管线（状态与'
+            '队列在「通用设置」里看）。</p>'
+            '<p><a class="btn" href="images">打开图片页</a>'
+            '</p></div>'
+            % (d["kind_counts"].get("image", 0), dist))
+    return _page("管理 · 图片", body, base_href=base_href)
+
+
+def page_admin_novels(base_href=""):
+    s = _admin_sections()
+    return _page("管理 · 小说",
+                 _admin_topbar("novels") + s["ext"] + s["novels"]
+                 + s["js_ext"] + s["js_novels"],
+                 base_href=base_href)
+
+
+def page_admin_files(base_href=""):
+    s = _admin_sections()
+    return _page("管理 · 文件",
+                 _admin_topbar("files") + s["filecats"]
+                 + s["js_filecats"],
+                 base_href=base_href)
+
+
+def page_admin_settings(base_href=""):
+    s = _admin_sections()
+    return _page("管理 · 通用设置",
+                 _admin_topbar("settings") + s["settings"]
+                 + s["js_settings"],
+                 base_href=base_href)
 
 
 # ------------------------------------------------------------ WebDAV
@@ -2715,43 +5852,71 @@ def _dav_segments(path):
     return parts
 
 
-def _dav_href(environ, segments):
+def _dav_library_by_name(name):
+    if not name or _MONTH_RE.fullmatch(name):
+        return None
+    for l in _libraries("video"):
+        if l["name"] == name:
+            return l
+    return None
+
+
+def _dav_resolve(segments):
+    """Split a DAV path into (library, rest): a leading library
+    name picks that library; a leading month or anything else
+    lands in the default library (legacy paths keep working)."""
+    if segments:
+        lib = _dav_library_by_name(segments[0])
+        if lib is not None:
+            return lib, list(segments[1:])
+    return _default_library("video"), list(segments)
+
+
+def _dav_href(environ, segments, is_col=None):
     scheme = environ.get("HTTP_X_FORWARDED_PROTO") or "https"
     host = environ.get("HTTP_HOST") or "debi.su7.dpdns.org"
     path = "/dav/" + "/".join(
         urllib.parse.quote(s, safe="") for s in segments)
-    if segments == [] or (segments and _folder_exists(segments[0])
-                          and len(segments) == 1):
+    if is_col is None:
+        is_col = (not segments or len(segments) == 1
+                  or (len(segments) == 2
+                      and bool(_MONTH_RE.fullmatch(segments[1] or ""))))
+    if is_col:
         path += "/"
     return "%s://%s%s" % (scheme, host, path)
 
 
-def _folder_exists(folder):
+def _folder_exists(library_id, folder):
     if not re.fullmatch(r"\d{4}-\d{2}", folder or ""):
         return False
     if folder == _folder_of(time.time()):
         return True  # the current upload month always exists
     with _db() as conn:
-        row = conn.execute("SELECT COUNT(*) c FROM entries WHERE folder = ?",
-                           (folder,)).fetchone()
+        row = conn.execute(
+            "SELECT COUNT(*) c FROM entries WHERE folder = ? "
+            "AND library_id = ?", (folder, library_id)).fetchone()
     return row["c"] > 0
 
 
-def _dav_folders():
+def _dav_folders(library_id):
     with _db() as conn:
         return [r["folder"] for r in conn.execute(
-            "SELECT DISTINCT folder FROM entries ORDER BY folder DESC")]
+            "SELECT DISTINCT e.folder AS folder FROM entries e "
+            "JOIN files f ON f.hash = e.hash "
+            "WHERE e.library_id = ? AND f.kind = 'video' "
+            "ORDER BY e.folder DESC", (library_id,))]
 
 
-def _dav_entries_in(folder):
+def _dav_entries_in(library_id, folder):
     with _db() as conn:
         return conn.execute(
-            _ENTRY_COLS + "WHERE e.folder = ? ORDER BY e.title",
-            (folder,)).fetchall()
+            _ENTRY_COLS + "WHERE e.folder = ? AND e.library_id = ? "
+            "AND f.kind = 'video' ORDER BY e.title",
+            (folder, library_id)).fetchall()
 
 
-def _dav_find(folder, filename):
-    for row in _dav_entries_in(folder):
+def _dav_find(library_id, folder, filename):
+    for row in _dav_entries_in(library_id, folder):
         if (row["title"] + "." + (row["ext"] or "")) == filename:
             return row
     return None
@@ -2769,7 +5934,7 @@ def _dav_response_xml(environ, items):
     quota = None
     for seg, is_col, size, mtime, ctype, etag in items:
         out.append("<D:response><D:href>%s</D:href>"
-                   % _esc(_dav_href(environ, seg)))
+                   % _esc(_dav_href(environ, seg, is_col)))
         out.append("<D:propstat><D:prop>")
         out.append("<D:displayname>%s</D:displayname>"
                    % _esc(seg[-1] if seg else "dav"))
@@ -2953,7 +6118,7 @@ def dav_handle(environ, start_response):
     if configured is None:
         return _dav_send(
             start_response, "403 Forbidden",
-            "WebDAV 密码尚未设置，请先在视频库管理页设置。".encode("utf-8"))
+            "WebDAV 密码尚未设置，请先在资源库管理页设置。".encode("utf-8"))
     if not configured:
         return _dav_send(
             start_response, "401 Unauthorized", b"unauthorized",
@@ -2961,33 +6126,52 @@ def dav_handle(environ, start_response):
 
     raw_segments = list(segments)
 
-    # A bare filename at the root names a file in the current
-    # month (the same place a root-level PUT puts it).
-    if (len(segments) == 1
-            and method in ("PROPFIND", "GET", "HEAD", "DELETE", "MOVE")
-            and not re.fullmatch(r"\d{4}-\d{2}", segments[0])):
-        segments = [_folder_of(time.time()), segments[0]]
-
-    # Folder-drop chute: when a client pushes a local folder tree
-    # in, the first segment is a folder name, not a month. The
-    # tree is flattened into the target month and the folder path
-    # is kept as the entries' tag, so the grouping survives in
-    # the web UI even though the DAV tree itself stays month-only.
+    # Library-aware resolution. The tree is now
+    # /dav/<库名>/<YYYY-MM>/<文件>; legacy /dav/<YYYY-MM>/<文件>
+    # and bare filenames resolve into the default library.
+    dav_lib, rest = _dav_resolve(segments)
+    if dav_lib is None:
+        return _dav_send(start_response, "404 Not Found", b"not found")
+    current_month = _folder_of(time.time())
     chute = ""
-    if segments:
-        first_is_month = bool(re.fullmatch(r"\d{4}-\d{2}", segments[0]))
-        if method == "PUT":
-            if len(segments) >= 2 and not first_is_month:
-                chute = "/".join(segments[:-1])
-                segments = [_folder_of(time.time()), segments[-1]]
-            elif len(segments) >= 3 and first_is_month:
-                chute = "/".join(segments[1:-1])
-                segments = [segments[0], segments[-1]]
-        elif method in ("GET", "HEAD", "DELETE", "MOVE"):
-            if len(segments) >= 2 and not first_is_month:
-                segments = [_folder_of(time.time()), segments[-1]]
-            elif len(segments) >= 3 and first_is_month:
-                segments = [segments[0], segments[-1]]
+
+    if method == "PUT":
+        # Normalize the PUT shapes down to (library, month,
+        # filename, chute): root drops and folder-tree drops land
+        # in the current month; the folder path of a tree drop is
+        # kept as the entries' tag (as before).
+        if not rest:
+            return _dav_send(start_response, "409 Conflict",
+                             "路径里缺少文件名。".encode("utf-8"))
+        filename = rest[-1]
+        lead = rest[:-1]
+        if not lead:
+            month = current_month
+        elif len(lead) == 1 and _MONTH_RE.fullmatch(lead[0]):
+            month = lead[0]
+        elif _MONTH_RE.fullmatch(lead[0]):
+            chute = "/".join(lead[1:])
+            month = lead[0]
+        else:
+            chute = "/".join(lead)
+            month = current_month
+        segments = [month, filename]
+    else:
+        # Read shapes: a bare filename names a file in the current
+        # month; folder-tree paths flatten to month + basename
+        # (PROPFIND keeps the raw path for its virtual chute
+        # listings below).
+        if (len(rest) == 1
+                and method in ("PROPFIND", "GET", "HEAD", "DELETE",
+                               "MOVE")
+                and not _MONTH_RE.fullmatch(rest[0])):
+            rest = [current_month, rest[0]]
+        if method in ("GET", "HEAD", "DELETE", "MOVE"):
+            if len(rest) >= 2 and not _MONTH_RE.fullmatch(rest[0]):
+                rest = [current_month, rest[-1]]
+            elif len(rest) >= 3:
+                rest = [rest[0], rest[-1]]
+        segments = rest
 
     if method == "OPTIONS":
         return _dav_send(
@@ -3002,38 +6186,45 @@ def dav_handle(environ, start_response):
             return _dav_send(start_response, "403 Forbidden",
                              "只支持 Depth 0 / 1。".encode("utf-8"))
         items = []
-        if len(segments) == 0:
+        if len(raw_segments) == 0:
             items.append(([], True, 0, time.time(), "", ""))
             if depth == "1":
-                folders = _dav_folders()
-                current = _folder_of(time.time())
-                if current not in folders:
-                    folders.insert(0, current)
+                for l in _libraries("video"):
+                    items.append(([l["name"]], True, 0, 0, "", ""))
+        elif len(rest) == 0:
+            items.append(([dav_lib["name"]], True, 0,
+                          time.time(), "", ""))
+            if depth == "1":
+                folders = _dav_folders(dav_lib["id"])
+                if current_month not in folders:
+                    folders.insert(0, current_month)
                 for folder in folders:
-                    items.append(([folder], True, 0, 0, "", ""))
-        elif len(segments) == 1:
-            folder = segments[0]
-            if not _folder_exists(folder):
+                    items.append(([dav_lib["name"], folder], True,
+                                  0, 0, "", ""))
+        elif len(rest) == 1 and _MONTH_RE.fullmatch(rest[0]):
+            folder = rest[0]
+            if not _folder_exists(dav_lib["id"], folder):
                 return _dav_send(start_response, "404 Not Found",
                                  b"not found")
-            items.append(([folder], True, 0, time.time(), "", ""))
+            items.append(([dav_lib["name"], folder], True, 0,
+                          time.time(), "", ""))
             if depth == "1":
-                for row in _dav_entries_in(folder):
+                for row in _dav_entries_in(dav_lib["id"], folder):
                     name = row["title"] + "." + (row["ext"] or "")
-                    items.append(([folder, name], False, row["size"],
-                                  row["created_at"], _mime_for(row["ext"]),
-                                  row["hash"]))
-        elif len(segments) >= 2:
+                    items.append(([dav_lib["name"], folder, name],
+                                  False, row["size"],
+                                  row["created_at"],
+                                  _mime_for(row["ext"]), row["hash"]))
+        elif len(rest) >= 2:
             # File paths may be nested (folder-drop trees): the
             # file itself lives in a month folder, so resolve by
             # month + basename. Folder paths are virtual chute
             # collections whose members are the entries tagged
             # with the folder path.
-            first_is_month = bool(
-                re.fullmatch(r"\d{4}-\d{2}", segments[0]))
-            month = (segments[0] if first_is_month
-                     else _folder_of(time.time()))
-            row = _dav_find(month, segments[-1])
+            first_is_month = bool(_MONTH_RE.fullmatch(rest[0]))
+            month = (rest[0] if first_is_month
+                     else current_month)
+            row = _dav_find(dav_lib["id"], month, rest[-1])
             if row is not None:
                 items.append((raw_segments, False, row["size"],
                               row["created_at"],
@@ -3046,16 +6237,18 @@ def dav_handle(environ, start_response):
                 # not exist keeps its plain 404 below - upload
                 # clients depend on it before sending a PUT.
                 if first_is_month:
-                    tag = "/".join(segments[1:])
+                    tag = "/".join(rest[1:])
                 else:
-                    tag = "/".join(segments)
+                    tag = "/".join(rest)
                 items.append((raw_segments, True, 0, time.time(), "", ""))
                 if depth == "1":
-                    for entry in _dav_entries_in(month):
+                    for entry in _dav_entries_in(dav_lib["id"], month):
                         if (entry["tags"] or "") == tag:
-                            name = entry["title"] + "." + (entry["ext"] or "")
+                            name = (entry["title"] + "."
+                                    + (entry["ext"] or ""))
                             items.append((raw_segments + [name], False,
-                                          entry["size"], entry["created_at"],
+                                          entry["size"],
+                                          entry["created_at"],
                                           _mime_for(entry["ext"]),
                                           entry["hash"]))
             else:
@@ -3068,7 +6261,7 @@ def dav_handle(environ, start_response):
     if method in ("GET", "HEAD"):
         if len(segments) != 2:
             return _dav_send(start_response, "404 Not Found", b"not found")
-        row = _dav_find(segments[0], segments[1])
+        row = _dav_find(dav_lib["id"], segments[0], segments[1])
         if row is None:
             return _dav_send(start_response, "404 Not Found", b"not found")
         file_row = get_file(row["hash"])
@@ -3094,6 +6287,12 @@ def dav_handle(environ, start_response):
         if not re.fullmatch(r"\d{4}-\d{2}", folder):
             return _dav_send(start_response, "409 Conflict",
                              "文件夹必须是 YYYY-MM 格式。".encode("utf-8"))
+        if _kind(filename.rpartition(".")[2].lower()
+                 if "." in filename else "") != "video":
+            return _dav_send(
+                start_response, "409 Conflict",
+                "WebDAV 只收视频；图片 / 小说 / 其他文件请走网页上传。"
+                .encode("utf-8"))
         try:
             length = int(environ.get("CONTENT_LENGTH") or 0)
         except Exception:
@@ -3152,7 +6351,7 @@ def dav_handle(environ, start_response):
             except Exception:
                 pass
             return _dav_send(start_response, "201 Created", b"")
-        existing = _dav_find(folder, filename)
+        existing = _dav_find(dav_lib["id"], folder, filename)
         replaced = existing is not None
         if replaced:
             # Free the title first so the new entry takes the clean
@@ -3160,7 +6359,8 @@ def dav_handle(environ, start_response):
             delete_entry(existing["id"])
         try:
             entry_id, digest, _dup = ingest_staged_file(
-                tmp_path, filename, folder=folder, tags=chute)
+                tmp_path, filename, folder=folder, tags=chute,
+                library_id=dav_lib["id"])
         except Exception as exc:
             return _dav_send(start_response, "500 Internal Server Error",
                              str(exc)[:200].encode("utf-8"))
@@ -3173,7 +6373,7 @@ def dav_handle(environ, start_response):
     if method == "DELETE":
         if len(segments) != 2:
             return _dav_send(start_response, "404 Not Found", b"not found")
-        row = _dav_find(segments[0], segments[1])
+        row = _dav_find(dav_lib["id"], segments[0], segments[1])
         if row is None:
             return _dav_send(start_response, "404 Not Found", b"not found")
         delete_entry(row["id"])
@@ -3182,31 +6382,35 @@ def dav_handle(environ, start_response):
     if method == "MOVE":
         if len(segments) != 2:
             return _dav_send(start_response, "404 Not Found", b"not found")
-        row = _dav_find(segments[0], segments[1])
+        row = _dav_find(dav_lib["id"], segments[0], segments[1])
         if row is None:
             return _dav_send(start_response, "404 Not Found", b"not found")
         dest = environ.get("HTTP_DESTINATION") or ""
         parsed = urllib.parse.urlparse(dest)
         dest_path = _dav_fix_path(urllib.parse.unquote(parsed.path))
         dest_segments = _dav_segments(dest_path)
-        if dest_segments and not re.fullmatch(r"\d{4}-\d{2}",
-                                              dest_segments[0]):
-            dest_segments = [_folder_of(time.time()), dest_segments[-1]]
-        elif len(dest_segments) >= 3:
-            dest_segments = [dest_segments[0], dest_segments[-1]]
-        if len(dest_segments) != 2:
+        dlib, drest = _dav_resolve(dest_segments)
+        if drest and not re.fullmatch(r"\d{4}-\d{2}", drest[0]):
+            drest = [_folder_of(time.time()), drest[-1]]
+        elif len(drest) >= 3:
+            drest = [drest[0], drest[-1]]
+        if len(drest) != 2:
             return _dav_send(start_response, "400 Bad Request",
                              "Destination 无效。".encode("utf-8"))
-        if dest_segments[0] != segments[0]:
+        if dlib is None or dlib["id"] != dav_lib["id"]:
+            return _dav_send(
+                start_response, "403 Forbidden",
+                "不支持跨库移动；换库请在网页里操作。".encode("utf-8"))
+        if drest[0] != segments[0]:
             return _dav_send(
                 start_response, "403 Forbidden",
                 "不支持跨文件夹移动；改月份请在网页里操作。".encode("utf-8"))
-        new_title = os.path.splitext(dest_segments[1])[0]
+        new_title = os.path.splitext(drest[1])[0]
         if not new_title:
             return _dav_send(start_response, "400 Bad Request",
                              "新文件名无效。".encode("utf-8"))
         overwrite = (environ.get("HTTP_OVERWRITE") or "T").upper() != "F"
-        target = _dav_find(dest_segments[0], dest_segments[1])
+        target = _dav_find(dav_lib["id"], drest[0], drest[1])
         if target is not None and target["id"] != row["id"]:
             if not overwrite:
                 return _dav_send(start_response,
@@ -3236,7 +6440,7 @@ def dav_handle(environ, start_response):
             '<D:href>%s</D:href><D:propstat><D:prop/>'
             '<D:status>HTTP/1.1 200 OK</D:status></D:propstat>'
             '</D:response></D:multistatus>'
-            % _esc(_dav_href(environ, segments))).encode("utf-8")
+            % _esc(_dav_href(environ, raw_segments))).encode("utf-8")
         return _dav_send(start_response, "207 Multi-Status", body,
                          content_type="application/xml; charset=utf-8")
 
@@ -3267,7 +6471,7 @@ def dav_handle(environ, start_response):
             '<D:locktoken><D:href>%s</D:href></D:locktoken>'
             '<D:lockroot><D:href>%s</D:href></D:lockroot>'
             '</D:activelock></D:lockdiscovery></D:prop>'
-            % (token, _esc(_dav_href(environ, segments)))).encode("utf-8")
+            % (token, _esc(_dav_href(environ, raw_segments)))).encode("utf-8")
         return _dav_send(start_response, "200 OK", body,
                          content_type="application/xml; charset=utf-8")
 
@@ -3382,13 +6586,52 @@ def application(environ, start_response):
     if path == "/dav" or path.startswith("/dav/"):
         return dav_handle(environ, start_response)
 
+    # Phone reader book source: own token, reached via Caddy at
+    # /vidlib-api/* (prefix stripped before it gets here).
+    if path == "/ext" or path.startswith("/ext/"):
+        return ext_handle(environ, start_response, params)
+
     if path == "/api/session":
         return _json(start_response, "200 OK",
                      {"ok": True, "authenticated": True,
                       "via": "platform", "username": "platform"})
 
     if path == "/" and method == "GET":
+        body = page_hub(params, base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
+    if path == "/wall" and method == "GET":
         body = page_wall(params, base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
+    if path == "/images" and method == "GET":
+        body = page_images(params, base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
+    if path == "/novels" and method == "GET":
+        body = page_novels(params, base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
+    if path == "/files" and method == "GET":
+        body = page_files(params, base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
+    if path.startswith("/read/") and method == "GET":
+        entry = get_entry(path[len("/read/"):])
+        if entry is None or entry["f_kind"] != "novel":
+            start_response("404 Not Found", [("Content-Type", "text/plain")])
+            return [b"not found"]
+        body = page_reader(entry, base_href)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
                                   ("Content-Length", str(len(body)))])
         return [body]
@@ -3418,6 +6661,36 @@ def application(environ, start_response):
 
     if path == "/admin" and method == "GET":
         body = page_admin(base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
+    if path == "/admin/videos" and method == "GET":
+        body = page_admin_videos(base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
+    if path == "/admin/images" and method == "GET":
+        body = page_admin_images(base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
+    if path == "/admin/novels" and method == "GET":
+        body = page_admin_novels(base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
+    if path == "/admin/files" and method == "GET":
+        body = page_admin_files(base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
+    if path == "/admin/settings" and method == "GET":
+        body = page_admin_settings(base_href)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
                                   ("Content-Length", str(len(body)))])
         return [body]
@@ -3480,6 +6753,227 @@ def application(environ, start_response):
                      {"ok": True, "url": "file/" + entry["hash"],
                       "archived": False, "pos": entry["play_pos"] or 0})
 
+    m = re.fullmatch(r"/api/novel/(\d+)", path)
+    if m and method == "GET":
+        entry = get_entry(int(m.group(1)))
+        if entry is None or entry["f_kind"] != "novel":
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "message": "小说不存在。"})
+        meta = _novel_meta(entry["hash"]) or {}
+        # Opening the reader counts as reading the book: a
+        # pending mark starts the deferred AI pass in the
+        # background; this response still serves the current
+        # titles, with an unobtrusive analysing hint while
+        # the pass runs.
+        analyzing = _maybe_ai_trigger(entry["hash"])
+        with _db() as conn:
+            rd = conn.execute(
+                "SELECT chapter, offset, percent FROM novel_read "
+                "WHERE entry_id = ?", (entry["id"],)).fetchone()
+        return _json(start_response, "200 OK", {
+            "ok": True, "title": entry["title"],
+            "encoding": meta.get("encoding") or "",
+            "char_count": meta.get("char_count") or 0,
+            "chapters": _novel_chapter_spans(meta),
+            "ai_analyzing": analyzing,
+            "read": ({"chapter": rd["chapter"], "offset": rd["offset"],
+                      "percent": rd["percent"]} if rd else None)})
+
+    m = re.fullmatch(r"/api/novel/(\d+)/chapter", path)
+    if m and method == "GET":
+        entry = get_entry(int(m.group(1)))
+        if entry is None or entry["f_kind"] != "novel":
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "message": "小说不存在。"})
+        meta = _novel_meta(entry["hash"]) or {}
+        chapters = _novel_chapter_spans(meta)
+        try:
+            idx = int(params.get("i") or "0")
+        except Exception:
+            idx = 0
+        if not chapters or idx < 0 or idx >= len(chapters):
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "message": "章节不存在。"})
+        try:
+            text = _novel_text(get_file(entry["hash"]))
+        except Exception:
+            return _json(start_response, "503 Service Unavailable",
+                         {"ok": False,
+                          "message": "正文暂不可用（归档拉取失败）。"})
+        ch = chapters[idx]
+        return _json(start_response, "200 OK", {
+            "ok": True, "index": idx, "title": ch["t"],
+            "text": text[ch["o"]:ch["e"]]})
+
+    if path == "/api/novel/progress" and method == "POST":
+        data = _read_json(environ)
+        try:
+            eid = int(data.get("entry_id"))
+            nch = int(data.get("chapter") or 0)
+            noff = int(data.get("offset") or 0)
+            npct = float(data.get("percent") or 0)
+        except Exception:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False, "message": "参数无效。"})
+        entry = get_entry(eid)
+        if entry is None or entry["f_kind"] != "novel":
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "message": "小说不存在。"})
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO novel_read(entry_id, chapter, offset, "
+                "percent, updated_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(entry_id) DO UPDATE SET "
+                "chapter=excluded.chapter, offset=excluded.offset, "
+                "percent=excluded.percent, "
+                "updated_at=excluded.updated_at",
+                (eid, nch, noff, max(0.0, min(100.0, npct)),
+                 int(time.time())))
+        return _json(start_response, "200 OK", {"ok": True})
+
+    if path == "/api/files/recategorize" and method == "POST":
+        data = _read_json(environ)
+        try:
+            eid = int(data.get("id"))
+        except Exception:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False, "message": "参数无效。"})
+        newcat = (data.get("category") or "").strip()
+        catnames = {c["name"] for c in _file_categories()}
+        entry = get_entry(eid)
+        if entry is None or entry["f_kind"] != "file":
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "message": "文件不存在。"})
+        if newcat not in catnames:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False, "message": "类别不存在。"})
+        f = get_file(entry["hash"])
+        oldcat = f["category"] or "其他"
+        if newcat != oldcat:
+            with _db() as conn:
+                conn.execute(
+                    "UPDATE files SET category = ?, updated_at = ? "
+                    "WHERE hash = ?",
+                    (newcat, int(time.time()), entry["hash"]))
+            f2 = get_file(entry["hash"])
+            old_remote = f["gpath"] or ""
+            new_remote = _target_gpath(f2)
+            if (f["status"] == "archived" and old_remote
+                    and new_remote != old_remote):
+                odir, _, oname = old_remote.rpartition("/")
+                ndir = new_remote.rpartition("/")[0]
+                moved = False
+                try:
+                    ALIST.fs_mkdir(ndir)
+                    ALIST.fs_move(odir, ndir, [oname])
+                    moved = _remote_size_drive(new_remote) is not None
+                except Exception:
+                    moved = False
+                if moved:
+                    with _db() as conn:
+                        conn.execute(
+                            "UPDATE files SET gpath = ? WHERE hash = ?",
+                            (new_remote, entry["hash"]))
+                else:
+                    with _db() as conn:
+                        conn.execute(
+                            "UPDATE files SET category = ? WHERE hash = ?",
+                            (oldcat, entry["hash"]))
+                    return _json(start_response, "200 OK", {
+                        "ok": False,
+                        "message": "云端移动失败，类别未更改。"})
+        return _json(start_response, "200 OK", {"ok": True})
+
+    if path == "/api/admin/libraries" and method == "POST":
+        data = _read_json(environ)
+        if data.get("add_name") is not None:
+            name = (data.get("add_name") or "").strip()
+            err = _validate_lib_name(name)
+            if err:
+                return _json(start_response, "400 Bad Request",
+                             {"ok": False, "message": err})
+            with _db() as conn:
+                conn.execute(
+                    "INSERT INTO libraries(name, kind, prefix, "
+                    "is_default, created_at) VALUES(?, 'video', ?, 0, ?)",
+                    (name, "视频/" + name, int(time.time())))
+            return _json(start_response, "200 OK", {"ok": True})
+        if data.get("delete_id") is not None:
+            row = _library_by_id(_safe_lib(data.get("delete_id")))
+            if (row is None or row["kind"] != "video"
+                    or row["is_default"]):
+                return _json(start_response, "400 Bad Request",
+                             {"ok": False, "message": "不能删除该库。"})
+            with _db() as conn:
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM entries WHERE library_id = ?",
+                    (row["id"],)).fetchone()[0]
+                if n:
+                    return _json(start_response, "400 Bad Request", {
+                        "ok": False, "message": "库里还有条目，不能删除。"})
+                conn.execute("DELETE FROM libraries WHERE id = ?",
+                             (row["id"],))
+            return _json(start_response, "200 OK", {"ok": True})
+        renames = data.get("renames") or {}
+        if isinstance(renames, dict):
+            for k, v in renames.items():
+                row = _library_by_id(k)
+                if row is None or row["kind"] != "video":
+                    continue
+                name = (v or "").strip()
+                if not name or name == row["name"]:
+                    continue
+                err = _validate_lib_name(name, exclude_id=row["id"])
+                if err:
+                    return _json(start_response, "400 Bad Request",
+                                 {"ok": False, "message": err})
+                with _db() as conn:
+                    conn.execute(
+                        "UPDATE libraries SET name = ? WHERE id = ?",
+                        (name, row["id"]))
+            return _json(start_response, "200 OK", {"ok": True})
+        return _json(start_response, "400 Bad Request",
+                     {"ok": False, "message": "无操作。"})
+
+    if path == "/api/admin/filecats" and method == "POST":
+        data = _read_json(environ)
+        items = data.get("items") or []
+        cleaned = []
+        seen_names = set()
+        empty_rows = 0
+        for it in items:
+            name = ((it or {}).get("name") or "").strip()
+            exts = _norm_exts((it or {}).get("exts") or "")
+            if not name:
+                continue
+            if "/" in name or "\\" in name or len(name) > 20:
+                return _json(start_response, "400 Bad Request", {
+                    "ok": False, "message": "类别名无效：" + name})
+            if name in seen_names:
+                return _json(start_response, "400 Bad Request", {
+                    "ok": False, "message": "类别名重复：" + name})
+            seen_names.add(name)
+            if not exts:
+                empty_rows += 1
+            cleaned.append((name, exts))
+        if not cleaned:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False, "message": "至少保留一个类别。"})
+        if empty_rows > 1:
+            return _json(start_response, "400 Bad Request", {
+                "ok": False,
+                "message": "只能有一个兜底类别（扩展名留空）。"})
+        if empty_rows == 0:
+            cleaned.append(("其他", ""))
+        with _db() as conn:
+            conn.execute("DELETE FROM file_categories")
+            for i, (name, exts) in enumerate(cleaned):
+                conn.execute(
+                    "INSERT INTO file_categories(name, exts, sort, "
+                    "builtin) VALUES(?,?,?,?)",
+                    (name, exts, i, 1 if not exts else 0))
+        return _json(start_response, "200 OK", {"ok": True})
+
     if path == "/api/feed" and method == "GET":
         mode = params.get("mode") or "random"
         seen_f = params.get("seen") or "unseen"
@@ -3513,13 +7007,20 @@ def application(environ, start_response):
             where.append("e.mark = 2")
         elif mark_f != "any":
             where.append("e.mark != 2")
+        lib_row = _library_by_id(params.get("lib")) \
+            if params.get("lib") else None
+        if lib_row is None or lib_row["kind"] != "video":
+            lib_row = _default_library("video")
+        if lib_row is not None:
+            where.append("e.library_id = ?")
+            args.append(lib_row["id"])
         sql = _ENTRY_COLS
         if where:
             sql += "WHERE " + " AND ".join(where) + " "
         sql += "ORDER BY e.id ASC"
         with _db() as conn:
             rows = conn.execute(sql, args).fetchall()
-        rows = [r for r in rows if _kind(r["ext"]) == "video"]
+        rows = [r for r in rows if (r["kind"] or _kind(r["ext"])) == "video"]
         total = len(rows)
         if mode == "random":
             pool = [r for r in rows if _cache_file(r)]
@@ -3663,7 +7164,8 @@ def application(environ, start_response):
         tags = _merge_chute(data.get("tags") or "",
                             data.get("relpath") or "")
         entry_id = register_dup(digest, data.get("name") or "",
-                                tags, data.get("source") or "")
+                                tags, data.get("source") or "",
+                                _safe_lib(data.get("library_id")))
         if entry_id is None:
             return _json(start_response, "404 Not Found",
                          {"ok": False, "message": "文件不存在。"})
@@ -3677,7 +7179,8 @@ def application(environ, start_response):
             uid = upload_init(data.get("name") or "", data.get("size") or 0,
                               data.get("title") or "", data.get("tags") or "",
                               data.get("source") or "",
-                              data.get("relpath") or "")
+                              data.get("relpath") or "",
+                              _safe_lib(data.get("library_id")))
         except ValueError as exc:
             return _json(start_response, "400 Bad Request",
                          {"ok": False, "message": str(exc)})
@@ -3709,7 +7212,7 @@ def application(environ, start_response):
     if path == "/api/batch-export" and method == "POST":
         data = _read_json(environ)
         ids = data.get("ids") or []
-        lines = ["# 视频库批量下载列表（aria2 -i 使用；链接为限时签名链接，过期请重新导出）"]
+        lines = ["# 资源库批量下载列表（aria2 -i 使用；链接为限时签名链接，过期请重新导出）"]
         for eid in ids[:100]:
             entry = get_entry(eid)
             if entry is None:
@@ -3780,6 +7283,108 @@ def application(environ, start_response):
                          {"ok": False, "message": "密码至少 8 位。"})
         dav_password_set(password)
         return _json(start_response, "200 OK", {"ok": True})
+
+    if path == "/api/admin/ext-token" and method == "POST":
+        creds = _load_creds()
+        creds["ext_token"] = secrets.token_urlsafe(24)
+        _save_creds(creds)
+        return _json(start_response, "200 OK",
+                     {"ok": True, "url": _ext_import_url()})
+
+    if path == "/api/admin/novel/title-len" and method == "POST":
+        data = _read_json(environ)
+        try:
+            entry = get_entry(int(data.get("entry_id") or 0))
+        except Exception:
+            entry = None
+        if entry is None or entry["f_kind"] != "novel":
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "message": "小说不存在。"})
+        try:
+            n = int(data.get("title_len") or 0)
+        except Exception:
+            n = 0
+        n = max(0, min(30, n))
+        with _db() as conn:
+            conn.execute(
+                "UPDATE novel_meta SET title_len = ? WHERE hash = ?",
+                (n, entry["hash"]))
+        old = _novel_meta(entry["hash"]) or {}
+        try:
+            text = _novel_text(get_file(entry["hash"]))
+        except Exception:
+            return _json(start_response, "503 Service Unavailable",
+                         {"ok": False,
+                          "message": "正文暂不可用（归档拉取失败）。"})
+        meta = _store_novel_meta(entry["hash"], text,
+                                 old.get("encoding") or "")
+        return _json(start_response, "200 OK",
+                     {"ok": True, "chapters": len(meta["chapters"]),
+                      "title_len": n})
+
+    if path == "/api/admin/novel/ai-config" and method == "POST":
+        data = _read_json(environ)
+        key_in = (data.get("openrouter_key") or "").strip()
+        if key_in:
+            creds = _load_creds()
+            creds["openrouter_key"] = key_in
+            _save_creds(creds)
+        kv_set("ai_title_model",
+               (data.get("model") or "").strip()
+               or _AI_DEFAULT_MODEL)
+        kv_set("ai_title_enabled",
+               "1" if data.get("enabled") else "0")
+        if data.get("batch") is not None:
+            try:
+                bv = int(data.get("batch"))
+            except Exception:
+                bv = 0
+            kv_set("ai_title_batch",
+                   str(min(50, bv)) if bv > 0 else "")
+        key, model, enabled = _ai_title_config()
+        return _json(start_response, "200 OK",
+                     {"ok": True, "configured": bool(key),
+                      "model": model, "enabled": enabled,
+                      "batch": _ai_batch_size()})
+
+    if path == "/api/admin/novel/ai-test" and method == "POST":
+        data = _read_json(environ)
+        try:
+            entry = get_entry(int(data.get("entry_id") or 0))
+        except Exception:
+            entry = None
+        if entry is None or entry["f_kind"] != "novel":
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "message": "小说不存在。"})
+        key, model, _enabled = _ai_title_config()
+        if not key:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False, "message":
+                          "OpenRouter API key 未配置：请先在管理页"
+                          "「小说切分」面板填入 key 再试跑。"})
+        meta = _novel_meta(entry["hash"]) or {}
+        try:
+            text = _novel_text(get_file(entry["hash"]))
+        except Exception:
+            return _json(start_response, "503 Service Unavailable",
+                         {"ok": False,
+                          "message": "正文暂不可用（归档拉取失败）。"})
+        _chs, stats, debug = _split_chapters_full(
+            text, meta.get("title_len") or 0,
+            ai_cfg={"key": key, "model": model,
+                    "batch": _ai_batch_size()},
+            ai_all_glued=True)
+        cur = {}
+        for c in meta.get("chapters") or []:
+            cur[c.get("o")] = c.get("t")
+        items = [{"num": d["num"], "offset": d["o"],
+                  "window": d["window"], "ai_len": d["ai_len"],
+                  "ai_raw": d["ai_raw"], "ai_title": d["ai_title"],
+                  "current_title": cur.get(d["o"])} for d in debug]
+        return _json(start_response, "200 OK",
+                     {"ok": True, "model": model,
+                      "candidates": len(items), "items": items,
+                      "fallback": stats.get("fallback")})
 
     if path == "/api/admin/backup" and method == "POST":
         kv_set("last_backup_at", "0")
