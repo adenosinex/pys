@@ -515,7 +515,7 @@ a.dl{color:#58a6ff;text-decoration:none;font-weight:600;white-space:nowrap}
   <div class="queue" id="gqueue"></div>
   <div class="msg" id="gmsg"></div>
   <table>
-    <thead><tr><th>文件</th><th>大小</th><th>时间</th><th></th></tr></thead>
+    <thead><tr><th>文件</th><th>大小</th><th>时间</th><th></th><th></th></tr></thead>
     <tbody id="grows"></tbody>
   </table>
   <div class="meta" id="gmeta"></div>
@@ -574,19 +574,19 @@ async function grefresh(){
   try{
     const r=await fetch("api/drive/files");const d=await r.json();
     tb.innerHTML="";
-    if(!d.ok){tb.innerHTML="<tr><td colspan=4 class=empty>"+(d.error||"谷歌硬盘不可用")+"</td></tr>";$("gmeta").textContent="";return;}
-    if(!d.files.length){tb.innerHTML="<tr><td colspan=4 class=empty>文件夹还是空的</td></tr>";}
+    if(!d.ok){tb.innerHTML="<tr><td colspan=5 class=empty>"+(d.error||"谷歌硬盘不可用")+"</td></tr>";$("gmeta").textContent="";return;}
+    if(!d.files.length){tb.innerHTML="<tr><td colspan=5 class=empty>文件夹还是空的</td></tr>";}
     for(const f of d.files){
       const tr=document.createElement("tr");
       const td1=document.createElement("td");td1.className="name";td1.textContent=f.name;tr.appendChild(td1);
       const td2=document.createElement("td");td2.className="size";td2.textContent=fmtSize(f.size);tr.appendChild(td2);
       const td3=document.createElement("td");td3.className="time";td3.textContent=fmtTime(f.mtime);tr.appendChild(td3);
-      const td4=document.createElement("td");const a=document.createElement("a");a.className="dl";a.textContent="下载";a.href="gdl/"+encodeURIComponent(f.name);td4.appendChild(a);tr.appendChild(td4);
+      const td4=document.createElement("td");const a=document.createElement("a");a.className="dl";a.textContent="下载";a.href="gdl/"+encodeURIComponent(f.name);td4.appendChild(a);tr.appendChild(td4);const td5=document.createElement("td");const b=document.createElement("button");b.className="del";b.textContent="删除";b.onclick=async()=>{if(!b.classList.contains("armed")){b.classList.add("armed");b.textContent="确认删除？";setTimeout(()=>{b.classList.remove("armed");b.textContent="删除";},3000);return;}await fetch("api/drive/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:f.name})});grefresh();};td5.appendChild(b);tr.appendChild(td5);
       tb.appendChild(tr);
     }
     let total=0;for(const f of d.files){total+=f.size;}
     $("gmeta").textContent="谷歌硬盘「文件中转站」共 "+d.files.length+" 个文件，占用 "+fmtSize(total);
-  }catch(e){tb.innerHTML="<tr><td colspan=4 class=empty>读取失败</td></tr>";}
+  }catch(e){tb.innerHTML="<tr><td colspan=5 class=empty>读取失败</td></tr>";}
 }
 function gupload(files){
   for(const file of files){
@@ -664,6 +664,22 @@ def app(environ, start_response):
                               "error": "upload failed: %s" % exc}, \
                 "500 Internal Server Error"
         return _json(start_response, status, result)
+    if path == "/api/drive/delete" and method == "POST":
+        if not _drive_configured():
+            return _json(start_response, "503 Service Unavailable",
+                         {"ok": False, "error": "google drive not configured"})
+        data = _read_json(environ)
+        safe = _safe_name(data.get("name"))
+        if not safe:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False, "error": "bad name"})
+        try:
+            _drive_ensure()
+            ALIST.fs_remove(DRIVE_DIR, [safe])
+        except AlistError as exc:
+            return _json(start_response, "502 Bad Gateway",
+                         {"ok": False, "error": str(exc)})
+        return _json(start_response, "200 OK", {"ok": True})
     if path == "/api/delete" and method == "POST":
         data = _read_json(environ)
         safe = _safe_name(data.get("name"))
