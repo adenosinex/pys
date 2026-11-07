@@ -18,6 +18,10 @@ import shutil
 import threading
 import time
 import urllib.parse
+import urllib.request
+import urllib.error
+import http.client
+from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -37,6 +41,242 @@ FILES_DIR = os.path.join(DATA_DIR, "files")
 os.makedirs(FILES_DIR, exist_ok=True)
 MIN_FREE = 2 * 1024 ** 3
 _lock = threading.Lock()
+
+# ------------------------------------------------------------ AList
+# Import-only credential store (values are never rendered back):
+#   alist_base / alist_user / alist_pass - this app -> AList
+CRED_PATH = os.path.join(DATA_DIR, "credentials.json")
+DRIVE_DIR = "/\u6587\u4ef6\u4e2d\u8f6c\u7ad9"
+DRIVE_TMP = os.path.join(DATA_DIR, ".drive-tmp")
+os.makedirs(DRIVE_TMP, exist_ok=True)
+
+
+def _load_creds():
+    try:
+        with open(CRED_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _cred(key, env_key=None):
+    if env_key and os.environ.get(env_key):
+        return os.environ[env_key]
+    return _load_creds().get(key) or ""
+
+
+class AlistError(Exception):
+    pass
+
+
+class _Alist:
+    def __init__(self):
+        self._token = ""
+        self._token_at = 0.0
+        self._lock = threading.Lock()
+
+    def base(self):
+        return (_cred("alist_base", "ALIST_BASE")
+                or "http://127.0.0.1:5244").rstrip("/")
+
+    def _raw(self, method, path, payload=None, headers=None, timeout=30):
+        data = None
+        hdrs = {"Content-Type": "application/json"}
+        if headers:
+            hdrs.update(headers)
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(self.base() + path, data=data,
+                                     method=method, headers=hdrs)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            try:
+                return json.loads(exc.read().decode("utf-8", "replace"))
+            except Exception:
+                raise AlistError("AList HTTP %s" % exc.code)
+        except Exception as exc:
+            raise AlistError("AList unreachable: %s" % str(exc)[:100])
+
+    def login(self, force=False):
+        with self._lock:
+            if (not force and self._token
+                    and time.time() - self._token_at < 40 * 3600):
+                return self._token
+            password = _cred("alist_pass", "ALIST_PASS")
+            if not password:
+                raise AlistError("AList credential not configured")
+            user = _cred("alist_user", "ALIST_USER") or "admin"
+            out = self._raw("POST", "/api/auth/login",
+                            {"username": user, "password": password})
+            token = (out.get("data") or {}).get("token") or ""
+            if not token:
+                raise AlistError("AList login failed: %s"
+                                 % (out.get("message") or "?"))
+            self._token = token
+            self._token_at = time.time()
+            return token
+
+    def api(self, method, path, payload=None, timeout=60):
+        token = self.login()
+        out = self._raw(method, path, payload,
+                        headers={"Authorization": token}, timeout=timeout)
+        if out.get("code") == 401:
+            token = self.login(force=True)
+            out = self._raw(method, path, payload,
+                            headers={"Authorization": token},
+                            timeout=timeout)
+        if out.get("code") not in (200, 0, None):
+            raise AlistError("AList %s: %s"
+                             % (path, out.get("message") or out.get("code")))
+        return out.get("data")
+
+    def fs_list(self, path):
+        data = self.api("POST", "/api/fs/list",
+                        {"path": path, "page": 1, "per_page": 0,
+                         "refresh": True}) or {}
+        return data.get("content") or []
+
+    def fs_mkdir(self, path):
+        return self.api("POST", "/api/fs/mkdir", {"path": path})
+
+    def fs_remove(self, dir_path, names):
+        return self.api("POST", "/api/fs/remove",
+                        {"dir": dir_path, "names": names})
+
+    def fs_get(self, path):
+        return self.api("POST", "/api/fs/get", {"path": path}) or {}
+
+    def upload_file(self, local_path, remote_path):
+        token = self.login()
+        size = os.path.getsize(local_path)
+        parsed = urllib.parse.urlparse(self.base())
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port,
+                                          timeout=900)
+        try:
+            conn.putrequest("PUT", "/api/fs/put")
+            conn.putheader("Authorization", token)
+            conn.putheader("File-Path", urllib.parse.quote(remote_path))
+            conn.putheader("As-Task", "false")
+            conn.putheader("Content-Type", "application/octet-stream")
+            conn.putheader("Content-Length", str(size))
+            conn.endheaders()
+            with open(local_path, "rb") as fh:
+                while True:
+                    block = fh.read(1024 * 1024)
+                    if not block:
+                        break
+                    conn.send(block)
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8", "replace")
+            out = json.loads(body) if body else {}
+            if out.get("code") not in (200, 0, None):
+                raise AlistError("upload failed: %s"
+                                 % (out.get("message") or resp.status))
+            return out.get("data")
+        finally:
+            conn.close()
+
+
+ALIST = _Alist()
+DRIVE_NAME = DRIVE_DIR.lstrip("/")
+
+
+def _drive_configured():
+    return bool(_cred("alist_pass", "ALIST_PASS"))
+
+
+def _drive_ensure():
+    names = [it.get("name") for it in ALIST.fs_list("/")]
+    if DRIVE_NAME not in names:
+        ALIST.fs_mkdir(DRIVE_DIR)
+
+
+def _mtime_of(item):
+    raw = item.get("modified") or item.get("created") or ""
+    try:
+        return datetime.fromisoformat(
+            str(raw).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0
+
+
+def _drive_files():
+    _drive_ensure()
+    out = []
+    for it in ALIST.fs_list(DRIVE_DIR):
+        if it.get("is_dir"):
+            continue
+        out.append({"name": it.get("name") or "",
+                    "size": it.get("size") or 0,
+                    "mtime": _mtime_of(it)})
+    out.sort(key=lambda x: -x["mtime"])
+    return out
+
+
+def handle_drive_upload(environ):
+    result, status = handle_upload(environ, DRIVE_TMP)
+    if not result.get("ok"):
+        return result, status
+    done = []
+    try:
+        _drive_ensure()
+        existing = {it.get("name") for it in ALIST.fs_list(DRIVE_DIR)
+                    if not it.get("is_dir")}
+        for item in result["saved"]:
+            local = os.path.join(DRIVE_TMP, item["name"])
+            try:
+                if item["name"] in existing:
+                    ALIST.fs_remove(DRIVE_DIR, [item["name"]])
+                ALIST.upload_file(local, DRIVE_DIR + "/" + item["name"])
+                done.append(item)
+            finally:
+                try:
+                    os.remove(local)
+                except OSError:
+                    pass
+    except AlistError as exc:
+        return {"ok": False,
+                "error": "drive upload failed: %s" % exc}, "502 Bad Gateway"
+    return {"ok": True, "saved": done}, "200 OK"
+
+
+def handle_drive_download(name):
+    safe = _safe_name(urllib.parse.unquote(name))
+    if not safe:
+        return None, None, 0
+    path = DRIVE_DIR + "/" + safe
+    try:
+        info = ALIST.fs_get(path)
+    except AlistError:
+        return None, None, 0
+    sign = info.get("sign") or ""
+    url = ALIST.base() + "/d" + urllib.parse.quote(path)
+    if sign:
+        url += "?sign=" + urllib.parse.quote(sign)
+    resp = None
+    try:
+        resp = urllib.request.urlopen(
+            urllib.request.Request(url, headers={"User-Agent": "transfer"}),
+            timeout=60)
+    except Exception:
+        raw = info.get("raw_url") or ""
+        if raw:
+            try:
+                resp = urllib.request.urlopen(
+                    urllib.request.Request(
+                        raw, headers={"User-Agent": "transfer"}),
+                    timeout=60)
+            except Exception:
+                resp = None
+    if resp is None:
+        return None, None, 0
+    return resp, safe, info.get("size") or 0
+
 
 
 def _safe_name(name):
@@ -123,7 +363,7 @@ def _parse_disposition(value):
     return params
 
 
-def handle_upload(environ):
+def handle_upload(environ, dest_dir=None):
     ctype = environ.get("CONTENT_TYPE", "")
     if "multipart/form-data" not in ctype or "boundary=" not in ctype:
         return {"ok": False, "error": "需要 multipart/form-data 上传"}, "400 Bad Request"
@@ -132,7 +372,8 @@ def handle_upload(environ):
     length = int(environ.get("CONTENT_LENGTH") or 0)
     if length <= 0:
         return {"ok": False, "error": "空请求"}, "400 Bad Request"
-    free = shutil.disk_usage(FILES_DIR).free
+    dest_dir = dest_dir or FILES_DIR
+    free = shutil.disk_usage(dest_dir).free
     if free - length < MIN_FREE:
         return {"ok": False, "error": "服务器剩余空间不足（需保留 2 GiB）"}, "507 Insufficient Storage"
     reader = _Reader(environ["wsgi.input"], length)
@@ -165,8 +406,8 @@ def handle_upload(environ):
                 for _ in reader.until(delim):
                     pass
                 continue
-            tmp_path = os.path.join(FILES_DIR, ".up-" + str(int(time.time() * 1000)) + "-" + safe)
-            dest_path = os.path.join(FILES_DIR, safe)
+            tmp_path = os.path.join(dest_dir, ".up-" + str(int(time.time() * 1000)) + "-" + safe)
+            dest_path = os.path.join(dest_dir, safe)
             size = 0
             with _lock:
                 with open(tmp_path, "wb") as fh:
@@ -244,6 +485,8 @@ a.dl{color:#58a6ff;text-decoration:none;font-weight:600;white-space:nowrap}
 .msg{font-size:13px;margin-top:10px;min-height:18px}
 .msg.err{color:#f85149}
 .msg.ok{color:#3fb950}
+.gtitle{font-size:17px;margin:30px 0 4px}
+.gsub{color:#8b949e;font-size:13px;margin-bottom:12px}
 </style>
 </head>
 <body>
@@ -262,6 +505,20 @@ a.dl{color:#58a6ff;text-decoration:none;font-weight:600;white-space:nowrap}
     <tbody id="rows"></tbody>
   </table>
   <div class="meta" id="meta"></div>
+  <h2 class="gtitle">谷歌硬盘</h2>
+  <div class="gsub">直传到谷歌硬盘里的新文件夹「文件中转站」，不占服务器磁盘；文件先经服务器中转，大文件转存要多等一会儿。</div>
+  <div class="drop" id="gdrop">
+    <strong>拖文件到这里，或点击选择</strong>
+    <span>上传到谷歌硬盘 · 文件中转站文件夹</span>
+  </div>
+  <input type="file" id="gpicker" multiple hidden>
+  <div class="queue" id="gqueue"></div>
+  <div class="msg" id="gmsg"></div>
+  <table>
+    <thead><tr><th>文件</th><th>大小</th><th>时间</th><th></th></tr></thead>
+    <tbody id="grows"></tbody>
+  </table>
+  <div class="meta" id="gmeta"></div>
 </div>
 <script>
 "use strict";
@@ -312,6 +569,49 @@ drop.ondragover=e=>{e.preventDefault();drop.classList.add("over");};
 drop.ondragleave=()=>drop.classList.remove("over");
 drop.ondrop=e=>{e.preventDefault();drop.classList.remove("over");upload([...e.dataTransfer.files]);};
 refresh();
+async function grefresh(){
+  const tb=$("grows");
+  try{
+    const r=await fetch("api/drive/files");const d=await r.json();
+    tb.innerHTML="";
+    if(!d.ok){tb.innerHTML="<tr><td colspan=4 class=empty>"+(d.error||"谷歌硬盘不可用")+"</td></tr>";$("gmeta").textContent="";return;}
+    if(!d.files.length){tb.innerHTML="<tr><td colspan=4 class=empty>文件夹还是空的</td></tr>";}
+    for(const f of d.files){
+      const tr=document.createElement("tr");
+      const td1=document.createElement("td");td1.className="name";td1.textContent=f.name;tr.appendChild(td1);
+      const td2=document.createElement("td");td2.className="size";td2.textContent=fmtSize(f.size);tr.appendChild(td2);
+      const td3=document.createElement("td");td3.className="time";td3.textContent=fmtTime(f.mtime);tr.appendChild(td3);
+      const td4=document.createElement("td");const a=document.createElement("a");a.className="dl";a.textContent="下载";a.href="gdl/"+encodeURIComponent(f.name);td4.appendChild(a);tr.appendChild(td4);
+      tb.appendChild(tr);
+    }
+    let total=0;for(const f of d.files){total+=f.size;}
+    $("gmeta").textContent="谷歌硬盘「文件中转站」共 "+d.files.length+" 个文件，占用 "+fmtSize(total);
+  }catch(e){tb.innerHTML="<tr><td colspan=4 class=empty>读取失败</td></tr>";}
+}
+function gupload(files){
+  for(const file of files){
+    const item=document.createElement("div");item.className="qitem";
+    const label=document.createElement("span");label.textContent=file.name+"（"+fmtSize(file.size)+"）";item.appendChild(label);
+    const st=document.createElement("span");st.className="st";st.textContent="准备上传";item.appendChild(st);
+    const bar=document.createElement("div");bar.className="bar";const fill=document.createElement("i");bar.appendChild(fill);item.appendChild(bar);
+    $("gqueue").appendChild(item);
+    const fd=new FormData();fd.append("files",file);
+    const xhr=new XMLHttpRequest();xhr.open("POST","api/drive/upload");
+    xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(100*e.loaded/e.total);fill.style.width=p+"%";st.textContent=p>=100?"转存谷歌硬盘中…":"上传 "+p+"%";}};
+    xhr.onload=()=>{let d={};try{d=JSON.parse(xhr.responseText);}catch(_){}
+      if(xhr.status===200&&d.ok){item.classList.add("done");fill.style.width="100%";st.textContent="已存入谷歌硬盘";grefresh();}
+      else{item.classList.add("err");st.textContent=(d.error||("失败 HTTP "+xhr.status));}};
+    xhr.onerror=()=>{item.classList.add("err");st.textContent="网络错误";};
+    xhr.send(fd);
+  }
+}
+const gdrop=$("gdrop");
+gdrop.onclick=()=>$("gpicker").click();
+$("gpicker").onchange=e=>{gupload([...e.target.files]);e.target.value="";};
+gdrop.ondragover=e=>{e.preventDefault();gdrop.classList.add("over");};
+gdrop.ondragleave=()=>gdrop.classList.remove("over");
+gdrop.ondrop=e=>{e.preventDefault();gdrop.classList.remove("over");gupload([...e.dataTransfer.files]);};
+grefresh();
 </script>
 </body>
 </html>
@@ -340,6 +640,30 @@ def app(environ, start_response):
         except Exception as exc:
             result, status = {"ok": False, "error": "上传失败：%s" % exc}, "500 Internal Server Error"
         return _json(start_response, status, result)
+    if path == "/api/drive/files" and method == "GET":
+        if not _drive_configured():
+            return _json(start_response, "200 OK",
+                         {"ok": False, "configured": False,
+                          "error": "google drive not configured on server"})
+        try:
+            files = _drive_files()
+        except AlistError as exc:
+            return _json(start_response, "200 OK",
+                         {"ok": False, "configured": True,
+                          "error": str(exc)})
+        return _json(start_response, "200 OK",
+                     {"ok": True, "configured": True, "files": files})
+    if path == "/api/drive/upload" and method == "POST":
+        if not _drive_configured():
+            return _json(start_response, "503 Service Unavailable",
+                         {"ok": False, "error": "google drive not configured"})
+        try:
+            result, status = handle_drive_upload(environ)
+        except Exception as exc:
+            result, status = {"ok": False,
+                              "error": "upload failed: %s" % exc}, \
+                "500 Internal Server Error"
+        return _json(start_response, status, result)
     if path == "/api/delete" and method == "POST":
         data = _read_json(environ)
         safe = _safe_name(data.get("name"))
@@ -352,6 +676,39 @@ def app(environ, start_response):
         except OSError:
             deleted = False
         return _json(start_response, "200 OK", {"ok": True, "deleted": deleted})
+    if path.startswith("/gdl/") and method == "GET":
+        if not _drive_configured():
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "error": "not configured"})
+        resp, safe, size = handle_drive_download(path[5:])
+        if resp is None:
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "error": "file not found"})
+        quoted = urllib.parse.quote(safe)
+        headers = [("Content-Type", "application/octet-stream"),
+                   ("Content-Disposition",
+                    "attachment; filename*=UTF-8''" + quoted)]
+        length = None
+        try:
+            length = resp.headers.get("Content-Length")
+        except Exception:
+            length = None
+        if length:
+            headers.append(("Content-Length", length))
+        elif size:
+            headers.append(("Content-Length", str(size)))
+        start_response("200 OK", headers)
+
+        def gstream():
+            try:
+                while True:
+                    chunk = resp.read(262144)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                resp.close()
+        return gstream()
     if path.startswith("/dl/") and method == "GET":
         found, safe = handle_download(path[4:])
         if not found:
