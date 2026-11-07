@@ -7,6 +7,7 @@ access on the local port is trusted.
 """
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -89,6 +90,79 @@ def _validate_link(data):
         return None, "链接需为完整的 http(s) 地址。"
     return {"name": name, "url": url, "note": note, "category": category}, None
 
+# ---------------------------------------------------------------- platform project categories
+
+PANEL_DB = "/srv/apphub/data/panel/apphub.sqlite3"
+SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$")
+SLUG_RESERVED = {"panel", "api", "static", "login", "logout", "backups",
+                 "github", "settings", "data", "env", "root"}
+_PROJCAT_LOCK = threading.Lock()
+_PROJCAT_CACHE = {"ts": 0.0, "data": None}
+
+# kind -> (display name, intro line, submit button label)
+PROJCAT_KINDS = {
+    "html": ("HTML 项目", "平台登记的静态网页项目，点卡片在新窗口打开。", "发布 HTML 项目"),
+    "py": ("PY 项目", "平台登记的 Python 脚本项目，点卡片打开运行页（填参数执行）。", "发布 PY 项目"),
+}
+
+
+def _panel_db_connect():
+    import sqlite3
+    db = sqlite3.connect("file:%s?mode=ro" % PANEL_DB, uri=True, timeout=5)
+    db.execute("PRAGMA busy_timeout = 5000")
+    return db
+
+
+def _read_registry():
+    """Read the panel project registry (read-only): {kind: [entries]}.
+    Returns None when the registry cannot be read (missing / locked /
+    schema drift) so callers can fall back to an empty view."""
+    try:
+        db = _panel_db_connect()
+        try:
+            rows = db.execute(
+                "SELECT slug, name, project_type, description, created_at "
+                "FROM projects WHERE project_type IN ('html', 'script') "
+                "ORDER BY created_at ASC, id ASC").fetchall()
+        finally:
+            db.close()
+    except Exception:
+        return None
+    out = {"html": [], "py": []}
+    for slug, name, ptype, desc, created in rows:
+        kind = "html" if ptype == "html" else "py"
+        out[kind].append({
+            "slug": slug, "name": name or slug, "kind": kind,
+            "note": desc or "",
+            "url": ("/site/%s/" % slug) if kind == "html" else ("/app/%s/" % slug),
+            "created_at": created,
+        })
+    return out
+
+
+def _registry_cached():
+    """Serve the registry cache. A refresh is only a short read-only
+    sqlite query, so it is ALWAYS done outside _PROJCAT_LOCK: the
+    create path holds that lock across its registration bridge call,
+    and a request thread that blocked on the lock would hang behind
+    the whole bridge round-trip. Stale data (up to the 15 s TTL) is
+    acceptable for display; the create path validates duplicates
+    against fresh data itself."""
+    now = time.time()
+    cache = _PROJCAT_CACHE
+    if cache["data"] is not None and now - cache["ts"] < 15:
+        return cache["data"]
+    data = _read_registry()
+    if data is not None:
+        _PROJCAT_CACHE.update(ts=time.time(), data=data)
+        return data
+    return cache["data"] or {"html": [], "py": []}
+
+
+def _invalidate_registry_cache():
+    _PROJCAT_CACHE.update(ts=0.0, data=None)
+
+
 # ---------------------------------------------------------------- http helpers
 
 COOKIE_NAME = "links_session"
@@ -104,15 +178,52 @@ def _json(start_response, status, payload, extra_headers=None):
     return [body]
 
 
-def _read_json(environ, limit=65536):
+def _read_body(environ, limit):
+    """Read exactly the declared request body.
+
+    Contract: read AT MOST CONTENT_LENGTH bytes in total and return
+    them. Never issue a second read once the declared length has
+    been collected, and never read past it: behind the panel /web
+    proxy the body stream is a spooled replay object that misbehaves
+    under repeated or oversized reads, while a single bounded read
+    (the pattern this app has always used) is reliable. A stream
+    that returns fewer bytes per call than asked is handled by
+    looping on the REMAINING count; a stream that returns more than
+    asked is cut to size. Bounded total reads also means this loop
+    always terminates within ceil(length / 1) iterations.
+    """
     try:
         length = int(environ.get("CONTENT_LENGTH") or 0)
     except ValueError:
         length = 0
-    if length <= 0 or length > limit:
+    if length <= 0:
+        return b""
+    if length > limit:
+        return None
+    stream = environ.get("wsgi.input")
+    if stream is None:
+        return b""
+    chunks = []
+    got = 0
+    try:
+        while got < length:
+            chunk = stream.read(min(65536, length - got))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+    except Exception:
+        return b""
+    data = b"".join(chunks)
+    return data[:length] if len(data) > length else data
+
+
+def _read_json(environ, limit=65536):
+    raw = _read_body(environ, limit)
+    if not raw:
         return {}
     try:
-        return json.loads(environ["wsgi.input"].read(length).decode("utf-8") or "{}")
+        return json.loads(raw.decode("utf-8") or "{}")
     except Exception:
         return {}
 
@@ -300,6 +411,93 @@ def handle_links_delete(environ, start_response, lid):
     return _json(start_response, "200 OK", {"ok": True})
 
 
+def handle_projects_list(environ, start_response, kind):
+    reg = _registry_cached()
+    return _json(start_response, "200 OK",
+                 {"ok": True, "kind": kind, "projects": reg.get(kind, [])})
+
+
+def handle_projects_create(environ, start_response, kind):
+    data = _read_json(environ, limit=1048576)
+    slug = str(data.get("slug") or "").strip()
+    name = str(data.get("name") or slug).strip()
+    desc = str(data.get("description") or "").strip()
+    code = str(data.get("code") or "")
+    if not SLUG_RE.match(slug) or slug.lower() in SLUG_RESERVED:
+        return _json(start_response, "400 Bad Request",
+                     {"ok": False, "error": "bad_slug",
+                      "message": "标识（slug）需为 1–63 位字母、数字、连字符或下划线，且不与平台保留名冲突。"})
+    if not (1 <= len(name) <= 100):
+        return _json(start_response, "400 Bad Request",
+                     {"ok": False, "error": "bad_name", "message": "名称需为 1–100 个字符。"})
+    if len(desc) > 500 or len(code) > 1048576:
+        return _json(start_response, "400 Bad Request",
+                     {"ok": False, "error": "too_large", "message": "说明或代码过长。"})
+    if not code.strip():
+        return _json(start_response, "400 Bad Request",
+                     {"ok": False, "error": "empty_code",
+                      "message": ("请粘贴 HTML 代码。" if kind == "html" else "请粘贴 Python 代码。")})
+    # Fresh registry snapshot for the fast-path duplicate check (the
+    # DB existence check further down is authoritative). This read
+    # never involves _PROJCAT_LOCK.
+    reg_now = _registry_cached()
+    with _PROJCAT_LOCK:
+        if any(p["slug"] == slug for entries in reg_now.values() for p in entries):
+            return _json(start_response, "409 Conflict",
+                         {"ok": False, "error": "slug_taken", "message": "该标识已被占用，请换一个。"})
+        try:
+            db = _panel_db_connect()
+            try:
+                taken = db.execute(
+                    "SELECT 1 FROM projects WHERE slug = ?", (slug,)).fetchone()
+            finally:
+                db.close()
+        except Exception:
+            taken = None
+        if taken:
+            return _json(start_response, "409 Conflict",
+                         {"ok": False, "error": "slug_taken", "message": "该标识已被占用，请换一个。"})
+        # The panel bridge runs in its own interpreter next to the panel
+        # (/tmp/apphub-register-bridge.py, written by the installer): it
+        # imports the panel's own services and registers the project
+        # through services.project_manager.create_or_update_project,
+        # so registration semantics (code dir, data dir, Caddy site
+        # config, audit-side effects) stay identical to the console.
+        payload = {"slug": slug, "name": name, "description": desc,
+                   "code": code, "kind": kind}
+        try:
+            env = dict(os.environ)
+            env["APPHUB_REGISTER_PAYLOAD"] = json.dumps(payload, ensure_ascii=False)
+            import subprocess
+            cp = subprocess.run(
+                ["/srv/apphub/envs/panel/bin/python",
+                 "/tmp/apphub-register-bridge.py"],
+                env=env, capture_output=True, text=True, timeout=20)
+            try:
+                result = json.loads((cp.stdout or "").strip().splitlines()[-1])
+            except Exception:
+                result = {}
+            if cp.returncode != 0 or not result.get("ok"):
+                return _json(start_response, "502 Bad Gateway",
+                             {"ok": False, "error": "register_failed",
+                              "message": "平台登记失败：" + str(result.get("error") or "未知错误")[:200]})
+        except Exception as exc:  # noqa: BLE001
+            return _json(start_response, "502 Bad Gateway",
+                         {"ok": False, "error": "register_failed",
+                          "message": "平台登记失败：" + str(exc)[:200]})
+        _invalidate_registry_cache()
+    reg = _registry_cached()
+    proj = next((p for p in reg.get(kind, []) if p["slug"] == slug), None)
+    if proj is None:
+        # The bridge already confirmed registration; if the registry
+        # read raced, still hand back the canonical entry shape.
+        label, _intro, _btn = PROJCAT_KINDS[kind]
+        proj = {"slug": slug, "name": name, "kind": kind, "note": desc,
+                "url": ("/site/%s/" % slug) if kind == "html" else ("/app/%s/" % slug),
+                "created_at": None}
+    return _json(start_response, "200 OK", {"ok": True, "project": proj})
+
+
 os.makedirs(RUNTIME, exist_ok=True)
 
 # ---------------------------------------------------------------- page
@@ -361,6 +559,14 @@ PAGE = """<!DOCTYPE html>
           font-size: 14px; opacity: .75; cursor: pointer; background: transparent; color: inherit; }
   body.editing .addcard { display: flex; }
   .empty { opacity: .55; font-size: 14px; padding: 26px 2px; }
+  .sheet textarea { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 13px;
+           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+           background: transparent; color: inherit; outline: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .sheet textarea:focus { border-color: #2f6fd0; }
+  .crumb { font-size: 13px; padding: 2px 2px 0; }
+  .crumb a { color: #2f6fd0; text-decoration: none; }
+  .intro { font-size: 13px; opacity: .65; padding: 4px 2px 0; }
+  body:not(.editing) .delcard { display: none !important; }
   footer { margin-top: 30px; font-size: 12px; opacity: .45; padding: 0 2px; }
   .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.48); z-index: 50;
              display: none; align-items: flex-end; justify-content: center; }
@@ -425,11 +631,37 @@ PAGE = """<!DOCTYPE html>
   </form>
 </div>
 
+<div class="overlay" id="poverlay">
+  <form class="sheet" id="psheet">
+    <h3 id="psTitle">发布项目</h3>
+    <label>名称</label>
+    <input id="p-name" type="text" required maxlength="100" placeholder="例如 天气看板">
+    <label>标识 slug（小写字母 / 数字 / 连字符，定后即网址的一部分）</label>
+    <input id="p-slug" type="text" required maxlength="63" placeholder="例如 weather-board" pattern="[a-z0-9][a-z0-9\-_]*">
+    <label>说明（可选，显示为卡片小字）</label>
+    <input id="p-desc" type="text" maxlength="500">
+    <label id="p-code-label">代码</label>
+    <textarea id="p-code" rows="10" required spellcheck="false" placeholder="把完整代码粘贴到这里"></textarea>
+    <div class="srow">
+      <span style="flex:1"></span>
+      <button id="p-cancel" type="button" class="sbtn ghost">取消</button>
+      <button type="submit" class="sbtn" id="p-submit">发布</button>
+    </div>
+    <p class="msg" id="psheetMsg"></p>
+  </form>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 let allLinks = [];
 let editing = false;
 let sheetId = null;
+let regData = {html: [], py: []};
+const PROJCAT = {html: {name: "HTML 项目", file: "index.html", btn: "发布 HTML 项目"},
+                 py: {name: "PY 项目", file: "main.py", btn: "发布 PY 项目"}};
+const viewMatch = location.pathname.match(/\/(html|py)\/?$/);
+const catKind = viewMatch ? viewMatch[1] : null;
+const basePath = location.pathname.replace(/\/(html|py)\/?$/, "").replace(/\/?$/, "/");
 
 async function api(path, options) {
   const res = await fetch(path, {credentials: "same-origin", cache: "no-store", ...options});
@@ -485,11 +717,36 @@ function cardHtml(l, withDate) {
   return `<a class="card" href="${esc(l.url)}" target="_blank" rel="noopener">${inner}</a>`;
 }
 
+function projCard(p) {
+  const letter = esc(Array.from(p.name || "?")[0] || "?");
+  const tileInner = p.kind === "html"
+    ? `<img src="/assets/logos/${p.slug}" alt="" loading="lazy" onerror="tileFallback(this)">`
+    : letter;
+  const inner = `<span class="tile" data-letter="${letter}" style="--h:${hueOf(p.name || "")}">${tileInner}</span>` +
+    `<span class="meta"><span class="name">${esc(p.name)}</span>` +
+    `<span class="sub2">${esc(p.note || "")}</span></span>`;
+  if (editing) return `<a class="card" href="${esc(p.url)}" target="_blank" rel="noopener" title="编辑模式下也能打开">${inner}</a>`;
+  return `<a class="card" href="${esc(p.url)}" target="_blank" rel="noopener">${inner}</a>`;
+}
+function specialSectionsHtml() {
+  if (editing || catKind || $("q").value.trim()) return "";
+  return ["html", "py"].map(k => {
+    const n = (regData[k] || []).length;
+    const letter = k === "html" ? "H" : "P";
+    const tileInner = `<img src="/assets/logos/${k === "html" ? "site" : "app"}" alt="" loading="lazy" onerror="tileFallback(this)">`;
+    return `<h2 class="cat">${PROJCAT[k].name}<span class="n">${n}</span></h2>` +
+      `<div class="grid"><a class="card" href="${k}/">` +
+      `<span class="tile" data-letter="${letter}" style="--h:${k === "html" ? 210 : 150}">${tileInner}</span>` +
+      `<span class="meta"><span class="name">查看全部</span><span class="sub2">${n} 个项目</span></span></a></div>`;
+  }).join("");
+}
 function render() {
   const gs = groups();
   const board = $("board");
-  if (!allLinks.length) {
-    board.innerHTML = `<div class="empty">暂无链接。点右上角「编辑」添加第一个。</div>`;
+  if (catKind) {
+    renderCatPage(board);
+  } else if (!allLinks.length) {
+    board.innerHTML = specialSectionsHtml() + `<div class="empty">暂无链接。点右上角「编辑」添加第一个。</div>`;
   } else if (!gs.length) {
     board.innerHTML = `<div class="empty">没有匹配的链接。</div>`;
   } else {
@@ -502,12 +759,13 @@ function render() {
           recent.map(l => cardHtml(l, true)).join("") + `</div>`;
       }
     }
-    board.innerHTML = recentHtml + gs.map(g =>
+    board.innerHTML = recentHtml + specialSectionsHtml() + gs.map(g =>
       `<h2 class="cat">${esc(g.cat || "未分类")}<span class="n">${g.items.length}</span></h2>` +
       `<div class="grid">` + g.items.map(cardHtml).join("") +
       (editing && !($("q").value.trim()) ? `<button type="button" class="addcard" data-add="${esc(g.cat)}">＋ 添加</button>` : "") +
       `</div>`).join("");
   }
+  board.querySelectorAll("[data-padd]").forEach(el => el.onclick = () => openProjSheet(el.dataset.padd));
   board.querySelectorAll("[data-edit]").forEach(el => el.onclick = () => openSheet(el.dataset.edit));
   board.querySelectorAll("[data-add]").forEach(el => el.onclick = () => openSheet(null, el.dataset.add));
   const cats = [...new Set(allLinks.map(l => (l.category || "").trim()).filter(Boolean))];
@@ -515,12 +773,72 @@ function render() {
   $("foot").textContent = allLinks.length ? `共 ${allLinks.length} 条 · 点卡片打开，编辑是低频操作，收在右上角「编辑」里` : "";
 }
 
+function renderCatPage(board) {
+  const meta = PROJCAT[catKind];
+  const items = regData[catKind] || [];
+  const q = $("q").value.trim().toLowerCase();
+  const filtered = items.filter(p => !q ||
+    (p.name + " " + (p.note || "") + " " + p.slug).toLowerCase().includes(q));
+  let h = `<div class="crumb"><a href="${basePath}">← 返回微书签</a></div>` +
+    `<h2 class="cat" style="font-size:17px;opacity:1;margin-top:10px;">${meta.name}<span class="n">${items.length}</span></h2>` +
+    `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台登记的 Python 脚本项目，点卡片打开运行页（填参数执行）。"}</div>`;
+  if (!editing && !q) {
+    const recent = [...items].filter(p => p.created_at)
+      .sort((a, b) => b.created_at - a.created_at).slice(0, 8);
+    if (recent.length >= 2) {
+      h += `<h2 class="cat">最近添加</h2><div class="grid">` +
+        recent.map(p => projCard(p)).join("") + `</div>`;
+    }
+  }
+  h += `<h2 class="cat">全部项目<span class="n">${filtered.length}</span></h2>`;
+  if (!items.length) {
+    h += `<div class="empty">本类暂无项目。用下方「添加项目」发布第一个。</div>`;
+  } else if (!filtered.length) {
+    h += `<div class="empty">没有匹配的项目。</div>`;
+  } else {
+    h += `<div class="grid">` + filtered.map(p => projCard(p)).join("") + `</div>`;
+  }
+  if (!q) h += `<button type="button" class="addcard" style="display:flex;width:100%;margin-top:12px;" data-padd="${catKind}">＋ 添加项目</button>`;
+  board.innerHTML = h;
+  $("foot").textContent = `共 ${items.length} 个${meta.name} · 由平台项目登记驱动，登记增减自动同步`;
+}
+
 async function loadLinks() {
   const {status, data} = await api("api/links");
   if (status !== 200) { $("board").innerHTML = `<div class="empty">加载失败，请刷新重试。</div>`; return; }
   allLinks = data.links || [];
+  const pr = await api("api/projects");
+  if (pr.status === 200 && pr.data.projects) regData = pr.data.projects;
+  if (catKind) document.title = PROJCAT[catKind].name + " · 微书签";
   render();
 }
+
+function openProjSheet(kind) {
+  const meta = PROJCAT[kind];
+  $("psTitle").textContent = meta.btn;
+  $("p-name").value = ""; $("p-slug").value = ""; $("p-desc").value = ""; $("p-code").value = "";
+  $("p-code-label").textContent = kind === "html" ? "HTML 代码（将保存为 index.html）" : "Python 代码（将保存为 main.py）";
+  $("p-code").placeholder = kind === "html" ? "粘贴完整的 HTML 代码（单个文件）" : "粘贴完整的 Python 脚本代码（单个文件）";
+  $("p-submit").textContent = meta.btn;
+  $("psheetMsg").textContent = "";
+  $("psheet").dataset.kind = kind;
+  $("poverlay").classList.add("show");
+  setTimeout(() => $("p-name").focus(), 30);
+}
+function closeProjSheet() { $("poverlay").classList.remove("show"); }
+$("p-cancel").onclick = closeProjSheet;
+$("poverlay").addEventListener("click", e => { if (e.target === $("poverlay")) closeProjSheet(); });
+$("psheet").onsubmit = async (e) => {
+  e.preventDefault();
+  const kind = $("psheet").dataset.kind;
+  const body = {name: $("p-name").value, slug: $("p-slug").value,
+                description: $("p-desc").value, code: $("p-code").value};
+  $("psheetMsg").textContent = "正在登记到平台…";
+  const {status, data} = await post("api/projects/" + kind, body);
+  if (status !== 200) { $("psheetMsg").innerHTML = `<span class="err">${esc(data.message || "发布失败")}</span>`; return; }
+  closeProjSheet();
+  await loadLinks();
+};
 
 function openSheet(id, presetCat) {
   const l = id ? allLinks.find(x => x.id === id) : null;
@@ -614,6 +932,21 @@ def application(environ, start_response):
                          {"ok": False, "error": "not_found", "message": "接口不存在。"})
         if path == "/api/logout" and method == "POST":
             return handle_logout(environ, start_response)
+        if path.startswith("/api/projects"):
+            if not _authed(environ):
+                return _json(start_response, "401 Unauthorized",
+                             {"ok": False, "error": "unauthorized", "message": "请先登录。"})
+            if path == "/api/projects" and method == "GET":
+                reg = _registry_cached()
+                return _json(start_response, "200 OK", {"ok": True, "projects": reg})
+            pk = path[len("/api/projects/"):]
+            if pk in PROJCAT_KINDS:
+                if method == "GET":
+                    return handle_projects_list(environ, start_response, pk)
+                if method == "POST":
+                    return handle_projects_create(environ, start_response, pk)
+            return _json(start_response, "404 Not Found",
+                         {"ok": False, "error": "not_found", "message": "接口不存在。"})
         if path.startswith("/api/links"):
             if not _authed(environ):
                 return _json(start_response, "401 Unauthorized",
@@ -634,7 +967,7 @@ def application(environ, start_response):
                     return handle_links_delete(environ, start_response, lid)
             return _json(start_response, "404 Not Found",
                          {"ok": False, "error": "not_found", "message": "接口不存在。"})
-        if path == "/" and method == "GET":
+        if path in ("/", "/html", "/html/", "/py", "/py/") and method == "GET":
             body = PAGE.encode("utf-8")
             start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
                                       ("Content-Length", str(len(body))),
