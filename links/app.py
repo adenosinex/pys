@@ -122,7 +122,7 @@ def _read_registry():
         try:
             rows = db.execute(
                 "SELECT slug, name, project_type, description, created_at "
-                "FROM projects WHERE project_type IN ('html', 'script') "
+                "FROM projects WHERE project_type IN ('html', 'script', 'web') "
                 "ORDER BY created_at ASC, id ASC").fetchall()
         finally:
             db.close()
@@ -131,10 +131,19 @@ def _read_registry():
     out = {"html": [], "py": []}
     for slug, name, ptype, desc, created in rows:
         kind = "html" if ptype == "html" else "py"
+        # The panel's Python web apps register as project_type "web";
+        # they form the "py" zone here and open at /web/<slug>/.
+        # Pasted script projects register as "script" (/app/<slug>/).
+        if ptype == "html":
+            url = "/site/%s/" % slug
+        elif ptype == "web":
+            url = "/web/%s/" % slug
+        else:
+            url = "/app/%s/" % slug
         out[kind].append({
             "slug": slug, "name": name or slug, "kind": kind,
             "note": desc or "",
-            "url": ("/site/%s/" % slug) if kind == "html" else ("/app/%s/" % slug),
+            "url": url,
             "created_at": created,
         })
     return out
@@ -534,6 +543,19 @@ PAGE_HOME = """<!DOCTYPE html>
   h2.cat { font-size: 14px; margin: 20px 2px 10px; opacity: .75; font-weight: 600;
            display: flex; align-items: baseline; gap: 8px; }
   h2.cat .n { font-size: 12px; opacity: .6; font-weight: 400; }
+  .zones { display: grid; gap: 10px; margin-top: 4px; }
+  .zone { border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
+          background: color-mix(in srgb, currentColor 4%, transparent);
+          border-radius: 16px; padding: 12px 12px 10px; }
+  .zone-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 9px; }
+  .zone-title { font-size: 15px; font-weight: 700; }
+  .zone-head .n { font-size: 12px; opacity: .6; }
+  .zone-all { margin-left: auto; font-size: 13px; color: #2f6fd0; text-decoration: none; white-space: nowrap; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { display: inline-flex; align-items: baseline; gap: 5px; padding: 6px 11px; border-radius: 999px;
+          border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+          font-size: 13px; color: inherit; text-decoration: none; }
+  .chip .n { font-size: 11px; opacity: .55; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px 8px; }
   @media (max-width: 560px) { .grid { grid-template-columns: repeat(4, 1fr); } }
   .card { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0;
@@ -637,6 +659,36 @@ let editing = false;
 let sheetId = null;
 let regData = {html: [], py: []};
 const PROJCAT = {html: {name: "HTML 项目"}, py: {name: "PY 项目"}};
+const APPCATS = {
+  py: [
+    {name: "内容媒体", slugs: ["zhihu-core", "yt-audio", "vidlib", "beastlib"]},
+    {name: "文件工具", slugs: ["transfer", "cloudfiles", "nameclean", "filetools"]},
+    {name: "记录数据", slugs: ["records", "cards", "docsnew"]},
+    {name: "网络工具", slugs: ["subconv", "dnsmap", "speedtest", "openrouter"]},
+    {name: "平台效率", slugs: ["links", "clipboard", "burn", "medatlas"]}
+  ],
+  html: ["平台与发布", "导入页"]
+};
+function catOf(p) {
+  if (p.kind === "py") {
+    for (const c of APPCATS.py) if (c.slugs.indexOf(p.slug) >= 0) return c.name;
+    return "其他";
+  }
+  return /^p[0-9]+$/.test(p.slug) ? "导入页" : "平台与发布";
+}
+function catOrder(kind) {
+  return kind === "py" ? APPCATS.py.map(c => c.name).concat(["其他"]) : APPCATS.html.slice();
+}
+function groupProjects(items, kind) {
+  const by = new Map();
+  for (const p of items) {
+    const c = catOf(p);
+    if (!by.has(c)) by.set(c, []);
+    by.get(c).push(p);
+  }
+  return catOrder(kind).filter(c => by.has(c)).map(c => ({cat: c, items: by.get(c)}));
+}
+
 const viewMatch = location.pathname.match(/\/(html|py)\/?$/);
 const catKind = viewMatch ? viewMatch[1] : null;
 const basePath = location.pathname.replace(/\/(html|py)\/?$/, "").replace(/\/?$/, "/");
@@ -698,9 +750,7 @@ function cardHtml(l, withDate) {
 
 function projCard(p) {
   const letter = esc(Array.from(p.name || "?")[0] || "?");
-  const tileInner = p.kind === "html"
-    ? `<img src="/assets/logos/${p.slug}" alt="" loading="lazy" onerror="tileFallback(this)">`
-    : letter;
+  const tileInner = `<img src="/assets/logos/${p.slug}" alt="" loading="lazy" onerror="tileFallback(this)">`;
   const inner = `<span class="tile" data-letter="${letter}" style="--h:${hueOf(p.name || "")}">${tileInner}</span>` +
     `<span class="meta"><span class="name">${esc(p.name)}</span>` +
     `<span class="sub2">${esc(p.note || "")}</span></span>`;
@@ -709,16 +759,19 @@ function projCard(p) {
 }
 function specialSectionsHtml() {
   if (editing || catKind || $("q").value.trim()) return "";
-  return ["html", "py"].map(k => {
-    const n = (regData[k] || []).length;
-    const letter = k === "html" ? "H" : "P";
-    const tileInner = `<img src="/assets/logos/${k === "html" ? "site" : "app"}" alt="" loading="lazy" onerror="tileFallback(this)">`;
-    return `<h2 class="cat">${PROJCAT[k].name}<span class="n">${n}</span></h2>` +
-      `<div class="grid"><a class="card" href="${k}/">` +
-      `<span class="tile" data-letter="${letter}" style="--h:${k === "html" ? 210 : 150}">${tileInner}</span>` +
-      `<span class="meta"><span class="name">查看全部</span><span class="sub2">${n} 个项目</span></span></a></div>`;
+  const zoneNames = {py: "Python 应用", html: "HTML 页面"};
+  const zones = ["py", "html"].map(k => {
+    const items = regData[k] || [];
+    const chips = groupProjects(items, k).map(g =>
+      `<a class="chip" href="${k}/?cat=${encodeURIComponent(g.cat)}">${esc(g.cat)}<span class="n">${g.items.length}</span></a>`).join("");
+    return `<div class="zone"><div class="zone-head">` +
+      `<span class="zone-title">${zoneNames[k]}</span><span class="n">${items.length}</span>` +
+      `<a class="zone-all" href="${k}/">进入分区 →</a></div>` +
+      `<div class="chips">${chips}</div></div>`;
   }).join("");
+  return `<h2 class="cat">应用分区</h2><div class="zones">${zones}</div>`;
 }
+
 function render() {
   const gs = groups();
   const board = $("board");
@@ -872,6 +925,14 @@ PAGE_HTML = """<!DOCTYPE html>
   h2.cat { font-size: 14px; margin: 20px 2px 10px; opacity: .75; font-weight: 600;
            display: flex; align-items: baseline; gap: 8px; }
   h2.cat .n { font-size: 12px; opacity: .6; font-weight: 400; }
+  .catnav { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 2px 0; }
+  .catnav .chip { display: inline-flex; align-items: baseline; gap: 5px; padding: 6px 11px; border-radius: 999px;
+          border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+          background: transparent; color: inherit; font-size: 13px; cursor: pointer; font-family: inherit; }
+  .catnav .chip .n { font-size: 11px; opacity: .55; }
+  h2.cat.sec { cursor: pointer; user-select: none; }
+  h2.cat.sec .tog { margin-left: auto; font-size: 12px; opacity: .6; font-weight: 400; }
+  .secgrid.off { display: none; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px 8px; }
   @media (max-width: 560px) { .grid { grid-template-columns: repeat(4, 1fr); } }
   .card { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0;
@@ -1018,6 +1079,36 @@ let editing = false;
 let sheetId = null;
 let regData = {html: [], py: []};
 const PROJCAT = {html: {name: "HTML 项目"}, py: {name: "PY 项目"}};
+const APPCATS = {
+  py: [
+    {name: "内容媒体", slugs: ["zhihu-core", "yt-audio", "vidlib", "beastlib"]},
+    {name: "文件工具", slugs: ["transfer", "cloudfiles", "nameclean", "filetools"]},
+    {name: "记录数据", slugs: ["records", "cards", "docsnew"]},
+    {name: "网络工具", slugs: ["subconv", "dnsmap", "speedtest", "openrouter"]},
+    {name: "平台效率", slugs: ["links", "clipboard", "burn", "medatlas"]}
+  ],
+  html: ["平台与发布", "导入页"]
+};
+function catOf(p) {
+  if (p.kind === "py") {
+    for (const c of APPCATS.py) if (c.slugs.indexOf(p.slug) >= 0) return c.name;
+    return "其他";
+  }
+  return /^p[0-9]+$/.test(p.slug) ? "导入页" : "平台与发布";
+}
+function catOrder(kind) {
+  return kind === "py" ? APPCATS.py.map(c => c.name).concat(["其他"]) : APPCATS.html.slice();
+}
+function groupProjects(items, kind) {
+  const by = new Map();
+  for (const p of items) {
+    const c = catOf(p);
+    if (!by.has(c)) by.set(c, []);
+    by.get(c).push(p);
+  }
+  return catOrder(kind).filter(c => by.has(c)).map(c => ({cat: c, items: by.get(c)}));
+}
+
 const viewMatch = location.pathname.match(/\/(html|py)\/?$/);
 const catKind = viewMatch ? viewMatch[1] : null;
 const basePath = location.pathname.replace(/\/(html|py)\/?$/, "").replace(/\/?$/, "/");
@@ -1079,9 +1170,7 @@ function cardHtml(l, withDate) {
 
 function projCard(p) {
   const letter = esc(Array.from(p.name || "?")[0] || "?");
-  const tileInner = p.kind === "html"
-    ? `<img src="/assets/logos/${p.slug}" alt="" loading="lazy" onerror="tileFallback(this)">`
-    : letter;
+  const tileInner = `<img src="/assets/logos/${p.slug}" alt="" loading="lazy" onerror="tileFallback(this)">`;
   const inner = `<span class="tile" data-letter="${letter}" style="--h:${hueOf(p.name || "")}">${tileInner}</span>` +
     `<span class="meta"><span class="name">${esc(p.name)}</span>` +
     `<span class="sub2">${esc(p.note || "")}</span></span>`;
@@ -1092,16 +1181,26 @@ function render() {
   renderCatPage($("board"));
 }
 
+let expandedCats = null;
+let focusScrolled = false;
+const focusCat = (() => { try { return new URLSearchParams(location.search).get("cat"); } catch (e) { return null; } })();
 function renderCatPage(board) {
   const meta = PROJCAT[catKind];
   const items = regData[catKind] || [];
   const q = $("q").value.trim().toLowerCase();
-  const filtered = items.filter(p => !q ||
+  const searching = !!q;
+  const filtered = items.filter(p => !searching ||
     (p.name + " " + (p.note || "") + " " + p.slug).toLowerCase().includes(q));
+  if (expandedCats === null) {
+    const gs0 = groupProjects(items, catKind);
+    expandedCats = new Set();
+    if (focusCat && gs0.some(g => g.cat === focusCat)) expandedCats.add(focusCat);
+    else if (gs0.length) expandedCats.add(gs0[0].cat);
+  }
   let h = `<div class="crumb"><a href="${basePath}">← 返回微书签</a></div>` +
     `<h2 class="cat" style="font-size:17px;opacity:1;margin-top:10px;">${meta.name}<span class="n">${items.length}</span></h2>` +
-    `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台登记的 Python 脚本项目，点卡片打开运行页（填参数执行）。"}</div>`;
-  if (!editing && !q) {
+    `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台的 Python 应用与脚本项目，点卡片打开。"}</div>`;
+  if (!editing && !searching && !focusCat) {
     const recent = [...items].filter(p => p.created_at)
       .sort((a, b) => b.created_at - a.created_at).slice(0, 8);
     if (recent.length >= 2) {
@@ -1109,15 +1208,51 @@ function renderCatPage(board) {
         recent.map(p => projCard(p)).join("") + `</div>`;
     }
   }
-  h += `<h2 class="cat">全部项目<span class="n">${filtered.length}</span></h2>`;
+  const gs = groupProjects(filtered, catKind);
+  if (gs.length) {
+    h += `<div class="catnav">` + gs.map(g =>
+      `<button type="button" class="chip" data-jump="${esc(g.cat)}">${esc(g.cat)}<span class="n">${g.items.length}</span></button>`).join("") + `</div>`;
+  }
   if (!items.length) {
     h += `<div class="empty">本类暂无项目。用下方表单发布第一个。</div>`;
-  } else if (!filtered.length) {
+  } else if (!gs.length) {
     h += `<div class="empty">没有匹配的项目。</div>`;
   } else {
-    h += `<div class="grid">` + filtered.map(p => projCard(p)).join("") + `</div>`;
+    h += gs.map(g => {
+      const open = searching || expandedCats.has(g.cat);
+      return `<h2 class="cat sec" data-sec="${esc(g.cat)}">${esc(g.cat)}<span class="n">${g.items.length}</span><span class="tog">${open ? "收起 ▴" : "展开 ▾"}</span></h2>` +
+        `<div class="grid secgrid${open ? "" : " off"}" data-grid="${esc(g.cat)}">` + g.items.map(p => projCard(p)).join("") + `</div>`;
+    }).join("");
   }
   board.innerHTML = h;
+  board.querySelectorAll("[data-sec]").forEach(el => {
+    el.addEventListener("click", () => {
+      const c = el.dataset.sec;
+      const grid = board.querySelector(`[data-grid="${c}"]`);
+      if (!grid) return;
+      const nowOff = grid.classList.toggle("off");
+      if (nowOff) expandedCats.delete(c); else expandedCats.add(c);
+      el.querySelector(".tog").textContent = nowOff ? "展开 ▾" : "收起 ▴";
+    });
+  });
+  board.querySelectorAll("[data-jump]").forEach(el => {
+    el.addEventListener("click", () => {
+      const c = el.dataset.jump;
+      expandedCats.add(c);
+      const head = board.querySelector(`[data-sec="${c}"]`);
+      const grid = board.querySelector(`[data-grid="${c}"]`);
+      if (grid && grid.classList.contains("off")) {
+        grid.classList.remove("off");
+        const tog = head ? head.querySelector(".tog") : null;
+        if (tog) tog.textContent = "收起 ▴";
+      }
+      if (head) head.scrollIntoView({behavior: "smooth", block: "start"});
+    });
+  });
+  if (focusCat && !focusScrolled) {
+    const head = board.querySelector(`[data-sec="${focusCat}"]`);
+    if (head) { focusScrolled = true; setTimeout(() => head.scrollIntoView({block: "start"}), 60); }
+  }
   $("foot").textContent = `共 ${items.length} 个${meta.name} · 由平台项目登记驱动，登记增减自动同步`;
 }
 
@@ -1305,6 +1440,14 @@ PAGE_PY = """<!DOCTYPE html>
   h2.cat { font-size: 14px; margin: 20px 2px 10px; opacity: .75; font-weight: 600;
            display: flex; align-items: baseline; gap: 8px; }
   h2.cat .n { font-size: 12px; opacity: .6; font-weight: 400; }
+  .catnav { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 2px 0; }
+  .catnav .chip { display: inline-flex; align-items: baseline; gap: 5px; padding: 6px 11px; border-radius: 999px;
+          border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+          background: transparent; color: inherit; font-size: 13px; cursor: pointer; font-family: inherit; }
+  .catnav .chip .n { font-size: 11px; opacity: .55; }
+  h2.cat.sec { cursor: pointer; user-select: none; }
+  h2.cat.sec .tog { margin-left: auto; font-size: 12px; opacity: .6; font-weight: 400; }
+  .secgrid.off { display: none; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px 8px; }
   @media (max-width: 560px) { .grid { grid-template-columns: repeat(4, 1fr); } }
   .card { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0;
@@ -1438,6 +1581,36 @@ let editing = false;
 let sheetId = null;
 let regData = {html: [], py: []};
 const PROJCAT = {html: {name: "HTML 项目"}, py: {name: "PY 项目"}};
+const APPCATS = {
+  py: [
+    {name: "内容媒体", slugs: ["zhihu-core", "yt-audio", "vidlib", "beastlib"]},
+    {name: "文件工具", slugs: ["transfer", "cloudfiles", "nameclean", "filetools"]},
+    {name: "记录数据", slugs: ["records", "cards", "docsnew"]},
+    {name: "网络工具", slugs: ["subconv", "dnsmap", "speedtest", "openrouter"]},
+    {name: "平台效率", slugs: ["links", "clipboard", "burn", "medatlas"]}
+  ],
+  html: ["平台与发布", "导入页"]
+};
+function catOf(p) {
+  if (p.kind === "py") {
+    for (const c of APPCATS.py) if (c.slugs.indexOf(p.slug) >= 0) return c.name;
+    return "其他";
+  }
+  return /^p[0-9]+$/.test(p.slug) ? "导入页" : "平台与发布";
+}
+function catOrder(kind) {
+  return kind === "py" ? APPCATS.py.map(c => c.name).concat(["其他"]) : APPCATS.html.slice();
+}
+function groupProjects(items, kind) {
+  const by = new Map();
+  for (const p of items) {
+    const c = catOf(p);
+    if (!by.has(c)) by.set(c, []);
+    by.get(c).push(p);
+  }
+  return catOrder(kind).filter(c => by.has(c)).map(c => ({cat: c, items: by.get(c)}));
+}
+
 const viewMatch = location.pathname.match(/\/(html|py)\/?$/);
 const catKind = viewMatch ? viewMatch[1] : null;
 const basePath = location.pathname.replace(/\/(html|py)\/?$/, "").replace(/\/?$/, "/");
@@ -1499,9 +1672,7 @@ function cardHtml(l, withDate) {
 
 function projCard(p) {
   const letter = esc(Array.from(p.name || "?")[0] || "?");
-  const tileInner = p.kind === "html"
-    ? `<img src="/assets/logos/${p.slug}" alt="" loading="lazy" onerror="tileFallback(this)">`
-    : letter;
+  const tileInner = `<img src="/assets/logos/${p.slug}" alt="" loading="lazy" onerror="tileFallback(this)">`;
   const inner = `<span class="tile" data-letter="${letter}" style="--h:${hueOf(p.name || "")}">${tileInner}</span>` +
     `<span class="meta"><span class="name">${esc(p.name)}</span>` +
     `<span class="sub2">${esc(p.note || "")}</span></span>`;
@@ -1512,16 +1683,26 @@ function render() {
   renderCatPage($("board"));
 }
 
+let expandedCats = null;
+let focusScrolled = false;
+const focusCat = (() => { try { return new URLSearchParams(location.search).get("cat"); } catch (e) { return null; } })();
 function renderCatPage(board) {
   const meta = PROJCAT[catKind];
   const items = regData[catKind] || [];
   const q = $("q").value.trim().toLowerCase();
-  const filtered = items.filter(p => !q ||
+  const searching = !!q;
+  const filtered = items.filter(p => !searching ||
     (p.name + " " + (p.note || "") + " " + p.slug).toLowerCase().includes(q));
+  if (expandedCats === null) {
+    const gs0 = groupProjects(items, catKind);
+    expandedCats = new Set();
+    if (focusCat && gs0.some(g => g.cat === focusCat)) expandedCats.add(focusCat);
+    else if (gs0.length) expandedCats.add(gs0[0].cat);
+  }
   let h = `<div class="crumb"><a href="${basePath}">← 返回微书签</a></div>` +
     `<h2 class="cat" style="font-size:17px;opacity:1;margin-top:10px;">${meta.name}<span class="n">${items.length}</span></h2>` +
-    `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台登记的 Python 脚本项目，点卡片打开运行页（填参数执行）。"}</div>`;
-  if (!editing && !q) {
+    `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台的 Python 应用与脚本项目，点卡片打开。"}</div>`;
+  if (!editing && !searching && !focusCat) {
     const recent = [...items].filter(p => p.created_at)
       .sort((a, b) => b.created_at - a.created_at).slice(0, 8);
     if (recent.length >= 2) {
@@ -1529,15 +1710,51 @@ function renderCatPage(board) {
         recent.map(p => projCard(p)).join("") + `</div>`;
     }
   }
-  h += `<h2 class="cat">全部项目<span class="n">${filtered.length}</span></h2>`;
+  const gs = groupProjects(filtered, catKind);
+  if (gs.length) {
+    h += `<div class="catnav">` + gs.map(g =>
+      `<button type="button" class="chip" data-jump="${esc(g.cat)}">${esc(g.cat)}<span class="n">${g.items.length}</span></button>`).join("") + `</div>`;
+  }
   if (!items.length) {
     h += `<div class="empty">本类暂无项目。用下方表单发布第一个。</div>`;
-  } else if (!filtered.length) {
+  } else if (!gs.length) {
     h += `<div class="empty">没有匹配的项目。</div>`;
   } else {
-    h += `<div class="grid">` + filtered.map(p => projCard(p)).join("") + `</div>`;
+    h += gs.map(g => {
+      const open = searching || expandedCats.has(g.cat);
+      return `<h2 class="cat sec" data-sec="${esc(g.cat)}">${esc(g.cat)}<span class="n">${g.items.length}</span><span class="tog">${open ? "收起 ▴" : "展开 ▾"}</span></h2>` +
+        `<div class="grid secgrid${open ? "" : " off"}" data-grid="${esc(g.cat)}">` + g.items.map(p => projCard(p)).join("") + `</div>`;
+    }).join("");
   }
   board.innerHTML = h;
+  board.querySelectorAll("[data-sec]").forEach(el => {
+    el.addEventListener("click", () => {
+      const c = el.dataset.sec;
+      const grid = board.querySelector(`[data-grid="${c}"]`);
+      if (!grid) return;
+      const nowOff = grid.classList.toggle("off");
+      if (nowOff) expandedCats.delete(c); else expandedCats.add(c);
+      el.querySelector(".tog").textContent = nowOff ? "展开 ▾" : "收起 ▴";
+    });
+  });
+  board.querySelectorAll("[data-jump]").forEach(el => {
+    el.addEventListener("click", () => {
+      const c = el.dataset.jump;
+      expandedCats.add(c);
+      const head = board.querySelector(`[data-sec="${c}"]`);
+      const grid = board.querySelector(`[data-grid="${c}"]`);
+      if (grid && grid.classList.contains("off")) {
+        grid.classList.remove("off");
+        const tog = head ? head.querySelector(".tog") : null;
+        if (tog) tog.textContent = "收起 ▴";
+      }
+      if (head) head.scrollIntoView({behavior: "smooth", block: "start"});
+    });
+  });
+  if (focusCat && !focusScrolled) {
+    const head = board.querySelector(`[data-sec="${focusCat}"]`);
+    if (head) { focusScrolled = true; setTimeout(() => head.scrollIntoView({block: "start"}), 60); }
+  }
   $("foot").textContent = `共 ${items.length} 个${meta.name} · 由平台项目登记驱动，登记增减自动同步`;
 }
 
