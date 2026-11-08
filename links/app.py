@@ -955,6 +955,12 @@ PAGE_HTML = """<!DOCTYPE html>
            border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
            background: transparent; color: inherit; outline: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
   .pubform textarea:focus { border-color: #2f6fd0; }
+  .uprow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .uprow .tbtn { display: inline-block; margin: 0; padding: 8px 14px; border-radius: 999px;
+          border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+          background: transparent; color: inherit; font-size: 14px; cursor: pointer; white-space: nowrap; }
+  .fnote { font-size: 12px; opacity: .7; }
+  #pf-fhint { margin: 6px 0 0; }
 </style>
 <section id="pubwrap" hidden>
   <h2 class="cat" style="font-size:17px;opacity:1;">发布 HTML 项目</h2>
@@ -965,6 +971,13 @@ PAGE_HTML = """<!DOCTYPE html>
     <input id="pf-slug" type="text" required maxlength="63" placeholder="例如 weather-board" pattern="[a-z0-9][a-z0-9\-_]*">
     <label>说明（可选，显示为卡片小字）</label>
     <input id="pf-desc" type="text" maxlength="500">
+    <label>上传 HTML 文件（可选，选中后自动填入下方代码框，与粘贴二选一）</label>
+    <div class="uprow">
+      <label class="tbtn" for="pf-file">选择 .html 文件</label>
+      <input id="pf-file" type="file" accept=".html,.htm,text/html" hidden>
+      <span id="pf-fname" class="fnote"></span>
+    </div>
+    <p class="fnote" id="pf-fhint">单个文件内容上限 1 MB（与粘贴发布一致），按 UTF-8 读取；名称自动取文件中的标题（&lt;title&gt;），没有则用文件名，填好后可再改。</p>
     <label>HTML 代码（将保存为 index.html）</label>
     <textarea id="pf-code" rows="10" required spellcheck="false" placeholder="粘贴完整的 HTML 代码（单个文件）"></textarea>
     <div class="srow">
@@ -1184,14 +1197,62 @@ $("impFile").addEventListener("change", async (e) => {
   e.target.value = "";
 });
 
+let uploadWarn = false;
+function decodeEntities(s) {
+  return s.replace(/&(#x?[0-9a-fA-F]+|amp|lt|gt|quot|apos|nbsp);/g, (m, g) => {
+    if (g.charAt(0) === "#") {
+      const n = (g.charAt(1) === "x" || g.charAt(1) === "X") ? parseInt(g.slice(2), 16) : parseInt(g.slice(1), 10);
+      return String.fromCodePoint(n);
+    }
+    return {amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " "}[g] || m;
+  });
+}
+function titleFromHtml(text, fname) {
+  const m = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (m) {
+    const t = decodeEntities(m[1]).trim().replace(/\s+/g, " ");
+    if (t) return t.slice(0, 100);
+  }
+  return fname.replace(/\.[^.]*$/, "").slice(0, 100);
+}
+$("pf-file").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  uploadWarn = false;
+  if (!f) return;
+  let text, badEnc = false;
+  const buf = await f.arrayBuffer();
+  try { text = new TextDecoder("utf-8", {fatal: true}).decode(buf); }
+  catch (err) { badEnc = true; text = new TextDecoder("utf-8").decode(buf); }
+  if (text.length > 1048576) {
+    $("pf-msg").innerHTML = `<span class="err">\u6587\u4ef6\u5185\u5bb9\u8fc7\u957f\uff1a\u7ea6 ${(text.length / 1048576).toFixed(2)} MB\uff0c\u4e0a\u9650 1 MB\uff08\u4e0e\u7c98\u8d34\u53d1\u5e03\u7684\u4ee3\u7801\u4e0a\u9650\u4e00\u81f4\uff09\uff0c\u8bf7\u7cbe\u7b80\u540e\u91cd\u8bd5\u3002</span>`;
+    $("pf-fname").textContent = "";
+    e.target.value = "";
+    return;
+  }
+  $("pf-code").value = text;
+  $("pf-name").value = titleFromHtml(text, f.name);
+  if (!$("pf-slug").value) {
+    const s = f.name.replace(/\.[^.]*$/, "").toLowerCase().replace(/[^a-z0-9\-_]+/g, "-").replace(/^-+|-+$/g, "");
+    if (/^[a-z0-9]/.test(s)) $("pf-slug").value = s.slice(0, 63);
+  }
+  $("pf-fname").textContent = f.name + "\uff08" + (f.size / 1024).toFixed(1) + " KB\uff09";
+  if (badEnc) {
+    uploadWarn = true;
+    $("pf-msg").innerHTML = `<span class="err">\u6ce8\u610f\uff1a\u8be5\u6587\u4ef6\u4e0d\u662f UTF-8 \u7f16\u7801\uff0c\u5df2\u6309 UTF-8 \u5f3a\u884c\u8bfb\u53d6\uff0c\u90e8\u5206\u5185\u5bb9\u53ef\u80fd\u4e71\u7801\uff08\u53d1\u5e03\u540e\u9875\u9762\u540c\u6837\u4f1a\u4e71\u7801\uff09\u3002\u5efa\u8bae\u5148\u7528\u7f16\u8f91\u5668\u53e6\u5b58\u4e3a UTF-8 \u518d\u4e0a\u4f20\uff1b\u82e5\u4ecd\u8981\u53d1\u5e03\uff0c\u8bf7\u518d\u70b9\u4e00\u6b21\u300c\u53d1\u5e03\u300d\u786e\u8ba4\u3002</span>`;
+  } else {
+    $("pf-msg").textContent = "\u6587\u4ef6\u5df2\u8bfb\u5165\u4e0b\u65b9\u4ee3\u7801\u6846\uff0c\u540d\u79f0\u5df2\u81ea\u52a8\u586b\u5199\uff0c\u68c0\u67e5\u65e0\u8bef\u540e\u70b9\u300c\u53d1\u5e03\u300d\u3002";
+  }
+});
 $("pubform").addEventListener("submit", async (e) => {
   e.preventDefault();
+  if (uploadWarn) { uploadWarn = false; $("pf-msg").innerHTML = `<span class="err">该文件按 UTF-8 读取后可能含乱码，确认仍要发布请再点一次「发布」。</span>`; return; }
   const body = {name: $("pf-name").value, slug: $("pf-slug").value,
                 description: $("pf-desc").value, code: $("pf-code").value};
   $("pf-msg").textContent = "正在登记到平台…";
   const {status, data} = await post("api/projects/" + catKind, body);
   if (status !== 200) { $("pf-msg").innerHTML = `<span class="err">${esc(data.message || "发布失败")}</span>`; return; }
   $("pubform").reset();
+  $("pf-fname").textContent = "";
   $("pf-msg").textContent = "已发布，列表已刷新。";
   await loadLinks();
 });

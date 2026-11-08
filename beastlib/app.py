@@ -20,7 +20,9 @@
 无项目内验证 (面板 /web 门负责)。数据落平台数据目录 (DATA_DIR 解析)。
 """
 import csv
+import hashlib
 import html as _html
+import time
 import json
 import os
 import re
@@ -29,6 +31,7 @@ import threading
 from collections import Counter, defaultdict
 
 from flask import Flask, abort, g, redirect, request
+from urllib.parse import urlencode
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -880,15 +883,16 @@ def _badges(r, hit_label=None):
     return "<div class=\"badges\">" + "".join(b) + "</div>"
 
 
-def _row(r, hit_label=None, views=None, pub_date=None):
+def _row(r, hit_label=None, views=None, pub_date=None, rank=None):
     links = ""
     if r["video_id"]:
         links += (f"<a href=\"https://www.youtube.com/watch?v={r['video_id']}\" "
                   "target=\"_blank\" rel=\"noopener\">YouTube ↗</a> · ")
     links += (f"<a href=\"https://www.bilibili.com/video/{r['source_bv']}\" "
               "target=\"_blank\" rel=\"noopener\">Bilibili ↗</a>")
-    if views is not None and str(views) != "":
-        links += f" · <span>播放 {_fmt_views(views)}</span>"
+    vh = _views_html(views, rank)
+    if vh:
+        links += " · " + vh
     if pub_date:
         links += f" · <span>发布 {pub_date}</span>"
     return (
@@ -905,12 +909,102 @@ def _row(r, hit_label=None, views=None, pub_date=None):
 PER_PAGE = 30
 
 
+_REC_SORTS = ("seq", "views", "text", "random")
+
+
+def _sort_args(valid, default_sort, asc_by_default):
+    sort = request.args.get("sort") or default_sort
+    if sort not in valid:
+        sort = default_sort
+    d = request.args.get("dir") or ""
+    if d not in ("asc", "desc"):
+        d = "asc" if sort in asc_by_default else "desc"
+    seed = (request.args.get("seed") or "").strip()
+    return sort, d, seed
+
+
+def _qs(**kw):
+    pairs = [(k, v) for k, v in kw.items() if v not in (None, "")]
+    return ("?" + urlencode(pairs)) if pairs else ""
+
+
+def _rand_key(seed, ident):
+    return hashlib.md5(("%s:%s" % (seed, ident)).encode("utf-8")).hexdigest()
+
+
+def _sortbar(view, sort, d, seed, q=""):
+    if view == "rec":
+        opts = [("seq", "序号", "asc"), ("views", "播放量", "desc"),
+                ("text", "文本长度", "desc"), ("random", "随机", "")]
+        vkw = {}
+    else:
+        opts = [("views", "播放量", "desc"), ("date", "发布时间", "desc"),
+                ("random", "随机", "")]
+        vkw = {"view": "base"}
+    items = []
+    if sort is None:
+        items.append("<span class=\"on\">相关度</span>")
+    for key, label, dd in opts:
+        if key == sort:
+            items.append(f"<span class=\"on\">{label}</span>")
+        else:
+            kw = dict(vkw)
+            if q:
+                kw["q"] = q
+            kw["sort"] = key
+            if dd:
+                kw["dir"] = dd
+            if key == "random":
+                kw["seed"] = str(int(time.time()))
+            items.append(f"<a href=\"{U('/' + _qs(**kw))}\">{label}</a>")
+    if sort == "random":
+        kw = dict(vkw)
+        if q:
+            kw["q"] = q
+        kw.update(sort="random", seed=str(int(time.time())))
+        items.append(f"<a href=\"{U('/' + _qs(**kw))}\">换一批</a>")
+    elif sort:
+        nd = "asc" if d == "desc" else "desc"
+        kw = dict(vkw)
+        if q:
+            kw["q"] = q
+        kw.update(sort=sort, dir=nd)
+        cur = "降序" if d == "desc" else "升序"
+        oth = "升序" if nd == "asc" else "降序"
+        items.append(f"<span class=\"on\">{cur}</span> "
+                     f"<a href=\"{U('/' + _qs(**kw))}\">{oth}</a>")
+    return "<div class=\"tgl\">排序：" + " · ".join(items) + "</div>"
+
+
+def _sort_hits(hits, sort, d, seed, bmap):
+    deco = []
+    for label, r in hits:
+        v = _num(_disp_views(r, bmap))
+        tl = len(r["txt_text"] or "") + len(r["yt_srt_text"] or "")
+        deco.append((label, r, v, tl))
+    if sort == "views":
+        if d == "desc":
+            deco.sort(key=lambda x: (x[2] is not None, x[2] or 0),
+                      reverse=True)
+        else:
+            deco.sort(key=lambda x: (x[2] is None, x[2] or 0))
+    elif sort == "text":
+        deco.sort(key=lambda x: x[3], reverse=(d == "desc"))
+    elif sort == "random":
+        deco.sort(key=lambda x: _rand_key(seed, x[1]["id"]))
+    else:
+        deco.sort(key=lambda x: x[1]["seq"], reverse=(d == "desc"))
+    return [(label, r) for label, r, _, _ in deco]
+
+
 @app.route("/")
 def index():
     db = get_db()
     if (request.args.get("view") or "") == "base":
         return _base_page(db)
     q = (request.args.get("q") or "").strip()
+    sort, d, seed = _sort_args(_REC_SORTS, "seq", {"seq"})
+    explicit_sort = "sort" in request.args
     total = db.execute("SELECT COUNT(*) FROM records").fetchone()[0]
     n_matched = db.execute(
         "SELECT COUNT(*) FROM records WHERE video_id IS NOT NULL").fetchone()[0]
@@ -924,13 +1018,18 @@ def index():
             f"<input name=\"q\" value=\"{_html.escape(q)}\" "
             "placeholder=\"搜索中文名 / 原名 / 关键词 / 正文 / 原文\">"
             "<button type=\"submit\">搜索</button></form>")
+    ranks = _view_ranks(db)
     if q:
         hits = search_records(db, q)
         body = head + f"<div class=\"stats\">搜索「{_html.escape(q)}」命中 {len(hits)} 条 · <a href=\"{U('/')}\">清除</a></div>"
         if hits:
             bmap = _base_map(db, [r["video_id"] for _, r in hits])
+            if explicit_sort:
+                hits = _sort_hits(hits, sort, d, seed, bmap)
+            body += _sortbar("rec", sort if explicit_sort else None, d, seed, q)
             body += "".join(
-                _row(r, label, _disp_views(r, bmap), _disp_date(r, bmap))
+                _row(r, label, _disp_views(r, bmap), _disp_date(r, bmap),
+                     ranks.get(r["video_id"]))
                 for label, r in hits)
         else:
             body += "<div class=\"empty\">没有命中。</div>"
@@ -939,23 +1038,60 @@ def index():
         p = max(1, int(request.args.get("p", "1")))
     except ValueError:
         p = 1
+    light = db.execute(
+        "SELECT id, seq, video_id, yt_view_count, "
+        "LENGTH(COALESCE(txt_text, '')) + LENGTH(COALESCE(yt_srt_text, '')) AS tl "
+        "FROM records").fetchall()
+    bmap_all = _base_map(db, [r["video_id"] for r in light])
+
+    def _lv(lr):
+        b = bmap_all.get(lr["video_id"]) if lr["video_id"] else None
+        if b is not None and not b["error"] and b["view_count"] is not None:
+            return b["view_count"]
+        return _num(lr["yt_view_count"])
+
+    items = [(lr["id"], lr["seq"], _lv(lr), lr["tl"]) for lr in light]
+    if sort == "views":
+        if d == "desc":
+            items.sort(key=lambda x: (x[2] is not None, x[2] or 0),
+                       reverse=True)
+        else:
+            items.sort(key=lambda x: (x[2] is None, x[2] or 0))
+    elif sort == "text":
+        items.sort(key=lambda x: x[3], reverse=(d == "desc"))
+    elif sort == "random":
+        items.sort(key=lambda x: _rand_key(seed, x[0]))
+    else:
+        items.sort(key=lambda x: x[1], reverse=(d == "desc"))
     pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
     p = min(p, pages)
-    rows = db.execute("SELECT * FROM records ORDER BY seq LIMIT ? OFFSET ?",
-                      (PER_PAGE, (p - 1) * PER_PAGE)).fetchall()
+    page_ids = [x[0] for x in items[(p - 1) * PER_PAGE: p * PER_PAGE]]
+    rows = []
+    if page_ids:
+        got = db.execute(
+            "SELECT * FROM records WHERE id IN (%s)"
+            % ",".join("?" * len(page_ids)), page_ids).fetchall()
+        by_id = {r["id"]: r for r in got}
+        rows = [by_id[i] for i in page_ids]
     bmap = _base_map(db, [r["video_id"] for r in rows])
-    body = head + "".join(
-        _row(r, views=_disp_views(r, bmap), pub_date=_disp_date(r, bmap))
+    body = head + _sortbar("rec", sort, d, seed)
+    body += "".join(
+        _row(r, views=_disp_views(r, bmap), pub_date=_disp_date(r, bmap),
+             rank=ranks.get(r["video_id"]))
         for r in rows)
-    prev = (f"<a href=\"{U('/?p=%d' % (p - 1))}\">上一页</a>" if p > 1
+
+    def pq(n):
+        return U("/" + _qs(p=n, sort=sort, dir=d,
+                           seed=seed if sort == "random" else None))
+
+    prev = (f"<a href=\"{pq(p - 1)}\">上一页</a>" if p > 1
             else "<span class=\"off\">上一页</span>")
-    nxt = (f"<a href=\"{U('/?p=%d' % (p + 1))}\">下一页</a>" if p < pages
+    nxt = (f"<a href=\"{pq(p + 1)}\">下一页</a>" if p < pages
            else "<span class=\"off\">下一页</span>")
     body += (f"<div class=\"pager\">{prev}<span>第 {p} / {pages} 页</span>{nxt}</div>")
     return page("野兽素材库", body)
 
-
-def _brow(b):
+def _brow(b, rank=None):
     badges = []
     if b["error"]:
         badges.append("<span class=\"b b-err\">抓取失败</span>")
@@ -980,8 +1116,9 @@ def _brow(b):
              "target=\"_blank\" rel=\"noopener\">YouTube ↗</a>")
     if b["rseq"] is not None:
         links += f" · <a href=\"{U('/r/%d' % b['rseq'])}\">看摘要 →</a>"
-    if b["view_count"] is not None:
-        links += f" · <span>播放 {_fmt_views(b['view_count'])}</span>"
+    vh = _views_html(b["view_count"], rank)
+    if vh:
+        links += " · " + vh
     sub = (f"{b['video_id']} · 发布 {_fmt_date(b['upload_date'])} · "
            f"时长 {_fmt_dur(b['duration'])}")
     if b["error"]:
@@ -997,6 +1134,7 @@ def _base_page(db):
     if not _has_base(db):
         return page("元数据底座 · 野兽素材库",
                     back + "<div class=\"empty\">底座尚未入库。</div>")
+    sort, d, seed = _sort_args(("views", "date", "random"), "views", set())
     bcols = {r[1] for r in db.execute("PRAGMA table_info(yt_base)")}
     has_ex = "excluded" in bcols
     exw = " AND excluded=0" if has_ex else ""
@@ -1022,33 +1160,103 @@ def _base_page(db):
             + "</div>"
             f"<div class=\"tgl\"><a href=\"{U('/')}\">素材记录（摘要）</a> · "
             "<span class=\"on\">全部底座</span></div>"
-            "<div class=\"stats\">底座为清单 706 个 video_id 的 yt-dlp 实抓元数据，"
-            "按播放量排序；有摘要的挂素材记录序号，无摘要的只有 video_id 身份"
-            "（底座不用 # 序号）。</div>")
+            "<div class=\"stats\">底座为清单 706 个 video_id 的 yt-dlp 实抓元数据；"
+            "有摘要的挂素材记录序号，无摘要的只有 video_id 身份"
+            "（底座不用 # 序号）。名次为底座内部按播放量降序的排名。</div>")
     try:
         p = max(1, int(request.args.get("p", "1")))
     except ValueError:
         p = 1
     pages = max(1, (total_all + PER_PAGE - 1) // PER_PAGE)
     p = min(p, pages)
-    rows = db.execute(
-        "SELECT b.*, r.seq AS rseq FROM yt_base b "
-        "LEFT JOIN records r ON r.video_id = b.video_id "
-        "ORDER BY (b.view_count IS NULL), b.view_count DESC LIMIT ? OFFSET ?",
-        (PER_PAGE, (p - 1) * PER_PAGE)).fetchall()
-    body = head + "".join(_brow(b) for b in rows)
-    prev = (f"<a href=\"{U('/?view=base&p=%d' % (p - 1))}\">上一页</a>" if p > 1
+    ranks = _view_ranks(db)
+    if sort == "random":
+        ids = [r[0] for r in db.execute("SELECT video_id FROM yt_base")]
+        ids.sort(key=lambda vid: _rand_key(seed, vid))
+        page_ids = ids[(p - 1) * PER_PAGE: p * PER_PAGE]
+        rows = []
+        if page_ids:
+            got = db.execute(
+                "SELECT b.*, r.seq AS rseq FROM yt_base b "
+                "LEFT JOIN records r ON r.video_id = b.video_id "
+                "WHERE b.video_id IN (%s)" % ",".join("?" * len(page_ids)),
+                page_ids).fetchall()
+            by_id = {b["video_id"]: b for b in got}
+            rows = [by_id[i] for i in page_ids]
+    else:
+        if sort == "date":
+            ordsql = ("(b.upload_date IS NULL OR b.upload_date = ''), "
+                      "b.upload_date %s, b.video_id"
+                      % ("DESC" if d == "desc" else "ASC"))
+        else:
+            ordsql = ("(b.view_count IS NULL), b.view_count %s, b.video_id"
+                      % ("DESC" if d == "desc" else "ASC"))
+        rows = db.execute(
+            "SELECT b.*, r.seq AS rseq FROM yt_base b "
+            "LEFT JOIN records r ON r.video_id = b.video_id "
+            "ORDER BY " + ordsql + " LIMIT ? OFFSET ?",
+            (PER_PAGE, (p - 1) * PER_PAGE)).fetchall()
+    body = head + _sortbar("base", sort, d, seed)
+    body += "".join(_brow(b, ranks.get(b["video_id"])) for b in rows)
+
+    def pq(n):
+        return U("/" + _qs(view="base", p=n, sort=sort, dir=d,
+                           seed=seed if sort == "random" else None))
+
+    prev = (f"<a href=\"{pq(p - 1)}\">上一页</a>" if p > 1
             else "<span class=\"off\">上一页</span>")
-    nxt = (f"<a href=\"{U('/?view=base&p=%d' % (p + 1))}\">下一页</a>" if p < pages
+    nxt = (f"<a href=\"{pq(p + 1)}\">下一页</a>" if p < pages
            else "<span class=\"off\">下一页</span>")
     body += f"<div class=\"pager\">{prev}<span>第 {p} / {pages} 页</span>{nxt}</div>"
     return page("元数据底座 · 野兽素材库", body)
 
+def _num(v):
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return v
+    s = str(v).strip()
+    return int(s) if s.isdigit() else None
+
 
 def _fmt_views(v):
-    if v and str(v).isdigit():
-        return f"{int(v):,}"
-    return v or "—"
+    """数字带单位: >=1亿 -> X.XX亿 (尾零可省), >=1万 -> X.X万, 否则千分位原数。"""
+    n = _num(v)
+    if n is None:
+        return "\u2014"
+    if n >= 100000000:
+        s = f"{n / 100000000:.2f}".rstrip("0").rstrip(".")
+        return s + "\u4ebf"
+    if n >= 10000:
+        s = f"{n / 10000:.1f}".rstrip("0").rstrip(".")
+        if s == "10000":
+            s = f"{n / 100000000:.2f}".rstrip("0").rstrip(".")
+            return s + "\u4ebf"
+        return s + "\u4e07"
+    return f"{n:,}"
+
+
+def _views_html(v, rank=None):
+    """列表行播放量片段: 单位格式 + 原值 title + 可选底座名次。"""
+    n = _num(v)
+    if n is None:
+        return ""
+    s = f"<span title=\"{n:,}\">播放 {_fmt_views(n)}</span>"
+    if rank:
+        s += f" · <span>第 {rank} 名</span>"
+    return s
+
+
+def _view_ranks(db):
+    """底座 (excluded=0) 按播放量降序的内部名次: {video_id: rank}。"""
+    if not _has_base(db):
+        return {}
+    cols = {r[1] for r in db.execute("PRAGMA table_info(yt_base)")}
+    exw = " WHERE excluded=0" if "excluded" in cols else ""
+    rows = db.execute(
+        "SELECT video_id FROM yt_base" + exw +
+        " ORDER BY (view_count IS NULL), view_count DESC, video_id").fetchall()
+    return {r[0]: i + 1 for i, r in enumerate(rows)}
 
 
 def _fmt_dur(sec):
@@ -1145,7 +1353,11 @@ def detail(seq):
            "target=\"_blank\" rel=\"noopener\">Bilibili 源 ↗</a></div>")
     stats = ""
     if base is not None and not base["error"]:
-        items = [("播放量", _fmt_views(base["view_count"])),
+        _rk = _view_ranks(db).get(r["video_id"]) if r["video_id"] else None
+        _vv = _fmt_views(base["view_count"])
+        if _rk:
+            _vv += f" · 第 {_rk} 名"
+        items = [("播放量", _vv),
                  ("点赞", _fmt_views(base["like_count"])),
                  ("评论", _fmt_views(base["comment_count"])),
                  ("时长", _fmt_dur(base["duration"])),

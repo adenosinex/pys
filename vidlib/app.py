@@ -2737,7 +2737,8 @@ def _sub_auth(params):
     if not user or not password:
         return False
     given_user = params.get("u") or ""
-    if not given_user or not secrets.compare_digest(given_user, user):
+    if not given_user or not secrets.compare_digest(
+            given_user.encode("utf-8"), user.encode("utf-8")):
         return False
     token = params.get("t") or ""
     salt = params.get("s") or ""
@@ -2752,8 +2753,33 @@ def _sub_auth(params):
                 p = bytes.fromhex(p[4:]).decode("utf-8")
             except Exception:
                 return False
-        return secrets.compare_digest(p, password)
+        return secrets.compare_digest(
+            p.encode("utf-8"), password.encode("utf-8"))
     return False
+
+
+def _sub_auth_basic(environ):
+    """True when the request carries an HTTP Basic credential matching
+    the Subsonic credentials. Symfonium's "send basic auth" option puts
+    the freshly typed credentials in the Authorization header while the
+    query params may still hold stale values, so either channel may
+    pass (any-pass); compared as UTF-8 bytes, constant time."""
+    user, password = _sub_creds()
+    if not user or not password:
+        return False
+    header = environ.get("HTTP_AUTHORIZATION") or ""
+    if not header.lower().startswith("basic "):
+        return False
+    try:
+        raw = base64.b64decode(header[6:].strip())
+    except Exception:
+        return False
+    got_user, sep, got_pass = raw.partition(b":")
+    if not sep:
+        return False
+    return (secrets.compare_digest(got_user, user.encode("utf-8"))
+            and secrets.compare_digest(
+                got_pass, password.encode("utf-8")))
 
 
 def _sub_envelope(payload=None, error=None):
@@ -3154,7 +3180,7 @@ def _sub_stream(environ, start_response, params):
     if entry["f_status"] == "archived":
         url = ""
         try:
-            url = resolve_play_url(file_row)
+            url = _play_url(file_row)
         except Exception:
             url = ""
         if url:
@@ -3192,7 +3218,7 @@ def subsonic_handle(environ, start_response):
     for suffix in (".view", ".json"):
         if name.endswith(suffix):
             name = name[:-len(suffix)]
-    if not _sub_auth(params):
+    if not _sub_auth(params) and not _sub_auth_basic(environ):
         return _sub_fail(start_response, 40,
                          "Wrong username or password.",
                          http="401 Unauthorized")
@@ -3340,6 +3366,10 @@ def _subsonic_admin_panel():
         '（IPv6 不通时把域名换成 debi4.su7.dpdns.org）。'
         '账号状态：<b>' + state + '</b>。用户名、密码只写不回显，'
         '留空的字段保持不变，密码至少 8 位。</div>'
+        '<p style="font-size:13px;line-height:1.8">Symfonium 填写对照：'
+        '服务器地址就填上面的 <b>' + SUBSONIC_PUBLIC_BASE + '</b>；'
+        '用户名填本区设置的用户名；密码填本区设置的密码'
+        '（就是在本区设置的那个——只写不回显，忘了就在本区重设）。</p>'
         '<p>用户名 <input id="ss-user" type="text" autocomplete="off" '
         'style="width:150px"> 新密码 '
         '<input id="ss-pass" type="password" '
@@ -3756,6 +3786,54 @@ _uploads_lock = threading.Lock()
 UPLOAD_CHUNK = 8 * 1024 * 1024
 
 
+# Upload sessions are mirrored to STAGING_DIR as <uid>.sess.json
+# so a service restart (deploy, crash) mid-batch no longer kills
+# in-flight uploads: the .part bytes were always on disk, and now
+# the session state (declared size, received chunk set, tags,
+# target library) survives with them. Loaded lazily on first use
+# after a restart; the in-memory dict stays the hot path.
+def _sess_path(uid):
+    return os.path.join(STAGING_DIR, uid + ".sess.json")
+
+
+def _save_sess(uid, sess):
+    try:
+        data = dict(sess)
+        data["got"] = sorted(sess.get("got") or [])
+        tmp = _sess_path(uid) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, _sess_path(uid))
+    except Exception:
+        pass
+
+
+def _load_sess(uid):
+    with _uploads_lock:
+        sess = _uploads.get(uid)
+    if sess is not None:
+        return sess
+    try:
+        with open(_sess_path(uid), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    data["got"] = set(data.get("got") or [])
+    data["path"] = os.path.join(STAGING_DIR, uid + ".part")
+    if not os.path.exists(data["path"]):
+        return None
+    with _uploads_lock:
+        _uploads[uid] = data
+    return data
+
+
+def _drop_sess_file(uid):
+    try:
+        os.unlink(_sess_path(uid))
+    except Exception:
+        pass
+
+
 def _merge_chute(tags, relpath):
     """Append the folder-path tag derived from a relative path
     (the DAV chute convention), if any."""
@@ -3801,17 +3879,18 @@ def upload_init(name, size, title, tags, source, relpath="",
     part_path = os.path.join(STAGING_DIR, uid + ".part")
     with open(part_path, "wb"):
         pass
+    sess = {"name": name, "size": size, "title": title,
+            "tags": tags, "source": source,
+            "path": part_path, "at": time.time(),
+            "got": set(), "library_id": library_id}
     with _uploads_lock:
-        _uploads[uid] = {"name": name, "size": size, "title": title,
-                         "tags": tags, "source": source,
-                         "path": part_path, "at": time.time(),
-                         "got": set(), "library_id": library_id}
+        _uploads[uid] = sess
+    _save_sess(uid, sess)
     return uid
 
 
 def upload_chunk(uid, offset, data):
-    with _uploads_lock:
-        sess = _uploads.get(uid)
+    sess = _load_sess(uid)
     if sess is None:
         raise ValueError("上传会话不存在或已过期。")
     with open(sess["path"], "r+b") as fh:
@@ -3819,12 +3898,14 @@ def upload_chunk(uid, offset, data):
         fh.write(data)
     with _uploads_lock:
         sess["got"].add(int(offset) // UPLOAD_CHUNK)
+    _save_sess(uid, sess)
     return len(data)
 
 
 def upload_complete(uid):
+    sess = _load_sess(uid)
     with _uploads_lock:
-        sess = _uploads.pop(uid, None)
+        _uploads.pop(uid, None)
     if sess is None:
         raise ValueError("上传会话不存在或已过期。")
     part = sess["path"]
@@ -3832,6 +3913,7 @@ def upload_complete(uid):
     if len(sess["got"]) < expected_chunks:
         with _uploads_lock:
             _uploads[uid] = sess
+        _save_sess(uid, sess)
         raise ValueError("分片不完整：收到 %d / %d 片，"
                          "请补传缺失分片后重试。"
                          % (len(sess["got"]), expected_chunks))
@@ -3839,6 +3921,7 @@ def upload_complete(uid):
     if actual != sess["size"]:
         raise ValueError("文件不完整：收到 %d / 应为 %d 字节。"
                          % (actual, sess["size"]))
+    _drop_sess_file(uid)
     entry_id, digest, dup = ingest_staged_file(
         part, sess["name"], tags=sess["tags"], source=sess["source"],
         library_id=sess.get("library_id"))
@@ -4040,6 +4123,14 @@ def _archive_one(row):
             "UPDATE files SET status = 'archived', gpath = ?, error = '', "
             "updated_at = ? WHERE hash = ?",
             (remote, time.time(), row["hash"]))
+    # Warm AList's listing cache for the target folder: without
+    # this, fs/get by path reports "object not found" for minutes
+    # after an upload lands (stale cached listing), which reads
+    # as a playback failure on freshly added files.
+    try:
+        ALIST.fs_list(dir_path or "/")
+    except Exception:
+        pass
     if not _cache_keep_local(row, local):
         try:
             os.unlink(local)
@@ -4120,7 +4211,7 @@ def _worker_loop(maintain=True):
         try:
             now = time.time()
             for name in os.listdir(STAGING_DIR) if maintain else []:
-                if name.endswith(".part"):
+                if name.endswith(".part") or ".sess.json" in name:
                     p = os.path.join(STAGING_DIR, name)
                     try:
                         if now - os.path.getmtime(p) > 24 * 3600:
@@ -4197,7 +4288,20 @@ def _ensure_worker():
 # --------------------------------------------------------- play links
 
 def _signed_url_raw(file_row):
-    info = ALIST.fs_get(file_row["gpath"])
+    try:
+        info = ALIST.fs_get(file_row["gpath"])
+    except AlistError as exc:
+        if "not found" not in str(exc):
+            raise
+        # AList resolves paths through its cached folder listing,
+        # which lags fresh uploads by minutes: refresh the parent
+        # listing once and retry before giving up.
+        parent = (file_row["gpath"] or "").rpartition("/")[0] or "/"
+        try:
+            ALIST.fs_list(parent)
+        except Exception:
+            pass
+        info = ALIST.fs_get(file_row["gpath"])
     return (info or {}).get("raw_url") or "", (info or {}).get("sign") or ""
 
 
@@ -4221,6 +4325,33 @@ def resolve_play_url(file_row):
         return (PUBLIC_VIDEO_BASE + "/d" + file_row["gpath"]
                 + "?sign=" + urllib.parse.quote(sign))
     return PUBLIC_VIDEO_BASE + "/d" + file_row["gpath"]
+
+
+_play_url_cache = {}
+
+
+def _play_url(file_row):
+    """resolve_play_url with a short in-process cache and retry:
+    a transient AList/Drive hiccup (seconds) must not surface as
+    a playback failure. Raises only after 3 failed attempts."""
+    key = file_row["hash"]
+    hit = _play_url_cache.get(key)
+    if hit and time.time() - hit[1] < 600:
+        return hit[0]
+    last = None
+    for attempt in range(3):
+        try:
+            url = resolve_play_url(file_row)
+            _play_url_cache[key] = (url, time.time())
+            return url
+        except Exception as exc:
+            last = exc
+            print("vidlib: play url resolve failed %s attempt %d: %s"
+                  % (key[:8], attempt + 1, str(exc)[:150]),
+                  flush=True)
+            if attempt < 2:
+                time.sleep(1.2)
+    raise last
 
 
 def resolve_loopback_url(file_row):
@@ -6942,6 +7073,12 @@ async function finishJob(job){
       job.barEl.style.width="100%";hideX(job);
       job.stEl.textContent="已入库（响应丢失后经校验确认）";
       layout();return;}}
+  if(done&&done.message&&done.message.indexOf("会话")>=0){
+    job.sessionLost=true;job.sessHeal=(job.sessHeal||0)+1;
+    if(job.sessHeal<=2){
+      job.stEl.textContent="服务器会话已失效，正在自动重新上传…";
+      layout();const j=job;
+      setTimeout(()=>{if(!j.cancelled)resumeJob(j);},600);return;}}
   if(!done)noteNetFail();
   job.done=true;job.state="fail";
   job.stEl.textContent="失败："+((done&&done.message)||"网络错误")+"（可点继续重试入库）";
@@ -7054,8 +7191,11 @@ const dz=document.getElementById("dz");
 dz.addEventListener("dragover",e=>{e.preventDefault();dz.style.outline="2px dashed #4f7cff";});
 dz.addEventListener("dragleave",()=>{dz.style.outline="";});
 dz.addEventListener("drop",async e=>{e.preventDefault();dz.style.outline="";
-  document.getElementById("msg").textContent="";
-  enqueue(await collectFromDrop(e.dataTransfer));});
+  const mg=document.getElementById("msg");
+  mg.textContent="正在读取拖入的文件夹…";
+  const pairs=await collectFromDrop(e.dataTransfer);
+  mg.textContent="";
+  enqueue(pairs);});
 </script>
 """
 
@@ -7989,6 +8129,13 @@ def _dav_stream_archived(environ, start_response, file_row):
             url = resolve_loopback_url(file_row)
         except Exception as exc:
             last_error = str(exc)[:150]
+            if _attempt == 0:
+                time.sleep(1.2)
+                try:
+                    ALIST.login(force=True)
+                except Exception:
+                    pass
+                continue
             break
         current = url
         try:
@@ -8725,10 +8872,11 @@ def application(environ, start_response):
         file_row = get_file(entry["hash"])
         if entry["f_status"] == "archived":
             try:
-                url = resolve_play_url(file_row)
-            except Exception as exc:
-                return _json(start_response, "502 Bad Gateway",
-                             {"ok": False, "message": str(exc)[:200]})
+                url = _play_url(file_row)
+            except Exception:
+                # AList link resolution is down hard; hand the
+                # player the app relay instead of a dead end.
+                url = "file/" + entry["hash"]
             return _json(start_response, "200 OK",
                          {"ok": True, "url": url, "archived": True,
                           "pos": entry["play_pos"] or 0})
