@@ -21,3 +21,7 @@ id_ed25519*
 *.pem
 *.key
 **/.runtime/
+
+# 2026-11-08 jinghua: bak files and corpus stay out of the code repo
+**/*.bak-*
+beastlib/seed/
