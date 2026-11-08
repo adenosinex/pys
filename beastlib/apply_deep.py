@@ -93,7 +93,8 @@ def main():
     base_by_id = {r["video_id"]: r for r in db.execute(
         "SELECT * FROM yt_base WHERE error IS NULL")}
     used = {r["video_id"]: r["seq"] for r in db.execute(
-        "SELECT seq, video_id FROM records WHERE video_id IS NOT NULL")}
+        "SELECT seq, video_id FROM records WHERE video_id IS NOT NULL"
+        " AND origin='bv'")}
     before = dict(db.execute(
         "SELECT match_tier, COUNT(*) FROM records GROUP BY 1").fetchall())
     done = []

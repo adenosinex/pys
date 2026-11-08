@@ -668,6 +668,9 @@ def _migrate(db):
         bcols = {r[1] for r in db.execute("PRAGMA table_info(yt_base)")}
         if "tab" not in bcols:
             db.execute("ALTER TABLE yt_base ADD COLUMN tab TEXT")
+        if "excluded" not in bcols:
+            db.execute("ALTER TABLE yt_base ADD COLUMN excluded"
+                       " INTEGER NOT NULL DEFAULT 0")
     db.commit()
 
 
@@ -951,6 +954,8 @@ def _brow(b):
     badges = []
     if b["error"]:
         badges.append("<span class=\"b b-err\">抓取失败</span>")
+    if "excluded" in b.keys() and b["excluded"]:
+        badges.append("<span class=\"b b-err\">已排除（超长）</span>")
     if b["rseq"] is not None:
         badges.append(f"<span class=\"b b-yt\">有摘要 #{b['rseq']:03d}</span>")
     else:
@@ -987,17 +992,29 @@ def _base_page(db):
     if not _has_base(db):
         return page("元数据底座 · 野兽素材库",
                     back + "<div class=\"empty\">底座尚未入库。</div>")
-    total = db.execute("SELECT COUNT(*) FROM yt_base").fetchone()[0]
+    bcols = {r[1] for r in db.execute("PRAGMA table_info(yt_base)")}
+    has_ex = "excluded" in bcols
+    exw = " AND excluded=0" if has_ex else ""
+    total_all = db.execute("SELECT COUNT(*) FROM yt_base").fetchone()[0]
+    excl_n = (db.execute(
+        "SELECT COUNT(*) FROM yt_base WHERE excluded=1").fetchone()[0]
+        if has_ex else 0)
+    total = total_all - excl_n
     ok = db.execute(
-        "SELECT COUNT(*) FROM yt_base WHERE error IS NULL").fetchone()[0]
+        "SELECT COUNT(*) FROM yt_base WHERE error IS NULL"
+        + exw).fetchone()[0]
     tr = db.execute(
-        "SELECT COUNT(*) FROM yt_base WHERE transcript_ready=1").fetchone()[0]
+        "SELECT COUNT(*) FROM yt_base WHERE transcript_ready=1"
+        + exw).fetchone()[0]
     n_md = db.execute(
         "SELECT COUNT(DISTINCT video_id) FROM records "
         "WHERE video_id IS NOT NULL").fetchone()[0]
     head = (back + "<h1 class=\"pt\">元数据底座</h1>"
             f"<div class=\"stats\">共 {total} 条 · 抓取成功 {ok} · 失败 {total - ok} · "
-            f"转写就绪 {tr} · 已挂摘要 {n_md} 条</div>"
+            f"转写就绪 {tr} · 已挂摘要 {n_md} 条"
+            + (f" · 已排除 {excl_n} 条超长视频（不计入底座，列表中标「已排除」）"
+               if excl_n else "")
+            + "</div>"
             f"<div class=\"tgl\"><a href=\"{U('/')}\">素材记录（摘要）</a> · "
             "<span class=\"on\">全部底座</span></div>"
             "<div class=\"stats\">底座为清单 706 个 video_id 的 yt-dlp 实抓元数据，"
@@ -1007,7 +1024,7 @@ def _base_page(db):
         p = max(1, int(request.args.get("p", "1")))
     except ValueError:
         p = 1
-    pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
+    pages = max(1, (total_all + PER_PAGE - 1) // PER_PAGE)
     p = min(p, pages)
     rows = db.execute(
         "SELECT b.*, r.seq AS rseq FROM yt_base b "
@@ -1182,11 +1199,20 @@ def _report_extra(db):
                 x["match_method"] or "B站独家")) for x in no_rows)
         h.append(f"<div class=\"stats\">无原版明细：{items}</div>")
     if _has_base(db):
-        total = db.execute("SELECT COUNT(*) FROM yt_base").fetchone()[0]
+        bcols = {r[1] for r in db.execute("PRAGMA table_info(yt_base)")}
+        has_ex = "excluded" in bcols
+        exw = " AND excluded=0" if has_ex else ""
+        total = db.execute(
+            "SELECT COUNT(*) FROM yt_base WHERE 1=1" + exw).fetchone()[0]
+        excl_n = (db.execute(
+            "SELECT COUNT(*) FROM yt_base WHERE excluded=1").fetchone()[0]
+            if has_ex else 0)
         ok = db.execute(
-            "SELECT COUNT(*) FROM yt_base WHERE error IS NULL").fetchone()[0]
+            "SELECT COUNT(*) FROM yt_base WHERE error IS NULL"
+            + exw).fetchone()[0]
         tr = db.execute(
-            "SELECT COUNT(*) FROM yt_base WHERE transcript_ready=1").fetchone()[0]
+            "SELECT COUNT(*) FROM yt_base WHERE transcript_ready=1"
+            + exw).fetchone()[0]
         n_md = db.execute(
             "SELECT COUNT(DISTINCT video_id) FROM records "
             "WHERE video_id IS NOT NULL").fetchone()[0]
@@ -1200,7 +1226,10 @@ def _report_extra(db):
                 bat = ""
         h.append("<h2>元数据底座（yt-dlp 实抓）</h2>")
         h.append(f"<div class=\"stats\">共 {total} 条 · 抓取成功 {ok} · 失败 {total - ok} · "
-                 f"转写就绪 {tr} · 已挂摘要 {n_md}{bat}</div>")
+                 f"转写就绪 {tr} · 已挂摘要 {n_md}"
+                 + (f" · 已排除 {excl_n} 条超长视频（用户定稿排除，不计入）"
+                    if excl_n else "")
+                 + f"{bat}</div>")
         if brow:
             try:
                 sc = json.loads(brow["value"]).get("scope") or {}

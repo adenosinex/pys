@@ -75,11 +75,21 @@ def main():
     beast._migrate(db)
     base_by_id = {r["video_id"]: r for r in db.execute(
         "SELECT * FROM yt_base WHERE error IS NULL")}
-    used = {r["video_id"]: r["seq"] for r in db.execute(
-        "SELECT seq, video_id FROM records WHERE video_id IS NOT NULL")}
+    used = {r["video_id"]: r for r in db.execute(
+        "SELECT seq, video_id, origin, match_method FROM records"
+        " WHERE video_id IS NOT NULL")}
+    coexist = []
     for seq, bv, vid, _cf in MATCHES:
         assert vid in base_by_id, "底座无此视频: %s" % vid
-        assert vid not in used, "video_id 已被 #%s 占用: %s" % (used.get(vid), vid)
+        if vid in used:
+            occ = used[vid]
+            # 与 YouTube 直连批记录同指一支视频是合法共存 (两批来源各一份),
+            # 与另一 BV 记录争用则不许
+            assert occ["origin"] == "yt" and occ["match_method"] == "direct", \
+                "video_id 已被 #%s (%s/%s) 占用: %s" % (
+                    occ["seq"], occ["origin"], occ["match_method"], vid)
+            coexist.append({"seq": seq, "video_id": vid,
+                            "direct_seq": occ["seq"]})
     before = dict(db.execute(
         "SELECT match_tier, COUNT(*) FROM records GROUP BY 1").fetchall())
     applied, noorig = [], []
@@ -126,6 +136,7 @@ def main():
             "source": "title_match_v2_verdicts.md (用户 2026-11-08 批准应用)",
             "before": before, "after": after,
             "matched": applied, "no_original": noorig,
+            "coexist_with_direct": coexist,
             "notes": [
                 "match_method='title_v2' 保留溯源; 证据 (签名/密度/互证) 见裁定表",
                 "#092 匹配成立但转录本身为残片 (transcript_status=partial), 与匹配无关",
