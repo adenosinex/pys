@@ -79,6 +79,7 @@ VIDEO_EXTS = {"mp4", "mkv", "webm", "mov", "m4v", "avi", "ts", "flv",
 PLAYABLE_EXTS = {"mp4", "webm", "m4v", "mov"}
 IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "svg",
               "heic", "heif", "tif", "tiff"}
+AUDIO_EXTS = {"mp3", "flac", "m4a", "aac", "ogg", "opus", "wav"}
 
 
 def _kind(ext):
@@ -87,6 +88,8 @@ def _kind(ext):
         return "video"
     if ext in IMAGE_EXTS:
         return "image"
+    if ext in AUDIO_EXTS:
+        return "music"
     if ext == "txt":
         return "novel"
     return "file"
@@ -95,7 +98,11 @@ def _kind(ext):
 _MIME_OVERRIDES = {"mkv": "video/x-matroska", "ts": "video/mp2t",
                    "flv": "video/x-flv", "wmv": "video/x-ms-wmv",
                    "rmvb": "application/vnd.rn-realmedia-vbr",
-                   "m4v": "video/mp4", "3gp": "video/3gpp"}
+                   "m4v": "video/mp4", "3gp": "video/3gpp",
+                   "mp3": "audio/mpeg", "flac": "audio/flac",
+                   "m4a": "audio/mp4", "aac": "audio/aac",
+                   "ogg": "audio/ogg", "opus": "audio/opus",
+                   "wav": "audio/x-wav"}
 
 
 def _mime_for(ext):
@@ -267,6 +274,18 @@ def init_db():
             conn.execute(
                 "ALTER TABLE files ADD COLUMN category "
                 "TEXT DEFAULT ''")
+        if "artist" not in _fcols:
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN artist "
+                "TEXT DEFAULT ''")
+        if "album" not in _fcols:
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN album "
+                "TEXT DEFAULT ''")
+        if "bit_rate" not in _fcols:
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN bit_rate "
+                "INTEGER DEFAULT 0")
         if "library_id" not in _ecols:
             conn.execute(
                 "ALTER TABLE entries ADD COLUMN library_id "
@@ -274,7 +293,8 @@ def init_db():
         for _k, _n, _p in (("video", "默认库", "视频/默认库"),
                            ("image", "默认库", "图片"),
                            ("novel", "默认库", "小说"),
-                           ("file", "默认库", "文件")):
+                           ("file", "默认库", "文件"),
+                           ("music", "默认库", "音乐")):
             if conn.execute(
                     "SELECT id FROM libraries WHERE kind = ? "
                     "AND is_default = 1", (_k,)).fetchone() is None:
@@ -440,6 +460,8 @@ def _target_gpath(row):
         return "/图片/" + month + "/" + name
     if kind == "novel":
         return "/小说/" + month + "/" + name
+    if kind == "music":
+        return "/音乐/" + month + "/" + name
     return ("/文件/" + (row["category"] or "其他") + "/"
             + month + "/" + name)
 
@@ -761,6 +783,59 @@ def _make_image_thumb(path, hash_):
              "-vf", "scale=480:-2", "-q:v", "5", out_path, "-y"],
             capture_output=True, timeout=60)
         return res.returncode == 0 and os.path.exists(out_path)
+    except Exception:
+        return False
+
+
+def _probe_audio(path):
+    """ffprobe for audio files: duration, bit rate and the
+    common format tags (title / artist / album)."""
+    result = {"duration": 0.0, "bit_rate": 0, "title": "",
+              "artist": "", "album": ""}
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", path],
+            capture_output=True, timeout=60)
+        info = json.loads(out.stdout.decode("utf-8", "replace")
+                          or "{}")
+    except Exception:
+        return result
+    fmt = info.get("format") or {}
+    try:
+        result["duration"] = float(fmt.get("duration") or 0)
+    except Exception:
+        pass
+    try:
+        result["bit_rate"] = int(fmt.get("bit_rate") or 0)
+    except Exception:
+        pass
+    tags = {}
+    for k, v in (fmt.get("tags") or {}).items():
+        tags[str(k).lower()] = v
+    result["title"] = str(tags.get("title") or "").strip()
+    result["artist"] = str(tags.get("artist") or "").strip()
+    result["album"] = str(tags.get("album") or "").strip()
+    return result
+
+
+def _make_cover_thumb(path, hash_):
+    """Extract the embedded cover image of an audio file, if
+    it has one; pure audio without art yields no thumbnail
+    (the frontend placeholder takes over)."""
+    out_path = os.path.join(THUMB_DIR, hash_ + ".jpg")
+    if os.path.exists(out_path):
+        return True
+    try:
+        res = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", path, "-frames:v", "1",
+             "-vf", "scale=320:-2", "-q:v", "5", out_path, "-y"],
+            capture_output=True, timeout=60)
+        ok = (res.returncode == 0 and os.path.exists(out_path)
+              and os.path.getsize(out_path) > 0)
+        if not ok and os.path.exists(out_path):
+            os.unlink(out_path)
+        return ok
     except Exception:
         return False
 
@@ -2558,6 +2633,742 @@ def ext_handle(environ, start_response, params):
     return _json(start_response, "404 Not Found", {"ok": False})
 
 
+# ------------------------------------------------------- subsonic
+# Phone music clients (Symfonium and friends) speak the Subsonic
+# API. This is a browse / search / star subset over the single
+# music library, exposed at /rest/* and reached from the internet
+# via Caddy at /vidlib-api/subsonic/* (the panel /web gate cannot
+# serve phone app clients). It carries the protocol's own
+# credential from credentials.json (subsonic_user / subsonic_pass,
+# import-only, same class as the book-source token and the WebDAV
+# password). Until both are set, every request fails auth.
+#
+# Mark mapping (shared with the /music page tri-state marks):
+#   star            -> like    (entries.mark = 1)
+#   unstar          -> clear like only
+#   setRating 1     -> dislike (entries.mark = 2)
+#   setRating 0     -> clear dislike only
+#   setRating 2..5  -> like    (entries.mark = 1)
+# In song payloads a liked song reports starred=<mark time> and
+# userRating 5; a disliked song reports userRating 1.
+#
+# ID scheme (defined here, nowhere else):
+#   song   "s"  + entries.id            (e.g. s123)
+#   artist "ar" + urlsafe_b64(artist)   (raw artist field, "" ok)
+#   album  "al" + urlsafe_b64(artist + "\x00" + album)
+#   root directory id is "root".
+
+SUBSONIC_API_VERSION = "1.16.1"
+SUBSONIC_PUBLIC_BASE = "https://debi.su7.dpdns.org/vidlib-api/subsonic"
+
+
+def _sub_b64enc(text):
+    return base64.urlsafe_b64encode(
+        (text or "").encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _sub_b64dec(text):
+    pad = "=" * (-len(text) % 4)
+    try:
+        return base64.urlsafe_b64decode(
+            (text + pad).encode("ascii")).decode("utf-8")
+    except Exception:
+        return None
+
+
+def _sub_song_id(entry_id):
+    return "s%d" % int(entry_id)
+
+
+def _sub_artist_id(artist):
+    return "ar" + _sub_b64enc(artist or "")
+
+
+def _sub_album_id(artist, album):
+    return "al" + _sub_b64enc((artist or "") + "\x00" + (album or ""))
+
+
+def _sub_parse_id(raw):
+    """-> (kind, value): song value is an int entry id; artist
+    value is the raw artist name; album value is (artist, album)."""
+    raw = (raw or "").strip()
+    if raw in ("root", "0", ""):
+        return ("root", None)
+    if raw.startswith("s") and raw[1:].isdigit():
+        return ("song", int(raw[1:]))
+    if raw.startswith("ar"):
+        name = _sub_b64dec(raw[2:])
+        if name is not None:
+            return ("artist", name)
+    if raw.startswith("al"):
+        joined = _sub_b64dec(raw[2:])
+        if joined is not None and "\x00" in joined:
+            artist, album = joined.split("\x00", 1)
+            return ("album", (artist, album))
+    if raw.isdigit():
+        return ("song", int(raw))
+    return (None, None)
+
+
+def _sub_iso(ts):
+    if not ts:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _sub_artist_name(raw):
+    return raw or "未知歌手"
+
+
+def _sub_album_name(raw):
+    return raw or "未知专辑"
+
+
+def _sub_creds():
+    creds = _load_creds()
+    return (creds.get("subsonic_user") or "",
+            creds.get("subsonic_pass") or "")
+
+
+def _sub_auth(params):
+    """True when the request carries a valid Subsonic credential.
+    Supports u+p (plain or enc:hex) and u+t+s (md5(pass+salt))."""
+    user, password = _sub_creds()
+    if not user or not password:
+        return False
+    given_user = params.get("u") or ""
+    if not given_user or not secrets.compare_digest(given_user, user):
+        return False
+    token = params.get("t") or ""
+    salt = params.get("s") or ""
+    if token and salt:
+        expect = hashlib.md5(
+            (password + salt).encode("utf-8")).hexdigest()
+        return secrets.compare_digest(token.lower(), expect)
+    p = params.get("p") or ""
+    if p:
+        if p.startswith("enc:"):
+            try:
+                p = bytes.fromhex(p[4:]).decode("utf-8")
+            except Exception:
+                return False
+        return secrets.compare_digest(p, password)
+    return False
+
+
+def _sub_envelope(payload=None, error=None):
+    resp = {"status": "ok" if error is None else "failed",
+            "version": SUBSONIC_API_VERSION,
+            "type": "vidlib",
+            "serverVersion": "1.0.0",
+            "openSubsonic": True}
+    if error is not None:
+        resp["error"] = {"code": error[0], "message": error[1]}
+    if payload:
+        resp.update(payload)
+    return {"subsonic-response": resp}
+
+
+def _sub_ok(start_response, payload=None):
+    return _json(start_response, "200 OK", _sub_envelope(payload))
+
+
+def _sub_fail(start_response, code, message, http="200 OK"):
+    return _json(start_response, http,
+                 _sub_envelope(error=(code, message)))
+
+
+_SUB_MUSIC_COLS = (
+    "SELECT e.id AS id, e.title AS title, e.tags AS tags, "
+    "e.mark AS mark, e.mark_at AS mark_at, "
+    "e.play_count AS play_count, e.created_at AS created_at, "
+    "e.hash AS hash, f.ext AS ext, f.size AS size, "
+    "f.duration AS duration, f.artist AS artist, "
+    "f.album AS album, f.bit_rate AS bit_rate, "
+    "f.status AS status "
+    "FROM entries e JOIN files f ON f.hash = e.hash "
+    "WHERE f.kind = 'music'")
+
+
+def _sub_songs(where="", args=(), order="e.id DESC", limit=None):
+    sql = _SUB_MUSIC_COLS
+    if where:
+        sql += " AND (" + where + ")"
+    sql += " ORDER BY " + order
+    if limit:
+        sql += " LIMIT %d OFFSET %d" % (int(limit[0]), int(limit[1]))
+    with _db() as conn:
+        return conn.execute(sql, tuple(args)).fetchall()
+
+
+def _sub_song_obj(r):
+    artist = r["artist"] or ""
+    album = r["album"] or ""
+    obj = {
+        "id": _sub_song_id(r["id"]),
+        "parent": _sub_album_id(artist, album),
+        "title": r["title"] or "",
+        "album": _sub_album_name(album),
+        "artist": _sub_artist_name(artist),
+        "albumId": _sub_album_id(artist, album),
+        "artistId": _sub_artist_id(artist),
+        "isDir": False,
+        "coverArt": _sub_song_id(r["id"]),
+        "duration": int(r["duration"] or 0),
+        "size": int(r["size"] or 0),
+        "suffix": (r["ext"] or "").lower(),
+        "contentType": _mime_for(r["ext"] or ""),
+        "path": (r["title"] or "") + (
+            "." + r["ext"] if r["ext"] else ""),
+        "playCount": int(r["play_count"] or 0),
+    }
+    if r["bit_rate"]:
+        obj["bitRate"] = int(round(r["bit_rate"] / 1000.0))
+    created = _sub_iso(r["created_at"])
+    if created:
+        obj["created"] = created
+    if r["mark"] == 1:
+        starred = _sub_iso(r["mark_at"])
+        if starred:
+            obj["starred"] = starred
+        obj["userRating"] = 5
+    elif r["mark"] == 2:
+        obj["userRating"] = 1
+    return obj
+
+
+def _sub_artist_rows():
+    with _db() as conn:
+        return conn.execute(
+            "SELECT COALESCE(f.artist, '') AS artist, "
+            "COUNT(*) AS n FROM entries e "
+            "JOIN files f ON f.hash = e.hash "
+            "WHERE f.kind = 'music' GROUP BY COALESCE(f.artist, '')"
+        ).fetchall()
+
+
+def _sub_album_rows():
+    with _db() as conn:
+        return conn.execute(
+            "SELECT COALESCE(f.artist, '') AS artist, "
+            "COALESCE(f.album, '') AS album, COUNT(*) AS n, "
+            "COALESCE(SUM(f.duration), 0) AS dur, "
+            "MAX(e.created_at) AS created FROM entries e "
+            "JOIN files f ON f.hash = e.hash "
+            "WHERE f.kind = 'music' "
+            "GROUP BY COALESCE(f.artist, ''), COALESCE(f.album, '')"
+        ).fetchall()
+
+
+def _sub_artist_obj(artist):
+    albums = [r for r in _sub_album_rows() if r["artist"] == artist]
+    return {"id": _sub_artist_id(artist),
+            "name": _sub_artist_name(artist),
+            "albumCount": len(albums),
+            "coverArt": _sub_artist_id(artist)}
+
+
+def _sub_album_obj(artist, album, count, duration, created):
+    return {"id": _sub_album_id(artist, album),
+            "name": _sub_album_name(album),
+            "artist": _sub_artist_name(artist),
+            "artistId": _sub_artist_id(artist),
+            "coverArt": _sub_album_id(artist, album),
+            "songCount": int(count),
+            "duration": int(duration or 0),
+            "created": _sub_iso(created) or "1970-01-01T00:00:00Z"}
+
+
+def _sub_index_groups():
+    """Artists grouped by first letter of display name."""
+    groups = {}
+    for r in _sub_artist_rows():
+        name = _sub_artist_name(r["artist"])
+        letter = name[0].upper() if name else "#"
+        if not letter.isalpha():
+            letter = "#"
+        groups.setdefault(letter, []).append(r["artist"])
+    return [{"name": letter,
+             "artist": [_sub_artist_obj(a)
+                        for a in sorted(groups[letter],
+                                        key=_sub_artist_name)]}
+            for letter in sorted(groups)]
+
+
+def _sub_dir_child_artist(artist):
+    return {"id": _sub_artist_id(artist),
+            "parent": "root",
+            "title": _sub_artist_name(artist),
+            "artist": _sub_artist_name(artist),
+            "isDir": True,
+            "coverArt": _sub_artist_id(artist)}
+
+
+def _sub_dir_child_album(artist, album):
+    return {"id": _sub_album_id(artist, album),
+            "parent": _sub_artist_id(artist),
+            "title": _sub_album_name(album),
+            "album": _sub_album_name(album),
+            "artist": _sub_artist_name(artist),
+            "isDir": True,
+            "coverArt": _sub_album_id(artist, album)}
+
+
+def _sub_get_music_directory(params):
+    kind, val = _sub_parse_id(params.get("id") or "")
+    if kind == "root":
+        children = [_sub_dir_child_artist(r["artist"])
+                    for r in sorted(
+                        _sub_artist_rows(),
+                        key=lambda r: _sub_artist_name(r["artist"]))]
+        return {"directory": {"id": "root", "name": "音乐",
+                              "child": children}}
+    if kind == "artist":
+        children = []
+        for r in _sub_album_rows():
+            if r["artist"] == val and r["album"] != "":
+                children.append(_sub_dir_child_album(val, r["album"]))
+        children.sort(key=lambda c: c["title"])
+        loose = _sub_songs(
+            "COALESCE(f.artist, '') = ? AND COALESCE(f.album, '') = ''",
+            (val,), order="e.title ASC")
+        children += [_sub_song_obj(r) for r in loose]
+        return {"directory": {"id": _sub_artist_id(val),
+                              "parent": "root",
+                              "name": _sub_artist_name(val),
+                              "child": children}}
+    if kind == "album":
+        artist, album = val
+        rows = _sub_songs(
+            "COALESCE(f.artist, '') = ? AND COALESCE(f.album, '') = ?",
+            (artist, album), order="e.title ASC")
+        return {"directory": {"id": _sub_album_id(artist, album),
+                              "parent": _sub_artist_id(artist),
+                              "name": _sub_album_name(album),
+                              "child": [_sub_song_obj(r) for r in rows]}}
+    return None
+
+
+def _sub_get_album(params):
+    kind, val = _sub_parse_id(params.get("id") or "")
+    if kind != "album":
+        return None
+    artist, album = val
+    rows = _sub_songs(
+        "COALESCE(f.artist, '') = ? AND COALESCE(f.album, '') = ?",
+        (artist, album), order="e.title ASC")
+    if not rows:
+        return None
+    obj = _sub_album_obj(artist, album, len(rows),
+                         sum(r["duration"] or 0 for r in rows),
+                         max(r["created_at"] or 0 for r in rows))
+    obj["song"] = [_sub_song_obj(r) for r in rows]
+    return {"album": obj}
+
+
+def _sub_album_list(params):
+    list_type = (params.get("type") or "recent").strip()
+    try:
+        size = max(1, int(params.get("size") or 10))
+    except Exception:
+        size = 10
+    try:
+        offset = max(0, int(params.get("offset") or 0))
+    except Exception:
+        offset = 0
+    rows = list(_sub_album_rows())
+    if list_type == "random":
+        random.shuffle(rows)
+    elif list_type == "alphabeticalByName":
+        rows.sort(key=lambda r: (_sub_album_name(r["album"]),
+                                 _sub_artist_name(r["artist"])))
+    elif list_type == "alphabeticalByArtist":
+        rows.sort(key=lambda r: (_sub_artist_name(r["artist"]),
+                                 _sub_album_name(r["album"])))
+    else:  # recent / newest / byYear fallback
+        rows.sort(key=lambda r: -(r["created"] or 0))
+    albums = [_sub_album_obj(r["artist"], r["album"], r["n"],
+                             r["dur"], r["created"])
+              for r in rows[offset:offset + size]]
+    return albums
+
+
+def _sub_search(params):
+    q = (params.get("query") or "").strip()
+
+    def _count(key, default=20):
+        try:
+            return max(0, int(params.get(key) or default))
+        except Exception:
+            return default
+
+    result = {}
+    if not q:
+        return result
+    like = "%" + q + "%"
+    songs = _sub_songs(
+        "(e.title LIKE ? OR f.artist LIKE ? OR f.album LIKE ? "
+        "OR e.tags LIKE ?)", (like, like, like, like),
+        order="e.id DESC",
+        limit=(_count("songCount"), _count("songOffset", 0)))
+    if songs:
+        result["song"] = [_sub_song_obj(r) for r in songs]
+    needle = q.lower()
+    artists = [r["artist"] for r in _sub_artist_rows()
+               if needle in _sub_artist_name(r["artist"]).lower()]
+    artists.sort(key=_sub_artist_name)
+    off = _count("artistOffset", 0)
+    artists = artists[off:off + _count("artistCount")]
+    if artists:
+        result["artist"] = [_sub_artist_obj(a) for a in artists]
+    albums = [r for r in _sub_album_rows()
+              if needle in _sub_album_name(r["album"]).lower()
+              or needle in _sub_artist_name(r["artist"]).lower()]
+    albums.sort(key=lambda r: (_sub_album_name(r["album"]),
+                               _sub_artist_name(r["artist"])))
+    off = _count("albumOffset", 0)
+    albums = albums[off:off + _count("albumCount")]
+    if albums:
+        result["album"] = [
+            _sub_album_obj(r["artist"], r["album"], r["n"],
+                           r["dur"], r["created"]) for r in albums]
+    return result
+
+
+def _sub_apply_mark(entry_id, mark):
+    """Mirror of the /api/mark write semantics for one entry."""
+    entry = get_entry(entry_id)
+    if entry is None or entry["f_kind"] != "music":
+        return False
+    if int(entry["mark"] or 0) == mark:
+        return True
+    now = time.time()
+    with _db() as conn:
+        if mark == 2:
+            conn.execute(
+                "UPDATE entries SET mark = 2, mark_at = ?, "
+                "seen_at = CASE WHEN seen_at IS NULL OR "
+                "seen_at = 0 THEN ? ELSE seen_at END, "
+                "updated_at = ? WHERE id = ?",
+                (now, now, now, entry_id))
+        else:
+            conn.execute(
+                "UPDATE entries SET mark = ?, mark_at = ?, "
+                "updated_at = ? WHERE id = ?",
+                (mark, now if mark else 0, now, entry_id))
+    return True
+
+
+def _sub_target_song_ids(params):
+    ids = set()
+    raws = []
+    for key in ("id", "albumId", "artistId"):
+        v = params.get(key)
+        if v:
+            raws += [x for x in v.split(",") if x]
+    for raw in raws:
+        kind, val = _sub_parse_id(raw)
+        if kind == "song":
+            ids.add(val)
+        elif kind == "artist":
+            rows = _sub_songs("COALESCE(f.artist, '') = ?", (val,),
+                              order="e.id ASC")
+            ids.update(r["id"] for r in rows)
+        elif kind == "album":
+            rows = _sub_songs(
+                "COALESCE(f.artist, '') = ? "
+                "AND COALESCE(f.album, '') = ?", val,
+                order="e.id ASC")
+            ids.update(r["id"] for r in rows)
+    return sorted(ids)
+
+
+def _sub_mark_action(params, action):
+    ids = _sub_target_song_ids(params)
+    if not ids:
+        return False
+    changed = False
+    for entry_id in ids:
+        entry = get_entry(entry_id)
+        if entry is None or entry["f_kind"] != "music":
+            continue
+        cur = int(entry["mark"] or 0)
+        if action == "star":
+            new = 1
+        elif action == "unstar":
+            new = 0 if cur == 1 else cur
+        else:  # setRating
+            try:
+                rating = int(params.get("rating") or 0)
+            except Exception:
+                rating = 0
+            if rating == 1:
+                new = 2
+            elif rating == 0:
+                new = 0 if cur == 2 else cur
+            else:
+                new = 1
+        if new != cur:
+            _sub_apply_mark(entry_id, new)
+            changed = True
+    if changed:
+        _sync_mark_files()
+    return True
+
+
+def _sub_cover_hash(params):
+    kind, val = _sub_parse_id(params.get("id") or "")
+    rows = []
+    if kind == "song":
+        entry = get_entry(val)
+        if entry is not None and entry["f_kind"] == "music":
+            return entry["hash"]
+        return None
+    if kind == "artist":
+        rows = _sub_songs("COALESCE(f.artist, '') = ?", (val,),
+                          order="e.id ASC", limit=(1, 0))
+    elif kind == "album":
+        rows = _sub_songs(
+            "COALESCE(f.artist, '') = ? AND COALESCE(f.album, '') = ?",
+            val, order="e.id ASC", limit=(1, 0))
+    if rows:
+        return rows[0]["hash"]
+    return None
+
+
+def _sub_stream(environ, start_response, params):
+    kind, val = _sub_parse_id(params.get("id") or "")
+    if kind != "song":
+        return _sub_fail(start_response, 70, "Song not found.")
+    entry = get_entry(val)
+    if entry is None or entry["f_kind"] != "music":
+        return _sub_fail(start_response, 70, "Song not found.")
+    with _db() as conn:
+        conn.execute("UPDATE entries SET play_count = play_count + 1 "
+                     "WHERE id = ?", (entry["id"],))
+        conn.execute(
+            "UPDATE entries SET seen_at = ? WHERE id = ? "
+            "AND (seen_at IS NULL OR seen_at = 0)",
+            (time.time(), entry["id"]))
+    file_row = get_file(entry["hash"])
+    if entry["f_status"] == "archived":
+        url = ""
+        try:
+            url = resolve_play_url(file_row)
+        except Exception:
+            url = ""
+        if url:
+            start_response("302 Found",
+                           [("Location", url), ("Content-Length", "0")])
+            return [b""]
+        return _dav_stream_archived(environ, start_response, file_row)
+    local = _local_path(file_row)
+    if not os.path.exists(local):
+        return _sub_fail(start_response, 70, "Song not found.")
+    return _serve_file_range(environ, start_response, local,
+                             _mime_for(file_row["ext"]))
+
+
+def subsonic_handle(environ, start_response):
+    params = {}
+    for k, v in urllib.parse.parse_qs(
+            environ.get("QUERY_STRING", "")).items():
+        params[k] = v[0]
+    if environ.get("REQUEST_METHOD") == "POST":
+        ctype = environ.get("CONTENT_TYPE") or ""
+        if "application/x-www-form-urlencoded" in ctype:
+            try:
+                length = int(environ.get("CONTENT_LENGTH") or 0)
+            except Exception:
+                length = 0
+            length = max(0, min(length, 65536))
+            if length:
+                body = environ["wsgi.input"].read(length)
+                for k, v in urllib.parse.parse_qs(
+                        body.decode("utf-8", "replace")).items():
+                    params[k] = v[0]
+    path = environ.get("PATH_INFO", "") or ""
+    name = path[len("/rest"):].strip("/")
+    for suffix in (".view", ".json"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    if not _sub_auth(params):
+        return _sub_fail(start_response, 40,
+                         "Wrong username or password.",
+                         http="401 Unauthorized")
+    try:
+        if name in ("ping", ""):
+            return _sub_ok(start_response)
+        if name == "getLicense":
+            return _sub_ok(start_response, {"license": {
+                "valid": True, "email": "vidlib@local",
+                "licenseExpires": "2099-01-01T00:00:00Z",
+                "trialExpires": "2099-01-01T00:00:00Z"}})
+        if name == "getMusicFolders":
+            return _sub_ok(start_response, {"musicFolders": {
+                "musicFolder": [{"id": 1, "name": "音乐"}]}})
+        if name == "getMusicDirectory":
+            data = _sub_get_music_directory(params)
+            if data is None:
+                return _sub_fail(start_response, 70, "Not found.")
+            return _sub_ok(start_response, data)
+        if name == "getIndexes":
+            return _sub_ok(start_response, {"indexes": {
+                "shortcut": [], "index": _sub_index_groups(),
+                "child": []}})
+        if name == "getArtists":
+            return _sub_ok(start_response, {"artists": {
+                "ignoredArticles": "",
+                "index": _sub_index_groups()}})
+        if name == "getArtist":
+            kind, val = _sub_parse_id(params.get("id") or "")
+            if kind != "artist":
+                return _sub_fail(start_response, 70, "Not found.")
+            obj = _sub_artist_obj(val)
+            obj["album"] = [
+                _sub_album_obj(r["artist"], r["album"], r["n"],
+                               r["dur"], r["created"])
+                for r in _sub_album_rows() if r["artist"] == val]
+            return _sub_ok(start_response, {"artist": obj})
+        if name == "getAlbum":
+            data = _sub_get_album(params)
+            if data is None:
+                return _sub_fail(start_response, 70, "Not found.")
+            return _sub_ok(start_response, data)
+        if name == "getAlbumList":
+            return _sub_ok(start_response, {
+                "albumList": {"album": _sub_album_list(params)}})
+        if name == "getAlbumList2":
+            return _sub_ok(start_response, {
+                "albumList2": {"album": _sub_album_list(params)}})
+        if name == "search2":
+            return _sub_ok(start_response, {
+                "searchResult2": _sub_search(params)})
+        if name == "search3":
+            return _sub_ok(start_response, {
+                "searchResult3": _sub_search(params)})
+        if name == "getSong":
+            kind, val = _sub_parse_id(params.get("id") or "")
+            rows = []
+            if kind == "song":
+                rows = _sub_songs("e.id = ?", (val,), limit=(1, 0))
+            if not rows:
+                return _sub_fail(start_response, 70, "Song not found.")
+            return _sub_ok(start_response,
+                           {"song": _sub_song_obj(rows[0])})
+        if name in ("getStarred", "getStarred2"):
+            rows = _sub_songs("e.mark = 1", order="e.mark_at DESC")
+            key = "starred" if name == "getStarred" else "starred2"
+            payload = {}
+            if rows:
+                payload["song"] = [_sub_song_obj(r) for r in rows]
+            return _sub_ok(start_response, {key: payload})
+        if name == "star":
+            _sub_mark_action(params, "star")
+            return _sub_ok(start_response)
+        if name == "unstar":
+            _sub_mark_action(params, "unstar")
+            return _sub_ok(start_response)
+        if name == "setRating":
+            _sub_mark_action(params, "setRating")
+            return _sub_ok(start_response)
+        if name == "getCoverArt":
+            hash_ = _sub_cover_hash(params)
+            if hash_ is None:
+                return _sub_fail(start_response, 70, "Not found.")
+            thumb = os.path.join(THUMB_DIR, hash_ + ".jpg")
+            if os.path.exists(thumb):
+                with open(thumb, "rb") as fh:
+                    data = fh.read()
+                start_response("200 OK", [
+                    ("Content-Type", "image/jpeg"),
+                    ("Content-Length", str(len(data))),
+                    ("Cache-Control", "public, max-age=86400")])
+                return [data]
+            start_response("200 OK", [
+                ("Content-Type", "image/svg+xml"),
+                ("Content-Length", str(len(_PLACEHOLDER_SVG)))])
+            return [_PLACEHOLDER_SVG]
+        if name in ("stream", "download"):
+            return _sub_stream(environ, start_response, params)
+        if name == "scrobble":
+            return _sub_ok(start_response)
+        if name == "getUser":
+            return _sub_ok(start_response, {"user": {
+                "username": params.get("u") or "",
+                "scrobblingEnabled": False, "adminRole": False,
+                "settingsRole": False, "downloadRole": True,
+                "uploadRole": False, "playlistRole": False,
+                "coverArtRole": True, "commentRole": False,
+                "podcastRole": False, "streamRole": True,
+                "jukeboxRole": False, "shareRole": False,
+                "videoConversionRole": False, "folder": [1]}})
+        if name == "getPlaylists":
+            return _sub_ok(start_response,
+                           {"playlists": {"playlist": []}})
+        if name in ("getScanStatus", "startScan"):
+            with _db() as conn:
+                n = conn.execute(
+                    "SELECT COUNT(*) AS n FROM entries e "
+                    "JOIN files f ON f.hash = e.hash "
+                    "WHERE f.kind = 'music'").fetchone()["n"]
+            return _sub_ok(start_response, {"scanStatus": {
+                "scanning": False, "count": int(n)}})
+        if name == "getRandomSongs":
+            try:
+                size = max(1, int(params.get("size") or 10))
+            except Exception:
+                size = 10
+            rows = _sub_songs(order="RANDOM()", limit=(size, 0))
+            return _sub_ok(start_response, {"randomSongs": {
+                "song": [_sub_song_obj(r) for r in rows]}})
+    except Exception:
+        return _sub_fail(start_response, 0, "Internal error.")
+    return _sub_fail(start_response, 0, "Unknown endpoint.")
+
+
+def _subsonic_admin_panel():
+    user, password = _sub_creds()
+    if user and password:
+        state = "已设置（账号：%s）" % _esc(user)
+    else:
+        state = "尚未设置，接口会拒绝所有请求"
+    body = (
+        '<div class="panel"><h2>手机播放（Subsonic）</h2>'
+        '<div class="kv">Symfonium 等 Subsonic 客户端从这里接入'
+        '音乐库。服务器地址：<b>' + SUBSONIC_PUBLIC_BASE + '</b>'
+        '（IPv6 不通时把域名换成 debi4.su7.dpdns.org）。'
+        '账号状态：<b>' + state + '</b>。用户名、密码只写不回显，'
+        '留空的字段保持不变，密码至少 8 位。</div>'
+        '<p>用户名 <input id="ss-user" type="text" autocomplete="off" '
+        'style="width:150px"> 新密码 '
+        '<input id="ss-pass" type="password" '
+        'autocomplete="new-password" style="width:150px"> '
+        '<button class="btn" id="ss-save" type="button">保存</button> '
+        '<span id="ss-msg" style="color:#8b94a7"></span></p>'
+        '<p style="color:#8b94a7;font-size:13px;line-height:1.7">'
+        '标记口径（与音乐页共用同一套三态标记，双向同步）：'
+        '星标 = 喜欢；评分 1 = 不喜欢；评分 0 = 清除不喜欢；'
+        '评分 2-5 = 喜欢；取消星标 = 清除喜欢。'
+        '歌曲在手机端显示为：喜欢 = 已星标 + 评分 5；'
+        '不喜欢 = 评分 1。</p>'
+        '<script>'
+        'async function ssPost(u,b){const r=await fetch(u,'
+        '{method:"POST",headers:{"Content-Type":"application/json"},'
+        'body:JSON.stringify(b)});return r.json();}'
+        'document.getElementById("ss-save").addEventListener('
+        '"click",async function(){'
+        'var u=document.getElementById("ss-user").value.trim();'
+        'var p=document.getElementById("ss-pass").value;'
+        'var d=await ssPost("api/admin/subsonic",'
+        '{user:u,password:p});'
+        'document.getElementById("ss-msg").textContent='
+        'd.ok?"已保存，刷新页面查看状态。":(d.message||"保存失败");'
+        '});'
+        '</script></div>')
+    return body
+
+
 def _fmt_duration(sec):
     sec = int(sec or 0)
     if sec >= 3600:
@@ -2628,7 +3439,9 @@ def get_entry(entry_id):
             "f.duration AS f_duration, f.width AS f_width, "
             "f.height AS f_height, f.status AS f_status, "
             "f.gpath AS f_gpath, f.error AS f_error, "
-            "f.kind AS f_kind, f.category AS f_category "
+            "f.kind AS f_kind, f.category AS f_category, "
+            "f.artist AS f_artist, f.album AS f_album, "
+            "f.bit_rate AS f_bit_rate "
             "FROM entries e JOIN files f ON f.hash = e.hash "
             "WHERE e.id = ?", (entry_id,)).fetchone()
 
@@ -2893,6 +3706,8 @@ def ingest_staged_file(staged_path, display_name, folder=None, tags="",
     os.replace(staged_path, final)
     meta = {"duration": 0, "width": 0, "height": 0}
     category = ""
+    audio = {"duration": 0.0, "bit_rate": 0, "title": "",
+             "artist": "", "album": ""}
     if kind == "video":
         meta = _probe(final)
         _probe_cache[digest] = meta
@@ -2908,15 +3723,25 @@ def ingest_staged_file(staged_path, display_name, folder=None, tags="",
             pass
     elif kind == "file":
         category = _category_for_ext(ext)
+    elif kind == "music":
+        audio = _probe_audio(final)
+        meta = {"duration": audio.get("duration") or 0,
+                "width": 0, "height": 0}
+        _make_cover_thumb(final, digest)
     size = os.path.getsize(final)
     with _db() as conn:
         conn.execute(
             "INSERT INTO files(hash, ext, size, duration, width, "
-            "height, status, kind, category, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,'local',?,?,?,?)",
+            "height, status, kind, category, artist, album, "
+            "bit_rate, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,'local',?,?,?,?,?,?,?)",
             (digest, ext, size, meta.get("duration") or 0,
              meta.get("width") or 0, meta.get("height") or 0,
-             kind, category, now, now))
+             kind, category, audio.get("artist") or "",
+             audio.get("album") or "",
+             audio.get("bit_rate") or 0, now, now))
+    if kind == "music" and audio.get("title"):
+        title = audio["title"]
     entry_id = insert_entry(
         digest, title, folder, tags, source,
         library_id=_resolve_library_id(kind, library_id))
@@ -4020,6 +4845,8 @@ _ENTRY_COLS = (
     "e.seen_at AS seen_at, e.mark AS mark, e.mark_at AS mark_at, "
     "e.created_at AS created_at, e.library_id AS library_id, "
     "f.kind AS kind, f.category AS category, "
+    "f.artist AS artist, f.album AS album, "
+    "f.bit_rate AS bit_rate, "
     "f.ext AS ext, f.size AS size, "
     "f.duration AS duration, f.width AS width, f.height AS height, "
     "f.status AS status, f.gpath AS gpath, f.error AS error "
@@ -4062,6 +4889,9 @@ def page_hub(params, base_href=""):
                 "SELECT f.kind AS kind, COUNT(*) AS c FROM entries e "
                 "JOIN files f ON f.hash = e.hash GROUP BY f.kind"):
             counts[r["kind"] or "video"] = r["c"]
+        music_recent = conn.execute(
+            _ENTRY_COLS + " WHERE f.kind = 'music' "
+            "ORDER BY e.id DESC LIMIT 1").fetchone()
         vlibs = conn.execute(
             "SELECT l.*, (SELECT COUNT(*) FROM entries e "
             "WHERE e.library_id = l.id) AS n FROM libraries l "
@@ -4069,6 +4899,9 @@ def page_hub(params, base_href=""):
         ).fetchall()
     libbits = "、".join(
         "%s（%d）" % (_esc(l["name"]), l["n"]) for l in vlibs) or "默认库"
+    music_suffix = ""
+    if music_recent:
+        music_suffix = " · 最近：%s" % _esc(music_recent["title"])
     cards = (
         '<a class="card" href="wall?kind=video">'
         '<span class="t">🎬 视频</span>'
@@ -4085,14 +4918,18 @@ def page_hub(params, base_href=""):
         '<a class="card" href="files">'
         '<span class="t">📦 文件</span>'
         '<div class="m">%d 个 · 按类别规则归档</div></a>'
+        '<a class="card" href="music">'
+        '<span class="t">🎵 音乐</span>'
+        '<div class="m">%d 首%s</div></a>'
         '<a class="card" href="upload">'
         '<span class="t">⬆ 上传</span>'
-        '<div class="m">视频 / 图片 / txt 小说 / 任意文件</div></a>'
+        '<div class="m">视频 / 图片 / 音乐 / txt 小说 / 任意文件</div></a>'
         '<a class="card" href="admin">'
         '<span class="t">⚙ 管理</span>'
         '<div class="m">主题库、文件类别、DAV、补传、清理</div></a>'
     ) % (counts.get("video", 0), libbits, counts.get("image", 0),
-         counts.get("novel", 0), counts.get("file", 0))
+         counts.get("novel", 0), counts.get("file", 0),
+         counts.get("music", 0), music_suffix)
     body = ('<div class="topbar"><h1>资源库</h1></div>'
             '<div class="grid">' + cards + "</div>")
     return _page("资源库", body, base_href=base_href)
@@ -4196,6 +5033,290 @@ def page_images(params, base_href=""):
         % (_esc(q), total, "".join(cards) or
            '<div class="muted">暂无图片。</div>', pager, lb, js))
     return _page("图片", body, base_href)
+
+
+_MUSIC_PER_PAGE = 30
+
+_MUSIC_CSS = (
+    "<style>"
+    ".muwrap{padding-bottom:124px}"
+    ".mulist{display:flex;flex-direction:column;gap:8px}"
+    ".murow{display:flex;gap:11px;align-items:center;background:#171c27;"
+    "border:1px solid #242c3f;border-radius:11px;padding:9px 12px}"
+    ".murow.playing{border-color:#2f6fd0}"
+    ".mucover{width:46px;height:46px;border-radius:8px;object-fit:cover;"
+    "background:#232a3a;flex:none}"
+    ".mumain{flex:1;min-width:0}"
+    ".mut{display:block;font-size:15px;color:#e8ebf1;white-space:nowrap;"
+    "overflow:hidden;text-overflow:ellipsis}"
+    ".mum{display:block;font-size:12.5px;color:#8b94a7;margin-top:2px;"
+    "white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+    ".mubtn.on{color:#ff5d7a;border-color:#ff5d7a}"
+    "#mubar{position:fixed;left:0;right:0;bottom:0;z-index:55;"
+    "background:rgba(13,16,24,.97);border-top:1px solid #2a3350;"
+    "padding:10px 14px}"
+    "#munow{font-size:13.5px;color:#e8ebf1;white-space:nowrap;"
+    "overflow:hidden;text-overflow:ellipsis;max-width:880px;"
+    "margin:0 auto 7px}"
+    "#museek{display:block;width:100%;max-width:880px;margin:0 auto}"
+    ".murow2{display:flex;gap:8px;align-items:center;max-width:880px;"
+    "margin:7px auto 0}"
+    ".mutime{font-size:12px;color:#8b94a7;margin-left:auto}"
+    "</style>")
+
+_MUSIC_JS = r"""
+function muShuffle(a){for(let i=a.length-1;i>0;i--){
+const j=Math.floor(Math.random()*(i+1));const t=a[i];a[i]=a[j];a[j]=t;}
+return a;}
+function muBuildQueue(items,mode,startId){
+const list=items.slice();
+if(mode==="shuffle"){
+const idx=list.findIndex(function(x){return x.id===startId;});
+let head=null;
+if(idx>=0){head=list.splice(idx,1)[0];}
+muShuffle(list);
+if(head)list.unshift(head);
+return list;}
+return list;}
+function muQueuePos(queue,id){
+return queue.findIndex(function(x){return x.id===id;});}
+let MU={items:null,queue:[],pos:-1,mode:(function(){
+try{return localStorage.getItem("mu_mode")||"seq";}
+catch(e){return "seq";}})()};
+const mau=document.getElementById("mplayer");
+function muFmtT(s){s=Math.max(0,Math.floor(s||0));
+const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60;
+return (h?h+":":"")+(h?String(m).padStart(2,"0"):m)+":"+String(x).padStart(2,"0");}
+async function muItems(){
+if(MU.items)return MU.items;
+const r=await fetch("api/music/list?q="+encodeURIComponent(MUQ));
+const d=await r.json();
+MU.items=(d&&d.items)?d.items:[];
+return MU.items;}
+function muMarkRow(){
+const cur=MU.queue[MU.pos];
+document.querySelectorAll(".murow").forEach(function(el){
+el.classList.toggle("playing",
+!!cur&&parseInt(el.dataset.id,10)===cur.id);});}
+function muSyncBtn(){
+document.getElementById("muplay").textContent=
+mau.paused?"▶ 播放":"⏸ 暂停";
+document.getElementById("mushuffle").textContent=
+MU.mode==="shuffle"?"🔀 随机：开":"🔀 随机：关";}
+async function muPlayAt(pos){
+if(pos<0||pos>=MU.queue.length)return;
+MU.pos=pos;
+const it=MU.queue[pos];
+document.getElementById("munow").textContent="加载中… "+it.t;
+muMarkRow();
+try{
+const r=await fetch("api/play/"+it.id);
+const d=await r.json();
+if(!d.ok)throw new Error("bad");
+mau.src=d.url;
+await mau.play();
+document.getElementById("munow").textContent=
+it.t+(it.a?" · "+it.a:"");
+}catch(e){
+document.getElementById("munow").textContent="播放失败："+it.t;}
+muSyncBtn();}
+async function muStart(id){
+const items=await muItems();
+if(!items.length)return;
+MU.queue=muBuildQueue(items,MU.mode,id||null);
+let pos=0;
+if(id){const p=muQueuePos(MU.queue,id);if(p>=0)pos=p;}
+muPlayAt(pos);}
+async function muShuffleAll(){
+MU.mode="shuffle";
+try{localStorage.setItem("mu_mode","shuffle");}catch(e){}
+const items=await muItems();
+if(!items.length){muSyncBtn();return;}
+MU.queue=muBuildQueue(items,"shuffle",null);
+muSyncBtn();
+muPlayAt(0);}
+function muStep(d){
+if(!MU.queue.length)return;
+const n=MU.pos+d;
+if(n<0||n>=MU.queue.length)return;
+muPlayAt(n);}
+document.querySelectorAll(".play").forEach(function(b){
+b.addEventListener("click",function(){
+const id=parseInt(b.dataset.id,10);
+const cur=MU.queue[MU.pos];
+if(cur&&cur.id===id){
+if(mau.paused)mau.play();else mau.pause();
+muSyncBtn();return;}
+muStart(id);});});
+document.querySelectorAll(".like").forEach(function(b){
+b.addEventListener("click",async function(){
+const on=b.classList.contains("on");
+const r=await fetch("api/mark",{method:"POST",
+headers:{"Content-Type":"application/json"},
+body:JSON.stringify({id:parseInt(b.dataset.id,10),mark:on?0:1})});
+const d=await r.json();
+if(d.ok){b.classList.toggle("on",!on);
+if(!on){const row=b.closest(".murow");
+const dis=row?row.querySelector(".dis"):null;
+if(dis)dis.classList.remove("on");}}});});
+document.querySelectorAll(".dis").forEach(function(b){
+b.addEventListener("click",async function(){
+const on=b.classList.contains("on");
+const r=await fetch("api/mark",{method:"POST",
+headers:{"Content-Type":"application/json"},
+body:JSON.stringify({id:parseInt(b.dataset.id,10),mark:on?0:2})});
+const d=await r.json();
+if(d.ok){b.classList.toggle("on",!on);
+if(!on){const row=b.closest(".murow");
+const like=row?row.querySelector(".like"):null;
+if(like)like.classList.remove("on");}}});});
+document.getElementById("muplay").onclick=function(){
+if(!MU.queue.length){muStart(null);return;}
+if(mau.paused)mau.play();else mau.pause();
+muSyncBtn();};
+document.getElementById("munext").onclick=function(){muStep(1);};
+document.getElementById("muprev").onclick=function(){muStep(-1);};
+document.getElementById("mushuffle").onclick=async function(){
+MU.mode=(MU.mode==="shuffle")?"seq":"shuffle";
+try{localStorage.setItem("mu_mode",MU.mode);}catch(e){}
+const cur=MU.queue[MU.pos];
+if(cur&&MU.items){
+MU.queue=muBuildQueue(MU.items,MU.mode,cur.id);
+MU.pos=muQueuePos(MU.queue,cur.id);}
+muSyncBtn();};
+document.getElementById("mushuffleall").onclick=function(){
+muShuffleAll();};
+mau.addEventListener("ended",function(){
+if(MU.pos+1<MU.queue.length)muPlayAt(MU.pos+1);
+else muSyncBtn();});
+mau.addEventListener("play",muSyncBtn);
+mau.addEventListener("pause",muSyncBtn);
+const museek=document.getElementById("museek");
+let museeking=false;
+museek.addEventListener("input",function(){museeking=true;});
+museek.addEventListener("change",function(){
+if(mau.duration)mau.currentTime=mau.duration*museek.value/1000;
+museeking=false;});
+mau.addEventListener("timeupdate",function(){
+if(!museeking&&mau.duration)
+museek.value=Math.floor(mau.currentTime/mau.duration*1000);
+document.getElementById("mutime").textContent=
+muFmtT(mau.currentTime)+" / "+muFmtT(mau.duration);});
+muSyncBtn();
+"""
+
+
+def _music_where(q):
+    where = ["f.kind = 'music'"]
+    args = []
+    if q:
+        where.append("(e.title LIKE ? OR f.artist LIKE ? "
+                     "OR f.album LIKE ? OR e.tags LIKE ?)")
+        like = "%" + q + "%"
+        args += [like, like, like, like]
+    return where, args
+
+
+def _music_list(q):
+    """The full current filter/search result set for the music
+    player queue (lightweight fields only)."""
+    where, args = _music_where(q)
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT e.id AS id, e.title AS t, f.artist AS a "
+            "FROM entries e JOIN files f ON f.hash = e.hash "
+            "WHERE " + " AND ".join(where)
+            + " ORDER BY e.id DESC LIMIT 2000", args).fetchall()
+    return [{"id": r["id"], "t": r["t"], "a": r["a"] or ""}
+            for r in rows]
+
+
+def page_music(params, base_href=""):
+    try:
+        page = max(1, int(params.get("page") or "1"))
+    except Exception:
+        page = 1
+    q = (params.get("q") or "").strip()
+    per = _MUSIC_PER_PAGE
+    where, args = _music_where(q)
+    with _db() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM entries e JOIN files f "
+            "ON f.hash = e.hash WHERE " + " AND ".join(where),
+            args).fetchone()[0]
+        rows = conn.execute(
+            _ENTRY_COLS + " WHERE " + " AND ".join(where)
+            + " ORDER BY e.id DESC LIMIT ? OFFSET ?",
+            args + [per, (page - 1) * per]).fetchall()
+    cards = []
+    for r in rows:
+        meta = " · ".join(x for x in (
+            r["artist"] or "", r["album"] or "",
+            _fmt_duration(r["duration"] or 0),
+            _fmt_size(r["size"] or 0)) if x)
+        cards.append(
+            '<div class="murow" data-id="%d">'
+            '<img class="mucover" loading="lazy" src="%s" alt="">'
+            '<div class="mumain"><span class="mut">%s</span>'
+            '<span class="mum">%s</span></div>'
+            '<button type="button" class="ghost mubtn play" '
+            'data-id="%d">▶</button>'
+            '<button type="button" class="ghost mubtn like%s" '
+            'data-id="%d" title="喜欢">❤</button>'
+            '<button type="button" class="ghost mubtn dis%s" '
+            'data-id="%d" title="不喜欢">👎</button>'
+            '<a class="btn ghost" href="watch/%d">详情</a></div>'
+            % (r["id"], _esc(base_href + "thumb/" + r["hash"]),
+               _esc(r["title"]), _esc(meta), r["id"],
+               " on" if (r["mark"] or 0) == 1 else "", r["id"],
+               " on" if (r["mark"] or 0) == 2 else "", r["id"],
+               r["id"]))
+    pages = max(1, (total + per - 1) // per)
+    pager = ""
+    if pages > 1:
+        bits = []
+        for n in range(1, pages + 1):
+            qq = ("&q=" + urllib.parse.quote(q)) if q else ""
+            bits.append("<strong>%d</strong>" % n if n == page else
+                        '<a href="?page=%d%s">%d</a>' % (n, qq, n))
+        pager = ('<div style="display:flex;gap:8px;'
+                 'justify-content:center;margin:16px 0;'
+                 'font-size:14px">' + " ".join(bits) + "</div>")
+    bar = (
+        '<div id="mubar">'
+        '<div id="munow">未播放</div>'
+        '<input type="range" id="museek" min="0" max="1000" '
+        'value="0">'
+        '<div class="murow2">'
+        '<button type="button" id="muprev">⏮ 上一首</button>'
+        '<button type="button" id="muplay">▶ 播放</button>'
+        '<button type="button" id="munext">下一首 ⏭</button>'
+        '<button type="button" class="ghost" id="mushuffle">'
+        '🔀 随机：关</button>'
+        '<span class="mutime" id="mutime">0:00 / 0:00</span>'
+        '</div></div>'
+        '<audio id="mplayer" preload="none"></audio>')
+    js = ('<script>const MUQ='
+          + json.dumps(q, ensure_ascii=False)
+          + ';' + _MUSIC_JS + '</script>')
+    body = (
+        '<div class="muwrap">'
+        '<div class="topbar"><h1>音乐</h1>'
+        '<form class="search" method="get">'
+        '<input type="search" name="q" value="%s" '
+        'placeholder="搜索歌名 / 歌手 / 专辑">'
+        '</form>'
+        '<button type="button" id="mushuffleall">'
+        '🔀 随机播放全部</button>'
+        '<a class="btn ghost" href="./">← 资源库</a>'
+        '<a class="btn ghost" href="upload">上传</a></div>'
+        '<div style="margin-bottom:12px;font-size:13px">'
+        '共 %d 首</div>'
+        '<div class="mulist">%s</div>%s</div>%s%s'
+        % (_esc(q), total, "".join(cards) or
+           '<div class="muted">暂无音乐。</div>', pager, bar, js))
+    return _page("音乐", body, extra_head=_MUSIC_CSS,
+                 base_href=base_href)
 
 
 _NOVELS_PER_PAGE = 20
@@ -5437,6 +6558,16 @@ def page_watch(entry, base_href=""):
             '<div style="margin-top:8px;color:#9db2c8">txt 小说 · '
             '在线阅读带章节目录与进度记忆。</div></div>' % entry["id"])
         note_html = ""
+    elif kind == "music":
+        media_html = (
+            '<div style="text-align:center">'
+            '<img src="thumb/%s" alt="" '
+            'style="max-width:240px;width:60%%;border-radius:12px;'
+            'background:#111"></div>'
+            '<audio id="v" controls preload="metadata" '
+            'style="width:100%%;margin-top:10px"></audio>'
+            % entry["hash"])
+        note_html = ""
     elif kind == "file":
         media_html = (
             '<div id="v" class="panel" style="text-align:center;'
@@ -5513,7 +6644,8 @@ def page_watch(entry, base_href=""):
         'start();'
         '</script>'
         % (_esc(entry["title"]), media_html, note_html,
-           _fmt_duration(entry["f_duration"]) if kind == "video" else "—",
+           _fmt_duration(entry["f_duration"])
+           if kind in ("video", "music") else "—",
            _fmt_size(entry["f_size"]),
            ("%dx%d" % (entry["f_width"], entry["f_height"]))
            if entry["f_width"] else "-",
@@ -5531,6 +6663,29 @@ def page_watch(entry, base_href=""):
         body = body.replace(
             '<button class="ghost" id="rate">',
             '<button class="ghost" id="rate" style="display:none">')
+    if kind == "music":
+        _mfields = (
+            '<input type="text" id="m-artist" value="%s" '
+            'placeholder="歌手" maxlength="200">'
+            '<input type="text" id="m-album" value="%s" '
+            'placeholder="专辑" maxlength="200">'
+            % (_esc(entry["f_artist"] or ""),
+               _esc(entry["f_album"] or "")))
+        body = body.replace(
+            '<input type="text" id="m-tags"',
+            _mfields + '<input type="text" id="m-tags"', 1)
+        body = body.replace(
+            'tags:document.getElementById("m-tags").value,',
+            'tags:document.getElementById("m-tags").value,'
+            'artist:(document.getElementById("m-artist")||{}).value,'
+            'album:(document.getElementById("m-album")||{}).value,',
+            1)
+        body = body.replace(
+            '<a class="btn" id="dl"',
+            ('歌手：%s · 专辑：%s<br>'
+             % (_esc(entry["f_artist"] or "—"),
+                _esc(entry["f_album"] or "—")))
+            + '<a class="btn" id="dl"', 1)
     return _page(entry["title"], body, base_href=base_href)
 
 
@@ -5544,7 +6699,7 @@ UPLOAD_PAGE = r"""<div class="topbar"><a class="btn ghost" href="./">← 返回<
 <span id="picked" style="font-size:13px;color:#8b94a7"></span>
 </div>
 <div style="color:#8b94a7;font-size:13px">也可以把文件或整个文件夹拖到这个面板里松手。文件夹上传会保留目录路径并自动变成标签（和 WebDAV 拖文件夹一致，如 trip/day1）；0 字节和系统文件（.DS_Store、Thumbs.db 等）会自动跳过。</div>
-<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span style="font-size:13px;color:#8b94a7">视频入库到</span><select id="libsel">__LIB_OPTIONS__</select><span style="font-size:12px;color:#8b94a7">（仅对视频生效；图片 / 小说 / 文件自动归类）</span></div>
+<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span style="font-size:13px;color:#8b94a7">视频入库到</span><select id="libsel">__LIB_OPTIONS__</select><span style="font-size:12px;color:#8b94a7">（仅对视频生效；图片 / 音乐 / 小说 / 文件自动归类）</span></div>
 <input type="text" id="tags" placeholder="标签（应用于本批，逗号分隔）" maxlength="200">
 <input type="text" id="source" placeholder="来源（应用于本批）" maxlength="120">
 <span><button id="go" type="button">开始上传</button> <span class="msg" id="msg"></span></span>
@@ -6474,7 +7629,7 @@ def _admin_sections():
 
 _ADMIN_TITLES = {"videos": "视频", "images": "图片",
                  "novels": "小说", "files": "文件",
-                 "settings": "通用设置"}
+                 "music": "音乐", "settings": "通用设置"}
 
 
 def _admin_topbar(section=None):
@@ -6522,6 +7677,10 @@ def page_admin(base_href=""):
         ("admin/files", "文件",
          "%d 个类别 · %d 个文件"
          % (len(d["file_categories"]), kc.get("file", 0))),
+        ("admin/music", "音乐",
+         "共 %d 首 · 已归档 %d"
+         % (kc.get("music", 0),
+            ks.get("music", {}).get("archived", 0))),
         ("admin/settings", "通用设置",
          "AList %s · 待归档 %d · 上次备份 %s"
          % ("已连接" if d["alist_ok"] else "不可达",
@@ -6563,6 +7722,36 @@ def page_admin_images(base_href=""):
             '</p></div>'
             % (d["kind_counts"].get("image", 0), dist))
     return _page("管理 · 图片", body, base_href=base_href)
+
+
+def page_admin_music(base_href=""):
+    d = _admin_data()
+    ks = d["kind_status"].get("music", {})
+    labels = {"archived": "已归档", "local": "待归档",
+              "uploading": "归档中", "error": "失败"}
+    dist = " · ".join("%s %d" % (labels.get(k, k), v)
+                      for k, v in sorted(ks.items())) or "暂无"
+    with _db() as conn:
+        agg = conn.execute(
+            "SELECT COUNT(*) AS n, "
+            "COALESCE(SUM(f.duration), 0) AS dur, "
+            "COALESCE(SUM(f.size), 0) AS sz "
+            "FROM entries e JOIN files f ON f.hash = e.hash "
+            "WHERE f.kind = 'music'").fetchone()
+    body = (_admin_topbar("music")
+            + '<div class="panel"><h2>音乐</h2>'
+            '<div class="kv">音乐条目：<b>%d</b><br>'
+            '总时长：<b>%s</b> · 总占用：<b>%s</b><br>'
+            '文件状态：<b>%s</b></div>'
+            '<p style="color:#8b94a7;font-size:13px;'
+            'line-height:1.7">单库：全部音乐按月归档到谷歌硬盘'
+            '的「音乐」文件夹。上传与播放在音乐页完成，归档走'
+            '全库统一管线（状态与队列在「通用设置」里看）。</p>'
+            '<p><a class="btn" href="music">打开音乐页</a>'
+            '</p></div>'
+            % (agg["n"], _fmt_duration(agg["dur"] or 0),
+               _fmt_size(agg["sz"] or 0), dist))
+    return _page("管理 · 音乐", body + _subsonic_admin_panel(), base_href=base_href)
 
 
 def page_admin_novels(base_href=""):
@@ -7356,6 +8545,12 @@ def application(environ, start_response):
     if path == "/ext" or path.startswith("/ext/"):
         return ext_handle(environ, start_response, params)
 
+    # Phone music clients (Subsonic): the protocol's own
+    # credential, reached via Caddy at /vidlib-api/subsonic/*
+    # (prefix stripped before it gets here).
+    if path == "/rest" or path.startswith("/rest/"):
+        return subsonic_handle(environ, start_response)
+
     if path == "/api/session":
         return _json(start_response, "200 OK",
                      {"ok": True, "authenticated": True,
@@ -7393,6 +8588,12 @@ def application(environ, start_response):
 
     if path == "/files" and method == "GET":
         body = page_files(params, base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
+    if path == "/music" and method == "GET":
+        body = page_music(params, base_href)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
                                   ("Content-Length", str(len(body)))])
         return [body]
@@ -7460,6 +8661,12 @@ def application(environ, start_response):
                                   ("Content-Length", str(len(body)))])
         return [body]
 
+    if path == "/admin/music" and method == "GET":
+        body = page_admin_music(base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
     if path == "/admin/settings" and method == "GET":
         body = page_admin_settings(base_href)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
@@ -7497,6 +8704,11 @@ def application(environ, start_response):
             return [b"not found"]
         return _serve_file_range(environ, start_response, local,
                                  _mime_for(file_row["ext"]))
+
+    if path == "/api/music/list" and method == "GET":
+        return _json(start_response, "200 OK",
+                     {"ok": True, "items": _music_list(
+                         (params.get("q") or "").strip())})
 
     if path.startswith("/api/play/") and method == "GET":
         entry = get_entry(path[len("/api/play/"):])
@@ -7906,6 +9118,15 @@ def application(environ, start_response):
                 (title, (data.get("tags") or "")[:200],
                  (data.get("source") or "")[:120],
                  time.time(), entry["id"]))
+        if entry["f_kind"] == "music" and (
+                "artist" in data or "album" in data):
+            with _db() as conn:
+                conn.execute(
+                    "UPDATE files SET artist = ?, album = ?, "
+                    "updated_at = ? WHERE hash = ?",
+                    ((data.get("artist") or "")[:200],
+                     (data.get("album") or "")[:200],
+                     time.time(), entry["hash"]))
         _sync_mark_files()
         return _json(start_response, "200 OK", {"ok": True})
 
@@ -8267,6 +9488,24 @@ def application(environ, start_response):
                          {"ok": False, "message": "密码至少 8 位。"})
         dav_password_set(password)
         return _json(start_response, "200 OK", {"ok": True})
+
+    if path == "/api/admin/subsonic" and method == "POST":
+        data = _read_json(environ)
+        ss_user = (data.get("user") or "").strip()
+        ss_pass = data.get("password") or ""
+        if ss_pass and len(ss_pass) < 8:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False, "message": "密码至少 8 位。"})
+        creds = _load_creds()
+        if ss_user:
+            creds["subsonic_user"] = ss_user[:64]
+        if ss_pass:
+            creds["subsonic_pass"] = ss_pass
+        _save_creds(creds)
+        return _json(start_response, "200 OK",
+                     {"ok": True,
+                      "configured": bool(creds.get("subsonic_user")
+                                         and creds.get("subsonic_pass"))})
 
     if path == "/api/admin/ext-token" and method == "POST":
         creds = _load_creds()

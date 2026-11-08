@@ -880,7 +880,7 @@ def _badges(r, hit_label=None):
     return "<div class=\"badges\">" + "".join(b) + "</div>"
 
 
-def _row(r, hit_label=None, views=None):
+def _row(r, hit_label=None, views=None, pub_date=None):
     links = ""
     if r["video_id"]:
         links += (f"<a href=\"https://www.youtube.com/watch?v={r['video_id']}\" "
@@ -889,6 +889,8 @@ def _row(r, hit_label=None, views=None):
               "target=\"_blank\" rel=\"noopener\">Bilibili ↗</a>")
     if views is not None and str(views) != "":
         links += f" · <span>播放 {_fmt_views(views)}</span>"
+    if pub_date:
+        links += f" · <span>发布 {pub_date}</span>"
     return (
         "<div class=\"row\">"
         f"<a class=\"seq\" href=\"{U('/r/%d' % r['seq'])}\">#{r['seq']:03d}</a>"
@@ -927,8 +929,9 @@ def index():
         body = head + f"<div class=\"stats\">搜索「{_html.escape(q)}」命中 {len(hits)} 条 · <a href=\"{U('/')}\">清除</a></div>"
         if hits:
             bmap = _base_map(db, [r["video_id"] for _, r in hits])
-            body += "".join(_row(r, label, _disp_views(r, bmap))
-                            for label, r in hits)
+            body += "".join(
+                _row(r, label, _disp_views(r, bmap), _disp_date(r, bmap))
+                for label, r in hits)
         else:
             body += "<div class=\"empty\">没有命中。</div>"
         return page("搜索 · 野兽素材库", body)
@@ -941,7 +944,9 @@ def index():
     rows = db.execute("SELECT * FROM records ORDER BY seq LIMIT ? OFFSET ?",
                       (PER_PAGE, (p - 1) * PER_PAGE)).fetchall()
     bmap = _base_map(db, [r["video_id"] for r in rows])
-    body = head + "".join(_row(r, views=_disp_views(r, bmap)) for r in rows)
+    body = head + "".join(
+        _row(r, views=_disp_views(r, bmap), pub_date=_disp_date(r, bmap))
+        for r in rows)
     prev = (f"<a href=\"{U('/?p=%d' % (p - 1))}\">上一页</a>" if p > 1
             else "<span class=\"off\">上一页</span>")
     nxt = (f"<a href=\"{U('/?p=%d' % (p + 1))}\">下一页</a>" if p < pages
@@ -1087,6 +1092,14 @@ def _disp_views(r, bmap):
     return r["yt_view_count"]
 
 
+def _disp_date(r, bmap):
+    """展示发布日期: 一律取底座 upload_date 并格式化。"""
+    b = bmap.get(r["video_id"]) if r["video_id"] else None
+    if b is not None and not b["error"] and b["upload_date"]:
+        return _fmt_date(b["upload_date"])
+    return None
+
+
 @app.route("/r/<int:seq>")
 def detail(seq):
     db = get_db()
@@ -1094,10 +1107,15 @@ def detail(seq):
     if r is None:
         abort(404)
     p = (seq - 1) // PER_PAGE + 1
+    base = (_base_map(db, [r["video_id"]]).get(r["video_id"])
+            if r["video_id"] else None)
+    pub_date = (_fmt_date(base["upload_date"])
+                if base is not None and not base["error"] else None)
     fm_items = [
         ("序号", f"#{r['seq']:03d}"), ("来源 BV", r["source_bv"]),
         ("来源批次", "YouTube 字幕批" if r["origin"] == "yt" else "BV 精选批"),
-        ("YouTube ID", r["video_id"]), ("发布时间", r["published_at"]),
+        ("YouTube ID", r["video_id"]),
+        ("发布时间", pub_date or r["published_at"]),
         ("来源", r["source"]), ("来源日期", r["source_date"]),
         ("来源文件", r["source_file"]), ("来源序号", r["source_index"]),
         ("标注字数", r["declared_words"]), ("转写状态", r["transcript_status"]),
@@ -1126,8 +1144,6 @@ def detail(seq):
     dl += (f"<a href=\"https://www.bilibili.com/video/{r['source_bv']}\" "
            "target=\"_blank\" rel=\"noopener\">Bilibili 源 ↗</a></div>")
     stats = ""
-    base = (_base_map(db, [r["video_id"]]).get(r["video_id"])
-            if r["video_id"] else None)
     if base is not None and not base["error"]:
         items = [("播放量", _fmt_views(base["view_count"])),
                  ("点赞", _fmt_views(base["like_count"])),
