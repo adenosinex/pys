@@ -233,6 +233,19 @@ def init_db():
             sort INTEGER DEFAULT 0,
             builtin INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS novel_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            author TEXT DEFAULT '',
+            status TEXT DEFAULT 'unrated',
+            note TEXT DEFAULT '',
+            dislike_reason TEXT DEFAULT '',
+            like_tags TEXT DEFAULT '',
+            like_text TEXT DEFAULT '',
+            link TEXT DEFAULT '',
+            created_at REAL DEFAULT 0,
+            updated_at REAL DEFAULT 0
+        );
         """)
         _ncols = {r[1] for r in conn.execute(
             "PRAGMA table_info(novel_meta)")}
@@ -4267,6 +4280,7 @@ def page_novels(params, base_href=""):
             + wsql + " ORDER BY e.id DESC LIMIT ? OFFSET ?",
             args + [_NOVELS_PER_PAGE,
                     (page - 1) * _NOVELS_PER_PAGE]).fetchall()
+    marks = _note_mark_map([r["e_id"] for r in rows])
     items = []
     for r in rows:
         try:
@@ -4298,12 +4312,32 @@ def page_novels(params, base_href=""):
         if r["created"]:
             bits.append("入库 " + time.strftime(
                 "%Y-%m-%d", time.localtime(r["created"])))
+        stt = marks.get(r["e_id"])
+        acts = ['<div class="nvacts">']
+        acts.append(
+            '<button type="button" class="nv-mark%s" '
+            'data-eid="%d" data-act="candidate">%s</button>'
+            % (" cur" if stt == "candidate" else "",
+               r["e_id"],
+               "已收藏" if stt == "candidate" else "收藏"))
+        acts.append(
+            '<button type="button" class="nv-mark ghost%s" '
+            'data-eid="%d" data-act="dropped">%s</button>'
+            % (" cur" if stt == "dropped" else "",
+               r["e_id"],
+               "已拉黑" if stt == "dropped" else "黑名单"))
+        acts.append(
+            '<span class="nvst"%s>笔记 · %s</span>'
+            % ("" if stt else ' style="display:none"',
+               _esc(_NOTE_STATUS_LABEL.get(stt, ""))))
+        acts.append('</div>')
         items.append(
-            '<a class="nvrow" href="read/%d">'
+            '<div class="nvrow">'
+            '<a class="nvmain" href="read/%d">'
             '<span class="nvt">%s</span>'
-            '<span class="nvm">%s</span></a>'
+            '<span class="nvm">%s</span></a>%s</div>'
             % (r["e_id"], _esc(r["e_title"]),
-               _esc(" · ".join(bits))))
+               _esc(" · ".join(bits)), "".join(acts)))
 
     def _plink(n, label):
         u = "novels?p=%d" % n
@@ -4340,22 +4374,714 @@ def page_novels(params, base_href=""):
         '<input type="search" name="q" value="%s" placeholder="搜索书名/标签">'
         '</form>'
         '<a class="btn ghost" href="./">← 资源库</a>'
-        '<a class="btn ghost" href="upload">上传</a></div>'
-        '<div class="nvlist">%s</div>%s'
+        '<a class="btn ghost" href="upload">上传</a>'
+        '<a class="btn ghost" href="notes">备注页</a></div>'
+        '<div class="nvlist">%s</div>%s%s'
         % (_esc(q), "".join(items) or
            '<div class="muted">暂无小说。上传 .txt 即可入库。</div>',
-           pager))
-    return _page("小说", body, extra_head=_NOVELS_CSS,
+           pager, _NOVELS_MARK_JS))
+    return _page("小说", body, extra_head=_NOVELS_CSS + _MARK_CSS,
+                 base_href=base_href)
+
+
+
+# ------------------------------------------------------------ Novel notes
+# Standalone notebook, deliberately NOT bound to the library:
+# novel_notes has no foreign key to entries, so deleting a book
+# never touches a note, and books that were never imported can
+# be noted too. Statuses follow the user's four-pool frame.
+# unrated is a legitimate permanent state: no badges, no
+# progress bars, no nagging copy anywhere on the page. The
+# candidate/reading caps are soft hints only, never a save gate.
+
+_NOTE_STATUSES = (
+    ("unrated", "未评估"),
+    ("candidate", "候选"),
+    ("reading", "在读"),
+    ("favorite", "精品"),
+    ("dropped", "不再推荐"),
+)
+_NOTE_STATUS_LABEL = dict(_NOTE_STATUSES)
+_NOTE_LIKE_TAGS = ("人物塑造", "世界观", "节奏", "情绪体验")
+_NOTE_CAPS = {"candidate": 30, "reading": 3}
+_NOTES_PER_PAGE = 20
+
+_NOTES_CSS = (
+    "<style>"
+    ".ntchips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}"
+    ".ntchip{background:#232a3a;border-radius:999px;padding:6px 13px;"
+    "text-decoration:none;font-size:13.5px;color:#c6ccd9}"
+    ".ntchip.on{background:#2f6fd0;color:#fff}"
+    ".ntcard{background:#171c27;border:1px solid #242c3f;"
+    "border-radius:12px;padding:13px 15px;margin-bottom:10px}"
+    ".ntcard .nt-t{font-size:16px;font-weight:600;color:#e8ebf1;"
+    "line-height:1.45}"
+    ".ntcard .nt-t a{color:#7ea6e0;text-decoration:none}"
+    ".ntcard .nt-m{font-size:12.5px;color:#8b94a7;margin-top:3px;"
+    "line-height:1.7}"
+    ".ntcard .nt-note{font-size:14px;line-height:1.75;"
+    "color:#d6dcea;margin-top:7px;white-space:pre-wrap;"
+    "word-break:break-word}"
+    ".ntst{display:inline-block;border-radius:5px;padding:1px 8px;"
+    "font-size:12px;margin-left:8px;vertical-align:2px}"
+    ".st-unrated{background:#2c3446;color:#aeb8cc}"
+    ".st-candidate{background:#274b73;color:#a9ccff}"
+    ".st-reading{background:#6b5410;color:#ffd97a}"
+    ".st-favorite{background:#5d2a5e;color:#f0b6f5}"
+    ".st-dropped{background:#4a2323;color:#ff9c9c}"
+    ".ntlike{display:inline-block;background:#1d2b1f;"
+    "color:#9fd49a;border-radius:5px;padding:1px 7px;"
+    "font-size:12px;margin-right:5px}"
+    ".ntacts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}"
+    ".ntacts button{padding:7px 13px;font-size:13px}"
+    ".ntacts button.cur{outline:2px solid #7ea6e0}"
+    ".ntform label{display:block;font-size:13px;color:#8b94a7;"
+    "margin:10px 0 4px}"
+    ".ntform input[type=text], .ntform textarea,"
+    " .ntform select{width:100%}"
+    ".ntform textarea{min-height:64px;resize:vertical}"
+    ".ntlikes{display:flex;gap:14px;flex-wrap:wrap;margin-top:4px}"
+    ".ntlikes label{display:inline-flex;gap:5px;"
+    "align-items:center;margin:0;color:#d6dcea;font-size:14px}"
+    "</style>")
+
+
+def _note_get(note_id):
+    try:
+        nid = int(note_id)
+    except Exception:
+        return None
+    with _db() as conn:
+        return conn.execute(
+            "SELECT * FROM novel_notes WHERE id = ?",
+            (nid,)).fetchone()
+
+
+def _note_clean_fields(data):
+    status = (data.get("status") or "unrated").strip()
+    if status not in _NOTE_STATUS_LABEL:
+        status = "unrated"
+    tags = data.get("like_tags") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",")]
+    tags = [t for t in tags if t in _NOTE_LIKE_TAGS]
+    return {
+        "title": (data.get("title") or "").strip()[:200],
+        "author": (data.get("author") or "").strip()[:100],
+        "status": status,
+        "note": (data.get("note") or "").strip()[:4000],
+        "dislike_reason": (data.get("dislike_reason")
+                           or "").strip()[:2000],
+        "like_tags": json.dumps(tags, ensure_ascii=False),
+        "like_text": (data.get("like_text") or "").strip()[:2000],
+        "link": (data.get("link") or "").strip()[:1000],
+    }
+
+
+def _note_public(r):
+    try:
+        tags = json.loads(r["like_tags"] or "[]")
+    except Exception:
+        tags = []
+    if not isinstance(tags, list):
+        tags = []
+    return {
+        "id": r["id"], "title": r["title"],
+        "author": r["author"], "status": r["status"],
+        "status_label": _NOTE_STATUS_LABEL.get(
+            r["status"], r["status"]),
+        "note": r["note"],
+        "dislike_reason": r["dislike_reason"],
+        "like_tags": tags, "like_text": r["like_text"],
+        "link": r["link"], "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+    }
+
+
+
+def _note_read_id(link):
+    """Entry id embedded in a reader-page link, else None. Lets the
+    same book match its note even when the stored link carries a
+    different host/prefix than the current visit."""
+    clean = (link or "").split("?")[0].split("#")[0].rstrip("/")
+    m = re.search(r"(?:^|/)read/(\d+)$", clean)
+    return int(m.group(1)) if m else None
+
+
+def _note_by_link(link):
+    """Existing note for a link: exact match first, then same
+    reader entry id. Manual notes without a link never match."""
+    if not link:
+        return None
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM novel_notes WHERE link = ? "
+            "ORDER BY id LIMIT 1", (link,)).fetchone()
+        if row is not None:
+            return row
+        rid = _note_read_id(link)
+        if rid is None:
+            return None
+        for r in conn.execute(
+                "SELECT * FROM novel_notes WHERE link != '' "
+                "ORDER BY id").fetchall():
+            if _note_read_id(r["link"]) == rid:
+                return r
+    return None
+
+
+def _note_mark_map(entry_ids):
+    """{entry_id: note status} for books that already have a note,
+    matched through the reader link stored on the note."""
+    want = set()
+    for i in entry_ids:
+        try:
+            want.add(int(i))
+        except Exception:
+            pass
+    out = {}
+    if not want:
+        return out
+    with _db() as conn:
+        for r in conn.execute(
+                "SELECT * FROM novel_notes WHERE link != '' "
+                "ORDER BY id").fetchall():
+            rid = _note_read_id(r["link"])
+            if rid in want and rid not in out:
+                out[rid] = r["status"]
+    return out
+
+
+_MARK_CSS = (
+    "<style>"
+    ".nvmain{display:block;text-decoration:none}"
+    ".nvacts{display:flex;gap:8px;align-items:center;"
+    "margin-top:9px}"
+    ".nv-mark{padding:6px 13px;font-size:13px}"
+    ".nv-mark.cur{outline:2px solid #7ea6e0}"
+    ".nvst{font-size:12.5px;color:#8b94a7}"
+    ".nvtoast{position:fixed;left:50%;bottom:26px;"
+    "transform:translateX(-50%);background:#2f6fd0;color:#fff;"
+    "padding:9px 18px;border-radius:999px;font-size:14px;"
+    "display:none;z-index:60;"
+    "box-shadow:0 4px 18px rgba(0,0,0,.4)}"
+    ".bsrow{display:flex;gap:8px;align-items:center;"
+    "padding:9px 0;border-bottom:1px solid #242c3f}"
+    ".bsrow:last-child{border-bottom:none}"
+    ".bsinfo{flex:1;min-width:0}"
+    ".bst{font-size:15px;color:#e8ebf1;line-height:1.4}"
+    ".bs-mark{padding:6px 13px;font-size:13px}"
+    ".bs-mark.cur{outline:2px solid #7ea6e0}"
+    ".ntdet>summary{cursor:pointer;font-size:15.5px;"
+    "font-weight:600;color:#e8ebf1;padding:2px 0}"
+    ".ntdet .ntform{margin-top:6px}"
+    ".nt-nedit{margin-top:7px;display:flex;gap:8px;"
+    "align-items:center;flex-wrap:wrap}"
+    ".nt-nbox{display:inline-flex;gap:8px;align-items:center}"
+    ".nt-ninput{min-width:220px}"
+    "</style>")
+
+_NOVELS_MARK_JS = (
+    '<script>'
+    'function nvToast(t){let el=document.getElementById'
+    '("nvtoast");if(!el){el=document.createElement("div");'
+    'el.id="nvtoast";el.className="nvtoast";'
+    'document.body.appendChild(el);}'
+    'el.textContent=t;el.style.display="block";'
+    'clearTimeout(el._t);'
+    'el._t=setTimeout(function(){el.style.display="none";}'
+    ',1800);}'
+    'document.querySelectorAll(".nv-mark").forEach('
+    'function(b){b.onclick=async function(){'
+    'const eid=b.dataset.eid;'
+    'const row=b.closest(".nvrow");'
+    'const title=row.querySelector(".nvt").textContent;'
+    'const link=new URL("read/"+eid,location.href).href;'
+    'const r=await fetch("api/notes/mark",{method:"POST",'
+    'headers:{"Content-Type":"application/json"},'
+    'body:JSON.stringify({title:title,link:link,'
+    'status:b.dataset.act})});'
+    'const j=await r.json();'
+    'if(!j.ok){nvToast(j.message||"失败");return;}'
+    'row.querySelectorAll(".nv-mark").forEach(function(x){'
+    'const on=x.dataset.act===j.status;'
+    'x.classList.toggle("cur",on);'
+    'x.textContent=on?(j.status==="candidate"?"已收藏"'
+    ':"已拉黑"):(x.dataset.act==="candidate"?"收藏"'
+    ':"黑名单");});'
+    'const st=row.querySelector(".nvst");'
+    'if(st){st.textContent="笔记 · "+j.status_label;'
+    'st.style.display="";}'
+    'nvToast(j.status==="candidate"?"已收藏到备注页"'
+    ':"已加入黑名单");};});'
+    '</script>')
+
+
+def page_notes(params, base_href=""):
+    q = (params.get("q") or "").strip()
+    st = (params.get("st") or "").strip()
+    if st not in _NOTE_STATUS_LABEL:
+        st = ""
+    try:
+        page = int(params.get("p") or 1)
+    except Exception:
+        page = 1
+    where = []
+    args = []
+    if st:
+        where.append("status = ?")
+        args.append(st)
+    if q:
+        where.append("(title LIKE ? OR note LIKE ?)")
+        like = "%" + q + "%"
+        args += [like, like]
+    wsql = (" WHERE " + " AND ".join(where)) if where else ""
+    with _db() as conn:
+        counts = {k: 0 for k, _ in _NOTE_STATUSES}
+        for r in conn.execute(
+                "SELECT status, COUNT(*) c FROM novel_notes "
+                "GROUP BY status"):
+            if r["status"] in counts:
+                counts[r["status"]] = r["c"]
+        total = conn.execute(
+            "SELECT COUNT(*) c FROM novel_notes" + wsql,
+            args).fetchone()["c"]
+        pages = max(1, (total + _NOTES_PER_PAGE - 1)
+                    // _NOTES_PER_PAGE)
+        page = min(max(1, page), pages)
+        rows = conn.execute(
+            "SELECT * FROM novel_notes" + wsql
+            + " ORDER BY updated_at DESC, id DESC"
+            " LIMIT ? OFFSET ?",
+            args + [_NOTES_PER_PAGE,
+                    (page - 1) * _NOTES_PER_PAGE]).fetchall()
+
+    def _nurl(stv, pv):
+        parts = []
+        if stv:
+            parts.append("st=" + stv)
+        if q:
+            parts.append("q=" + urllib.parse.quote(q))
+        if pv and pv > 1:
+            parts.append("p=%d" % pv)
+        return "notes" + ("?" + "&".join(parts) if parts else "")
+
+    chips = ['<a class="ntchip%s" href="%s">全部（%d）</a>'
+             % (" on" if not st else "", _nurl("", 0),
+                sum(counts.values()))]
+    for k, lab in _NOTE_STATUSES:
+        chips.append('<a class="ntchip%s" href="%s">%s（%d）</a>'
+                     % (" on" if st == k else "", _nurl(k, 0),
+                        lab, counts[k]))
+
+    hints = []
+    for key in ("candidate", "reading"):
+        cap = _NOTE_CAPS[key]
+        if counts[key] > cap:
+            hints.append("%s已有 %d 本（建议上限 %d）"
+                         % (_NOTE_STATUS_LABEL[key],
+                            counts[key], cap))
+    hint_html = ""
+    if hints:
+        hint_html = ('<div class="muted" style="margin-bottom:10px">'
+                     + "；".join(hints)
+                     + "。只是温和提醒，不影响保存。</div>")
+
+    cards = []
+    for r in rows:
+        pub = _note_public(r)
+        title_html = _esc(pub["title"])
+        if pub["link"]:
+            title_html = ('<a href="%s" target="_blank" '
+                          'rel="noopener">%s</a>'
+                          % (_esc(pub["link"]), title_html))
+        meta = []
+        if pub["author"]:
+            meta.append("作者 " + _esc(pub["author"]))
+        meta.append("记于 " + time.strftime(
+            "%Y-%m-%d", time.localtime(pub["created_at"] or 0)))
+        if (pub["updated_at"] or 0) > (pub["created_at"] or 0) + 1:
+            meta.append("改于 " + time.strftime(
+                "%Y-%m-%d", time.localtime(pub["updated_at"] or 0)))
+        segs = ['<div class="nt-t">%s'
+                '<span class="ntst st-%s">%s</span></div>'
+                '<div class="nt-m">%s</div>'
+                % (title_html, _esc(pub["status"]),
+                   _esc(pub["status_label"]),
+                   " · ".join(meta))]
+        segs.append(
+            '<div class="nt-note" data-nv="%d"%s>%s</div>'
+            % (pub["id"],
+               "" if pub["note"] else ' style="display:none"',
+               _esc(pub["note"])))
+        segs.append(
+            '<div class="nt-nedit">'
+            '<button type="button" class="ghost nt-nbtn" '
+            'data-id="%d">%s</button>'
+            '<span class="nt-nbox" style="display:none">'
+            '<input type="text" class="nt-ninput" '
+            'data-id="%d" value="%s" placeholder="一句话备注">'
+            '<button type="button" class="nt-nsave" '
+            'data-id="%d">保存</button></span></div>'
+            % (pub["id"],
+               "改一句话备注" if pub["note"] else "＋ 一句话备注",
+               pub["id"], _esc(pub["note"]), pub["id"]))
+        if pub["like_tags"] or pub["like_text"]:
+            seg = "".join('<span class="ntlike">%s</span>'
+                          % _esc(t) for t in pub["like_tags"])
+            if pub["like_text"]:
+                seg += _esc(pub["like_text"])
+            segs.append('<div class="nt-m" style="margin-top:7px">'
+                        '喜欢的理由：%s</div>' % seg)
+        if pub["dislike_reason"]:
+            segs.append('<div class="nt-m" style="margin-top:4px">'
+                        '不喜欢的原因：%s</div>'
+                        % _esc(pub["dislike_reason"]))
+        vbtns = []
+        for v, lab in (("reading", "想继续"),
+                       ("candidate", "暂时搁置"),
+                       ("dropped", "不想再读")):
+            vbtns.append(
+                '<button type="button" class="ghost nt-verdict%s" '
+                'data-id="%d" data-v="%s">%s</button>'
+                % (" cur" if pub["status"] == v else "",
+                   pub["id"], v, lab))
+        segs.append(
+            '<div class="ntacts">' + "".join(vbtns)
+            + '<button type="button" class="ghost nt-edit" '
+            'data-id="%d">编辑</button>'
+            '<button type="button" class="ghost nt-del" '
+            'data-id="%d">删除</button></div>' % (pub["id"],
+                                                 pub["id"]))
+        cards.append('<div class="ntcard">' + "".join(segs)
+                     + '</div>')
+
+    pager = ""
+    if total:
+        nav = []
+        if page > 1:
+            nav.append('<a href="%s">← 上一页</a>'
+                       % _nurl(st, page - 1))
+        nums = sorted(set(
+            [1, pages] + [n for n in range(page - 2, page + 3)
+                          if 1 <= n <= pages]))
+        last = 0
+        for n in nums:
+            if n - last > 1:
+                nav.append('<span class="muted">…</span>')
+            if n == page:
+                nav.append('<span class="pgcur">%d</span>' % n)
+            else:
+                nav.append('<a href="%s">%d</a>'
+                           % (_nurl(st, n), n))
+            last = n
+        if page < pages:
+            nav.append('<a href="%s">下一页 →</a>'
+                       % _nurl(st, page + 1))
+        pager = ('<div class="pager">%s</div>'
+                 '<div class="muted" style="margin-top:6px">'
+                 '第 %d / %d 页 · 共 %d 条</div>'
+                 % (" ".join(nav), page, pages, total))
+
+    status_opts = "".join(
+        '<option value="%s">%s</option>' % (k, lab)
+        for k, lab in _NOTE_STATUSES)
+    like_boxes = "".join(
+        '<label><input type="checkbox" class="nf-like" '
+        'value="%s">%s</label>' % (t, t) for t in _NOTE_LIKE_TAGS)
+    prefill_note = ""
+    if (params.get("title") or params.get("link")):
+        prefill_note = ('<div class="muted" style="margin-top:6px">'
+                        '已从阅读页带入书名与链接，存不存随你。'
+                        '</div>')
+
+    form = (
+        '<div class="ntform"><h2 id="nf-head">新增笔记</h2>'
+        '<input type="hidden" id="nf-id">'
+        '<label>书名（必填）</label>'
+        '<input type="text" id="nf-title" value="%s" '
+        'placeholder="书名">'
+        '<label>作者</label>'
+        '<input type="text" id="nf-author" placeholder="可选">'
+        '<label>状态</label>'
+        '<select id="nf-status">%s</select>'
+        '<label>喜欢的理由（可多选）</label>'
+        '<div class="ntlikes">%s</div>'
+        '<label>喜欢的理由（补充）</label>'
+        '<input type="text" id="nf-liketext" placeholder="可选">'
+        '<label>不喜欢的原因</label>'
+        '<input type="text" id="nf-dislike" placeholder="可选">'
+        '<label>备注</label>'
+        '<textarea id="nf-note" placeholder="随便记，不记也行">'
+        '</textarea>'
+        '<label>链接</label>'
+        '<input type="text" id="nf-link" value="%s" '
+        'placeholder="可选，如阅读页地址">'
+        % (_esc(params.get("title") or ""), status_opts,
+           like_boxes, _esc(params.get("link") or ""))
+        + prefill_note
+        + '<div style="display:flex;gap:8px;margin-top:12px;'
+        'align-items:center">'
+        '<button type="button" id="nf-save">保存</button>'
+        '<button type="button" class="ghost" id="nf-cancel" '
+        'style="display:none">取消编辑</button>'
+        '<span class="msg" id="nf-msg"></span></div></div>')
+    form = ('<details class="panel ntdet" id="nf-details"%s>'
+            '<summary>手动添加（库里没有的书）</summary>'
+            % (" open" if prefill_note else "")
+            + form + '</details>')
+
+    searchadd = (
+        '<div class="panel"><h2>从书库搜索添加</h2>'
+        '<div class="muted" style="margin-bottom:10px">'
+        '先在书库里找到书，一键收藏或拉黑，自动记到这里，'
+        '不用手填。</div>'
+        '<div style="display:flex;gap:8px">'
+        '<input type="search" id="bs-q" '
+        'placeholder="输入书名关键词" style="flex:1">'
+        '<button type="button" id="bs-go">搜索</button></div>'
+        '<div id="bs-results" style="margin-top:6px"></div>'
+        '<div id="bstoast" class="nvtoast"></div></div>')
+
+    blind = (
+        '<div class="panel"><h2>随机盲盒</h2>'
+        '<div class="muted" style="margin-bottom:10px">'
+        '从「未评估」和「候选」里随机抽一条，随手给它'
+        '一个裁决，或者不理它。</div>'
+        '<button type="button" id="bb-draw">随机抽一本</button>'
+        '<div id="bb-box" style="margin-top:12px"></div></div>')
+
+    js = (
+        '<script>'
+        'async function postJ(u,b){const r=await fetch(u,'
+        '{method:"POST",headers:{"Content-Type":'
+        '"application/json"},body:JSON.stringify(b)});'
+        'return r.json();}'
+        'function escHtml(s){const d=document.createElement'
+        '("div");d.textContent=s||"";return d.innerHTML;}'
+        'const nfMsg=document.getElementById("nf-msg");'
+        'function nfReset(){'
+        'document.getElementById("nf-id").value="";'
+        'document.getElementById("nf-title").value="";'
+        'document.getElementById("nf-author").value="";'
+        'document.getElementById("nf-status").value="unrated";'
+        'document.getElementById("nf-liketext").value="";'
+        'document.getElementById("nf-dislike").value="";'
+        'document.getElementById("nf-note").value="";'
+        'document.getElementById("nf-link").value="";'
+        'document.querySelectorAll(".nf-like").forEach('
+        'function(c){c.checked=false;});'
+        'document.getElementById("nf-head").textContent='
+        '"新增笔记";'
+        'document.getElementById("nf-save").textContent="保存";'
+        'document.getElementById("nf-cancel").style.display'
+        '="none";}'
+        'document.getElementById("nf-cancel").onclick=nfReset;'
+        'document.getElementById("nf-save").onclick='
+        'async function(){'
+        'const likes=[];'
+        'document.querySelectorAll(".nf-like").forEach('
+        'function(c){if(c.checked)likes.push(c.value);});'
+        'const d={title:document.getElementById("nf-title")'
+        '.value,author:document.getElementById("nf-author")'
+        '.value,status:document.getElementById("nf-status")'
+        '.value,like_tags:likes,'
+        'like_text:document.getElementById("nf-liketext")'
+        '.value,'
+        'dislike_reason:document.getElementById("nf-dislike")'
+        '.value,note:document.getElementById("nf-note").value,'
+        'link:document.getElementById("nf-link").value};'
+        'const idv=document.getElementById("nf-id").value;'
+        'const j=idv?await postJ("api/notes/update",'
+        'Object.assign({id:parseInt(idv,10)},d))'
+        ':await postJ("api/notes",d);'
+        'nfMsg.textContent=j.ok?"已保存。":'
+        '("失败：" + (j.message || ""));'
+        'if(j.ok)setTimeout(function(){location.href='
+        '"notes";},600);};'
+        'document.querySelectorAll(".nt-edit").forEach('
+        'function(b){b.onclick=async function(){'
+        'const r=await fetch("api/notes/get?id="+b.dataset.id);'
+        'const j=await r.json();if(!j.ok||!j.note){'
+        'alert(j.message||"读取失败");return;}'
+        'const n=j.note;nfReset();'
+        'document.getElementById("nf-id").value=String(n.id);'
+        'document.getElementById("nf-title").value=n.title;'
+        'document.getElementById("nf-author").value=n.author;'
+        'document.getElementById("nf-status").value=n.status;'
+        'document.querySelectorAll(".nf-like").forEach('
+        'function(c){c.checked=n.like_tags.indexOf(c.value)'
+        '>=0;});'
+        'document.getElementById("nf-liketext").value='
+        'n.like_text;'
+        'document.getElementById("nf-dislike").value='
+        'n.dislike_reason;'
+        'document.getElementById("nf-note").value=n.note;'
+        'document.getElementById("nf-link").value=n.link;'
+        'document.getElementById("nf-head").textContent='
+        '"编辑笔记";'
+        'document.getElementById("nf-save").textContent='
+        '"保存修改";'
+        'document.getElementById("nf-cancel").style.display'
+        '="";'
+        'document.getElementById("nf-details").open=true;'
+        'document.getElementById("nf-head").scrollIntoView();'
+        '};});'
+        'document.querySelectorAll(".nt-verdict").forEach('
+        'function(b){b.onclick=async function(){'
+        'const j=await postJ("api/notes/verdict",'
+        '{id:parseInt(b.dataset.id,10),verdict:b.dataset.v});'
+        'if(j.ok)location.reload();'
+        'else alert(j.message||"失败");};});'
+        'document.querySelectorAll(".nt-del").forEach('
+        'function(b){let armed=false,t=null;'
+        'b.onclick=async function(){'
+        'if(!armed){armed=true;b.textContent="确认删除？";'
+        'b.classList.add("danger");'
+        't=setTimeout(function(){armed=false;'
+        'b.textContent="删除";b.classList.remove("danger");'
+        '},3000);return;}'
+        'clearTimeout(t);'
+        'const j=await postJ("api/notes/delete",'
+        '{id:parseInt(b.dataset.id,10)});'
+        'if(j.ok)location.reload();'
+        'else alert(j.message||"删除失败");};});'
+        'async function bbDraw(){'
+        'const r=await fetch("api/notes/random");'
+        'const j=await r.json();'
+        'const box=document.getElementById("bb-box");'
+        'if(!j.ok||!j.note){box.innerHTML='
+        '"<div class=\\"muted\\">未评估和候选里暂时没有'
+        '可抽的了。</div>";return;}'
+        'const n=j.note;'
+        'let h="<div class=\\"ntcard\\" style=\\"margin:0\\">'
+        '<div class=\\"nt-t\\">"+escHtml(n.title)+'
+        '"<span class=\\"ntst st-"+n.status+"\\">"+'
+        'escHtml(n.status_label)+"</span></div>";'
+        'if(n.author)h+="<div class=\\"nt-m\\">作者 "+'
+        'escHtml(n.author)+"</div>";'
+        'if(n.note)h+="<div class=\\"nt-note\\">"+'
+        'escHtml(n.note)+"</div>";'
+        'h+="<div class=\\"ntacts\\">'
+        '<button type=\\"button\\" data-v=\\"reading\\">'
+        '想继续</button>'
+        '<button type=\\"button\\" class=\\"ghost\\" '
+        'data-v=\\"candidate\\">暂时搁置</button>'
+        '<button type=\\"button\\" class=\\"ghost\\" '
+        'data-v=\\"dropped\\">不想再读</button></div></div>";'
+        'box.innerHTML=h;'
+        'box.querySelectorAll("button[data-v]").forEach('
+        'function(b){b.onclick=async function(){'
+        'const j2=await postJ("api/notes/verdict",'
+        '{id:n.id,verdict:b.dataset.v});'
+        'if(j2.ok)bbDraw();'
+        'else alert(j2.message||"失败");};});}'
+        'document.getElementById("bb-draw").onclick=bbDraw;'
+        'document.querySelectorAll(".nt-nbtn").forEach('
+        'function(b){b.onclick=function(){'
+        'const card=b.closest(".ntcard");'
+        'const box=card.querySelector(".nt-nbox");'
+        'box.style.display="";'
+        'box.querySelector(".nt-ninput").focus();};});'
+        'document.querySelectorAll(".nt-nsave").forEach('
+        'function(b){b.onclick=async function(){'
+        'const card=b.closest(".ntcard");'
+        'const inp=card.querySelector(".nt-ninput");'
+        'const j=await postJ("api/notes/note",'
+        '{id:parseInt(b.dataset.id,10),note:inp.value});'
+        'if(!j.ok){alert(j.message||"保存失败");return;}'
+        'const v=card.querySelector("[data-nv]");'
+        'const t=inp.value.trim();'
+        'v.textContent=t;v.style.display=t?"":"none";'
+        'card.querySelector(".nt-nbtn").textContent='
+        't?"改一句话备注":"＋ 一句话备注";'
+        'card.querySelector(".nt-nbox").style.display'
+        '="none";};});'
+        'const BS={};let bsT=null;'
+        'function bsToast(t){'
+        'const el=document.getElementById("bstoast");'
+        'el.textContent=t;el.style.display="block";'
+        'clearTimeout(bsT);'
+        'bsT=setTimeout(function(){'
+        'el.style.display="none";},1800);}'
+        'function bsRowState(row,st,lab){'
+        'row.querySelectorAll(".bs-mark").forEach('
+        'function(x){const on=x.dataset.act===st;'
+        'x.classList.toggle("cur",on);'
+        'x.textContent=on?(st==="candidate"?"已收藏"'
+        ':"已拉黑"):(x.dataset.act==="candidate"?"收藏"'
+        ':"黑名单");});'
+        'let bd=row.querySelector(".ntst");'
+        'if(st){if(!bd){bd=document.createElement("span");'
+        'row.insertBefore(bd,row.querySelector(".bs-mark"));'
+        '}bd.className="ntst st-"+st;bd.textContent=lab;}'
+        'else if(bd){bd.remove();}}'
+        'async function bsSearch(){'
+        'const q=document.getElementById("bs-q").value.trim();'
+        'const box=document.getElementById("bs-results");'
+        'if(!q){box.innerHTML="";return;}'
+        'const r=await fetch("api/notes/booksearch?q="+encodeURIComponent(q));'
+        'const j=await r.json();'
+        'box.innerHTML="";'
+        'if(!j.ok){box.innerHTML="<div class=muted>搜索失败。</div>";return;}'
+        'if(!j.books.length){box.innerHTML="<div class=muted>书库里没找到这本书，可以展开下面的手动添加。</div>";return;}'
+        'j.books.forEach(function(bk){'
+        'BS[bk.entry_id]=bk;'
+        'const row=document.createElement("div");row.className="bsrow";'
+        'const info=document.createElement("div");info.className="bsinfo";'
+        'const t=document.createElement("div");t.className="bst";t.textContent=bk.title;'
+        'const m=document.createElement("div");m.className="nt-m";m.textContent=bk.chars+" · "+bk.chapters+" 章";'
+        'info.appendChild(t);info.appendChild(m);row.appendChild(info);'
+        'if(bk.status){const bd=document.createElement("span");bd.className="ntst st-"+bk.status;bd.textContent=bk.status_label;row.appendChild(bd);}'
+        'const b1=document.createElement("button");b1.type="button";b1.className="bs-mark"+(bk.status==="candidate"?" cur":"");b1.dataset.eid=bk.entry_id;b1.dataset.act="candidate";b1.textContent=bk.status==="candidate"?"已收藏":"收藏";b1.onclick=function(){bsMark(b1);};'
+        'const b2=document.createElement("button");b2.type="button";b2.className="ghost bs-mark"+(bk.status==="dropped"?" cur":"");b2.dataset.eid=bk.entry_id;b2.dataset.act="dropped";b2.textContent=bk.status==="dropped"?"已拉黑":"黑名单";b2.onclick=function(){bsMark(b2);};'
+        'row.appendChild(b1);row.appendChild(b2);box.appendChild(row);});}'
+        'async function bsMark(b){'
+        'const bk=BS[b.dataset.eid];if(!bk)return;'
+        'const link=new URL("read/"+bk.entry_id,'
+        'location.href).href;'
+        'const j=await postJ("api/notes/mark",'
+        '{title:bk.title,link:link,status:b.dataset.act});'
+        'if(!j.ok){alert(j.message||"失败");return;}'
+        'bk.status=j.status;'
+        'bsRowState(b.closest(".bsrow"),j.status,'
+        'j.status_label);'
+        'bsToast(j.status==="candidate"'
+        '?"已收藏到备注页":"已加入黑名单");}'
+        'document.getElementById("bs-go").onclick=bsSearch;'
+        'document.getElementById("bs-q").addEventListener('
+        '"keydown",function(e){if(e.key==="Enter"){'
+        'e.preventDefault();bsSearch();}});'
+        '</script>')
+
+    body = (
+        '<div class="topbar"><h1>小说备注</h1>'
+        '<form class="search" method="get">'
+        '<input type="search" name="q" value="%s" '
+        'placeholder="搜索书名/备注">'
+        % _esc(q)
+        + ('<input type="hidden" name="st" value="%s">'
+           % _esc(st) if st else '')
+        + '</form>'
+        '<a class="btn ghost" href="./">← 资源库</a>'
+        '<a class="btn ghost" href="novels">小说</a></div>'
+        '<div class="ntchips">%s</div>%s%s%s%s%s%s%s'
+        % ("".join(chips), hint_html, searchadd, blind, form,
+           "".join(cards) or
+           '<div class="muted">还没有笔记。从上方书库搜索添加，或展开手动添加。'
+           '</div>',
+           pager, js))
+    return _page("小说备注", body, extra_head=_NOTES_CSS + _MARK_CSS,
                  base_href=base_href)
 
 
 def page_reader(entry, base_href=""):
     body = (
         '<div class="topbar"><a class="btn ghost" href="novels">← 小说</a>'
-        '<h1 style="font-size:17px">%s</h1>'
+        '<h1 id="bkTitle" style="font-size:17px">%s</h1>'
         '<select id="chsel" style="max-width:44vw"></select>'
         '<button type="button" class="ghost" id="fdec">A-</button>'
-        '<button type="button" class="ghost" id="finc">A+</button></div>'
+        '<button type="button" class="ghost" id="finc">A+</button>''<a class="btn ghost" id="noteLink" href="notes">记到备注页</a>' '<button type="button" class="ghost" id="mkFav">收藏</button>' '<button type="button" class="ghost" id="mkBan">黑名单</button></div>'
         '<div id="nmeta" class="muted" style="margin-bottom:10px"></div>'
         '<div id="novel" style="font-size:19px;line-height:1.95;'
         'max-width:760px;margin:0 auto;color:#dfe5f0"></div>'
@@ -4367,6 +5093,39 @@ def page_reader(entry, base_href=""):
         'try{FS=parseInt(localStorage.getItem("novelFont")||"19",10)||19;}'
         'catch(e){}'
         'const NOV=document.getElementById("novel");'
+        'var NL=document.getElementById("noteLink");'
+        'if(NL){NL.href="notes?title="+'
+        'encodeURIComponent(document.getElementById("' 'bkTitle").textContent)+"&link="+'
+        'encodeURIComponent(location.href.split("#")[0]' '.split("?")[0]);}'
+                'var MKF=document.getElementById("mkFav"),'
+        'MKB=document.getElementById("mkBan");'
+        'function mkState(st){if(!MKF)return;'
+        'MKF.textContent=st==="candidate"?"已收藏":"收藏";'
+        'MKB.textContent=st==="dropped"?"已拉黑":"黑名单";'
+        'MKF.style.outline=st==="candidate"'
+        '?"2px solid #7ea6e0":"";'
+        'MKB.style.outline=st==="dropped"'
+        '?"2px solid #e07a7a":"";}'
+        'async function mkSend(st){'
+        'const link=location.href.split("#")[0]'
+        '.split("?")[0];'
+        'const j=await postJ2({title:document'
+        '.getElementById("bkTitle").textContent,'
+        'link:link,status:st});'
+        'if(j&&j.ok)mkState(j.status);'
+        'else alert((j&&j.message)||"失败");}'
+        'async function postJ2(d){'
+        'const r=await fetch("api/notes/mark",'
+        '{method:"POST",headers:{"Content-Type":'
+        '"application/json"},body:JSON.stringify(d)});'
+        'return r.json();}'
+        'if(MKF){MKF.onclick=function(){'
+        'mkSend("candidate");};'
+        'MKB.onclick=function(){mkSend("dropped");};'
+        'fetch("api/notes/markstate?entry_id="+EID)'
+        '.then(function(r){return r.json();})'
+        '.then(function(j){if(j.ok)mkState(j.status||"");})'
+        '.catch(function(){});}'
         'function applyFs(){NOV.style.fontSize=FS+"px";}'
         'document.getElementById("fdec").onclick=function(){'
         'FS=Math.max(14,FS-1);applyFs();'
@@ -5808,9 +6567,15 @@ def page_admin_images(base_href=""):
 
 def page_admin_novels(base_href=""):
     s = _admin_sections()
+    link = ('<div class="panel"><h2>小说备注页</h2>'
+            '<div class="kv">独立的读书笔记：候选 / 在读 / '
+            '精品 / 不再推荐。和书库不绑定，删书不影响笔记，'
+            '没入库的书也能记。</div>'
+            '<p><a class="btn" href="notes">打开备注页</a>'
+            '</p></div>')
     return _page("管理 · 小说",
-                 _admin_topbar("novels") + s["ext"] + s["novels"]
-                 + s["js_ext"] + s["js_novels"],
+                 _admin_topbar("novels") + link + s["ext"]
+                 + s["novels"] + s["js_ext"] + s["js_novels"],
                  base_href=base_href)
 
 
@@ -6620,6 +7385,12 @@ def application(environ, start_response):
                                   ("Content-Length", str(len(body)))])
         return [body]
 
+    if path == "/notes" and method == "GET":
+        body = page_notes(params, base_href)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
+                                  ("Content-Length", str(len(body)))])
+        return [body]
+
     if path == "/files" and method == "GET":
         body = page_files(params, base_href)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
@@ -7145,6 +7916,219 @@ def application(environ, start_response):
             return _json(start_response, "404 Not Found",
                          {"ok": False, "message": "视频不存在。"})
         delete_entry(entry["id"])
+        return _json(start_response, "200 OK", {"ok": True})
+
+    if path == "/api/notes" and method == "POST":
+        data = _read_json(environ)
+        f = _note_clean_fields(data)
+        if not f["title"]:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False,
+                          "message": "书名不能为空。"})
+        now = time.time()
+        with _db() as conn:
+            cur = conn.execute(
+                "INSERT INTO novel_notes(title, author, "
+                "status, note, dislike_reason, like_tags, "
+                "like_text, link, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (f["title"], f["author"], f["status"],
+                 f["note"], f["dislike_reason"], f["like_tags"],
+                 f["like_text"], f["link"], now, now))
+            nid = cur.lastrowid
+        return _json(start_response, "200 OK",
+                     {"ok": True, "id": nid})
+
+    if path == "/api/notes/get" and method == "GET":
+        row = _note_get(params.get("id"))
+        if row is None:
+            return _json(start_response, "404 Not Found",
+                         {"ok": False,
+                          "message": "笔记不存在。"})
+        return _json(start_response, "200 OK",
+                     {"ok": True, "note": _note_public(row)})
+
+    if path == "/api/notes/update" and method == "POST":
+        data = _read_json(environ)
+        row = _note_get(data.get("id"))
+        if row is None:
+            return _json(start_response, "404 Not Found",
+                         {"ok": False,
+                          "message": "笔记不存在。"})
+        f = _note_clean_fields(data)
+        if not f["title"]:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False,
+                          "message": "书名不能为空。"})
+        with _db() as conn:
+            conn.execute(
+                "UPDATE novel_notes SET title = ?, "
+                "author = ?, status = ?, note = ?, "
+                "dislike_reason = ?, like_tags = ?, "
+                "like_text = ?, link = ?, updated_at = ? "
+                "WHERE id = ?",
+                (f["title"], f["author"], f["status"],
+                 f["note"], f["dislike_reason"], f["like_tags"],
+                 f["like_text"], f["link"], time.time(),
+                 row["id"]))
+        return _json(start_response, "200 OK", {"ok": True})
+
+    if path == "/api/notes/verdict" and method == "POST":
+        data = _read_json(environ)
+        row = _note_get(data.get("id"))
+        if row is None:
+            return _json(start_response, "404 Not Found",
+                         {"ok": False,
+                          "message": "笔记不存在。"})
+        verdict = (data.get("verdict") or "").strip()
+        if verdict not in ("reading", "candidate", "dropped"):
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False,
+                          "message": "裁决无效。"})
+        with _db() as conn:
+            conn.execute(
+                "UPDATE novel_notes SET status = ?, "
+                "updated_at = ? WHERE id = ?",
+                (verdict, time.time(), row["id"]))
+        return _json(start_response, "200 OK", {"ok": True})
+
+    if path == "/api/notes/delete" and method == "POST":
+        data = _read_json(environ)
+        row = _note_get(data.get("id"))
+        if row is None:
+            return _json(start_response, "404 Not Found",
+                         {"ok": False,
+                          "message": "笔记不存在。"})
+        with _db() as conn:
+            conn.execute(
+                "DELETE FROM novel_notes WHERE id = ?",
+                (row["id"],))
+        return _json(start_response, "200 OK", {"ok": True})
+
+    if path == "/api/notes/random" and method == "GET":
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT * FROM novel_notes WHERE status IN "
+                "('unrated', 'candidate') ORDER BY RANDOM() "
+                "LIMIT 1").fetchone()
+        return _json(start_response, "200 OK",
+                     {"ok": True,
+                      "note": (_note_public(row)
+                               if row else None)})
+
+
+
+    if path == "/api/notes/mark" and method == "POST":
+        data = _read_json(environ)
+        status = (data.get("status") or "").strip()
+        title = (data.get("title") or "").strip()[:200]
+        link = (data.get("link") or "").strip()[:1000]
+        if status not in ("candidate", "dropped"):
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False,
+                          "message": "状态无效。"})
+        if not title:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False,
+                          "message": "书名不能为空。"})
+        if not link:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False,
+                          "message": "链接不能为空。"})
+        now = time.time()
+        row = _note_by_link(link)
+        if row is not None:
+            with _db() as conn:
+                conn.execute(
+                    "UPDATE novel_notes SET status = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (status, now, row["id"]))
+            return _json(start_response, "200 OK",
+                         {"ok": True, "id": row["id"],
+                          "status": status,
+                          "status_label":
+                              _NOTE_STATUS_LABEL[status],
+                          "existed": True})
+        with _db() as conn:
+            cur = conn.execute(
+                "INSERT INTO novel_notes(title, author, "
+                "status, note, dislike_reason, like_tags, "
+                "like_text, link, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (title, "", status, "", "", "[]", "",
+                 link, now, now))
+            nid = cur.lastrowid
+        return _json(start_response, "200 OK",
+                     {"ok": True, "id": nid, "status": status,
+                      "status_label": _NOTE_STATUS_LABEL[status],
+                      "existed": False})
+
+    if path == "/api/notes/markstate" and method == "GET":
+        try:
+            eid = int(params.get("entry_id") or 0)
+        except Exception:
+            eid = 0
+        found = None
+        if eid:
+            with _db() as conn:
+                for r in conn.execute(
+                        "SELECT * FROM novel_notes "
+                        "WHERE link != '' ORDER BY id").fetchall():
+                    if _note_read_id(r["link"]) == eid:
+                        found = r
+                        break
+        return _json(start_response, "200 OK",
+                     {"ok": True,
+                      "status": (found["status"]
+                                 if found is not None else ""),
+                      "id": (found["id"]
+                             if found is not None else 0)})
+
+    if path == "/api/notes/booksearch" and method == "GET":
+        q = (params.get("q") or "").strip()
+        books = []
+        if q:
+            like = "%" + q + "%"
+            with _db() as conn:
+                rows = conn.execute(
+                    "SELECT e.id AS e_id, e.title AS e_title, "
+                    "m.char_count AS chars, m.chapters AS chaps "
+                    "FROM entries e "
+                    "JOIN files f ON f.hash = e.hash "
+                    "LEFT JOIN novel_meta m ON m.hash = e.hash "
+                    "WHERE f.kind = 'novel' AND "
+                    "(e.title LIKE ? OR e.tags LIKE ?) "
+                    "ORDER BY e.id DESC LIMIT 20",
+                    (like, like)).fetchall()
+            bmarks = _note_mark_map([r["e_id"] for r in rows])
+            for r in rows:
+                try:
+                    nch = len(json.loads(r["chaps"] or "[]"))
+                except Exception:
+                    nch = 0
+                bst = bmarks.get(r["e_id"], "")
+                books.append({
+                    "entry_id": r["e_id"], "title": r["e_title"],
+                    "chars": _fmt_wchars(r["chars"] or 0),
+                    "chapters": nch, "status": bst,
+                    "status_label":
+                        _NOTE_STATUS_LABEL.get(bst, "")})
+        return _json(start_response, "200 OK",
+                     {"ok": True, "books": books})
+
+    if path == "/api/notes/note" and method == "POST":
+        data = _read_json(environ)
+        row = _note_get(data.get("id"))
+        if row is None:
+            return _json(start_response, "404 Not Found",
+                         {"ok": False,
+                          "message": "笔记不存在。"})
+        note = (data.get("note") or "").strip()[:4000]
+        with _db() as conn:
+            conn.execute(
+                "UPDATE novel_notes SET note = ?, "
+                "updated_at = ? WHERE id = ?",
+                (note, time.time(), row["id"]))
         return _json(start_response, "200 OK", {"ok": True})
 
     if path == "/api/uploads/check" and method == "POST":

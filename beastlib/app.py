@@ -1,12 +1,21 @@
 # -*- coding: utf-8 -*-
 """野兽素材库 (beastlib): MrBeast 文案材料库。
 
-一条记录 = 一篇 BV 摘要 (md) + 配对原文 (txt)。身份与排序:
-  - 序号: 按 BV 号排序确定性分配 (#001 起), 重导入不变;
-  - YouTube video_id 为规范主键字段: 本批 front-matter 全为 null,
-    只允许用「用户自己的 YouTube 下载清单」(seed/match_source.csv)
-    按英文标题匹配回填 —— 确定匹配才落库, 疑似只进报告待裁决,
-    未匹配留空。BV 号只是来源标识, 不冒充主键;
+数据分层 (元数据先行):
+  - 底座层 yt_base: 用户 YouTube 清单 706 个 video_id 的元数据 (原始标题/
+    播放/点赞/评论/发布日期/时长), fetch_base.py 用 yt-dlp 实抓、
+    ingest_base.py 入表; 统计展示一律以底座为准。
+  - 文本层 records: 一条记录 = 一篇 BV 摘要 (md) + 配对原文 (txt), 是用户
+    特意筛选先行下载的精选批 (与 706 补全集是两个批次, 不是从中切出的子集)。
+身份与排序:
+  - 序号: 按 BV 号排序确定性分配 (#001 起), 重导入不变; 底座记录无序号,
+    以 video_id 为身份。
+  - YouTube video_id 为规范主键字段: 本批 front-matter 全为 null, 只允许
+    匹配回填 —— 先标题匹配 (对底座原始标题), 标题不够的升级内容核验
+    (BV txt 与候选 ASR 转写的片段重合); 确定才落库, 疑似只进报告待裁决,
+    未匹配留空, 只降不升、降级留理由。内容匹配 (match_method 为
+    content / title+content) 强于标题层: 标题法重导入时保留不覆盖。
+    BV 号只是来源标识, 不冒充主键;
   - title_zh (中文名) 是标准名: 列表/详情/搜索都以它为准。
 无项目内验证 (面板 /web 门负责)。数据落平台数据目录 (DATA_DIR 解析)。
 """
@@ -347,7 +356,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS records (
   id INTEGER PRIMARY KEY,
   seq INTEGER NOT NULL,
-  source_bv TEXT NOT NULL UNIQUE,
+  source_bv TEXT UNIQUE,
   video_id TEXT,
   title_zh TEXT NOT NULL,
   title_original TEXT,
@@ -365,7 +374,15 @@ CREATE TABLE IF NOT EXISTS records (
   match_tier TEXT NOT NULL DEFAULT 'unmatched',
   yt_title TEXT,
   yt_view_count TEXT,
-  yt_duration_sec TEXT
+  yt_duration_sec TEXT,
+  match_method TEXT,
+  content_cov REAL,
+  content_shared INTEGER,
+  origin TEXT NOT NULL DEFAULT 'bv',
+  yt_md_body TEXT,
+  yt_srt_text TEXT,
+  yt_doc_name TEXT,
+  base_pending INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS suspects (
   source_bv TEXT NOT NULL,
@@ -375,9 +392,57 @@ CREATE TABLE IF NOT EXISTS suspects (
   PRIMARY KEY (source_bv, cand_video_id)
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS yt_base (
+  video_id TEXT PRIMARY KEY,
+  title TEXT,
+  view_count INTEGER,
+  like_count INTEGER,
+  comment_count INTEGER,
+  upload_date TEXT,
+  duration INTEGER,
+  fetched_at TEXT,
+  source TEXT,
+  error TEXT,
+  transcript_ready INTEGER NOT NULL DEFAULT 0,
+  tab TEXT
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
-  title_zh, title_original, keywords, md_body, txt_text,
+  title_zh, title_original, keywords, md_body, txt_text, yt_md_body, yt_srt_text,
   content='records', content_rowid='id', tokenize='trigram');
+"""
+
+RECORDS_V2_DEF = """
+CREATE TABLE records_v2 (
+  id INTEGER PRIMARY KEY,
+  seq INTEGER NOT NULL,
+  source_bv TEXT UNIQUE,
+  video_id TEXT,
+  title_zh TEXT NOT NULL,
+  title_original TEXT,
+  source_file TEXT,
+  published_at TEXT,
+  source TEXT,
+  source_date TEXT,
+  source_index TEXT,
+  declared_words TEXT,
+  transcript_status TEXT,
+  keywords TEXT,
+  md_body TEXT NOT NULL,
+  txt_text TEXT,
+  has_txt INTEGER NOT NULL DEFAULT 0,
+  match_tier TEXT NOT NULL DEFAULT 'unmatched',
+  yt_title TEXT,
+  yt_view_count TEXT,
+  yt_duration_sec TEXT,
+  match_method TEXT,
+  content_cov REAL,
+  content_shared INTEGER,
+  origin TEXT NOT NULL DEFAULT 'bv',
+  yt_md_body TEXT,
+  yt_srt_text TEXT,
+  yt_doc_name TEXT,
+  base_pending INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -418,6 +483,16 @@ def run_import():
 
     db = sqlite3.connect(DB_PATH)
     db.executescript(SCHEMA)
+    _migrate(db)
+    # 内容层结论强于标题层: 已有内容匹配的 BV 在标题法重导入时保留原结论
+    preserved = {}
+    for bv0, vid0, mm0, ct0, cv0, cs0, t0, v0, d0 in db.execute(
+            "SELECT source_bv, video_id, match_method, yt_title, yt_view_count,"
+            " yt_duration_sec, title_zh FROM records"
+            " WHERE video_id IS NOT NULL AND match_method IN ('content','title+content','title_v2')"):
+        preserved[bv0] = {"video_id": vid0, "match_method": mm0,
+                          "yt_title": ct0, "views": cv0, "dur": cs0,
+                          "title_zh": t0}
     matched = suspect = unmatched = 0
     matched_list, suspect_list, unmatched_list, demoted_list = [], [], [], []
     with db:
@@ -427,19 +502,34 @@ def run_import():
             res = by_bv[rec["bv"]]
             tier = res["tier"]
             fm = rec["fm"]
+            pres = preserved.get(rec["bv"])
+            if pres:
+                tier = "matched"
             video_id = yt_title = yt_views = yt_dur = None
             if tier == "matched":
                 matched += 1
-                video_id = res["best"]["video_id"]
-                crow = csv_by_id.get(video_id, {})
-                yt_title = crow.get("title")
-                yt_views = crow.get("view_count") or None
-                yt_dur = crow.get("duration_sec") or None
-                matched_list.append({"bv": rec["bv"], "seq": seq,
-                                     "title_zh": fm.get("title_zh"),
-                                     "video_id": video_id, "yt_title": yt_title,
-                                     "views": yt_views, "dice": res["best"]["dice"],
-                                     "rule": res["rule"]})
+                if pres:
+                    video_id = pres["video_id"]
+                    yt_title = pres["yt_title"]
+                    yt_views = pres["views"]
+                    yt_dur = pres["dur"]
+                    matched_list.append({"bv": rec["bv"], "seq": seq,
+                                         "title_zh": fm.get("title_zh"),
+                                         "video_id": video_id,
+                                         "yt_title": yt_title,
+                                         "views": yt_views, "dice": None,
+                                         "rule": pres["match_method"]})
+                else:
+                    video_id = res["best"]["video_id"]
+                    crow = csv_by_id.get(video_id, {})
+                    yt_title = crow.get("title")
+                    yt_views = crow.get("view_count") or None
+                    yt_dur = crow.get("duration_sec") or None
+                    matched_list.append({"bv": rec["bv"], "seq": seq,
+                                         "title_zh": fm.get("title_zh"),
+                                         "video_id": video_id, "yt_title": yt_title,
+                                         "views": yt_views, "dice": res["best"]["dice"],
+                                         "rule": res["rule"]})
             elif tier == "suspect":
                 suspect += 1
                 suspect_list.append({"bv": rec["bv"], "seq": seq,
@@ -516,6 +606,7 @@ def run_import():
         "paired": sum(1 for r in recs if r["txt"] is not None),
         "md_only": [r["bv"] for r in recs if r["txt"] is None],
         "matched": matched, "suspect": suspect, "unmatched": unmatched,
+        "title_source": "用户下载清单 (seed/match_source.csv)",
         "matched_rate": round(matched / len(recs) * 100, 1) if recs else 0,
         "conflicts": conflicts,
         "demoted": demoted_list,
@@ -524,10 +615,11 @@ def run_import():
         "suspect_list": suspect_list,
         "unmatched_list": unmatched_list,
         "notes": [
-            "video_id 原始数据全为 null (%d/%d); 确定匹配 %d 条已按下载清单回填" % (len(recs), len(recs), matched),
-            "下载清单 (still_to_download.csv, 706 行) 不含 published_at 字段, 故发布时间未回填; 回填的清单字段仅 view_count / duration_sec",
+            "video_id 原始数据全为 null (%d/%d); 确定匹配 %d 条已回填" % (len(recs), len(recs), matched),
+            "本报告为标题层结果 (来源见报告页标题层段落); 元数据底座 (yt-dlp 实抓) 的标题层由 apply_rematch 生成, 内容核验层由 apply_content 生成, 均在本页上部汇总",
+            "下载清单 (still_to_download.csv, 706 行) 不含 published_at 字段; 发布时间/点赞/评论只来自底座实抓",
             "疑似匹配不落库, 在本报告并排列出候选供裁决; 未匹配 video_id 留空",
-            "BV 号为来源标识 (source_bv / source_file), 不作主键; 序号按 BV 排序稳定分配",
+            "BV 号为来源标识 (source_bv / source_file), 不作主键; 序号按 BV 排序稳定分配; 内容匹配 (content/title+content) 在标题法重导入时保留不覆盖",
         ],
     }
     with db:
@@ -535,6 +627,48 @@ def run_import():
                    (json.dumps(report, ensure_ascii=False),))
     db.close()
     return report
+
+
+def _migrate(db):
+    """v1: 匹配证据列; v2: records 重建 (source_bv 可空 + origin/第二套文档列
+    + FTS 扩列纳入 YouTube 来源文档)。幂等, 按列存在性判断。"""
+    cols = {r[1] for r in db.execute("PRAGMA table_info(records)")}
+    if not cols:
+        return  # fresh DB: SCHEMA 已是 v2
+    for name, decl in (("match_method", "TEXT"), ("content_cov", "REAL"),
+                       ("content_shared", "INTEGER")):
+        if name not in cols:
+            db.execute(f"ALTER TABLE records ADD COLUMN {name} {decl}")
+            cols.add(name)
+    if "origin" not in cols:
+        keep = ["id", "seq", "source_bv", "video_id", "title_zh",
+                "title_original", "source_file", "published_at", "source",
+                "source_date", "source_index", "declared_words",
+                "transcript_status", "keywords", "md_body", "txt_text",
+                "has_txt", "match_tier", "yt_title", "yt_view_count",
+                "yt_duration_sec", "match_method", "content_cov",
+                "content_shared"]
+        collist = ", ".join(keep)
+        db.execute("DROP TABLE IF EXISTS records_fts")
+        db.execute("DROP TABLE IF EXISTS records_v2")
+        db.execute(RECORDS_V2_DEF)
+        db.execute(f"INSERT INTO records_v2 ({collist}) "
+                   f"SELECT {collist} FROM records")
+        db.execute("DROP TABLE records")
+        db.execute("ALTER TABLE records_v2 RENAME TO records")
+        db.execute("""CREATE VIRTUAL TABLE records_fts USING fts5(
+          title_zh, title_original, keywords, md_body, txt_text, yt_md_body,
+          yt_srt_text, content='records', content_rowid='id',
+          tokenize='trigram')""")
+        db.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')")
+    db.execute("UPDATE records SET match_method='title' "
+               "WHERE video_id IS NOT NULL AND match_method IS NULL")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                  " AND name='yt_base'").fetchone():
+        bcols = {r[1] for r in db.execute("PRAGMA table_info(yt_base)")}
+        if "tab" not in bcols:
+            db.execute("ALTER TABLE yt_base ADD COLUMN tab TEXT")
+    db.commit()
 
 
 _init_lock = threading.Lock()
@@ -550,6 +684,7 @@ def ensure_init():
             return
         db = sqlite3.connect(DB_PATH)
         db.executescript(SCHEMA)
+        _migrate(db)
         n = db.execute("SELECT COUNT(*) FROM records").fetchone()[0]
         db.close()
         if n == 0:
@@ -699,6 +834,20 @@ section.rep h2 { font-size: 17px; margin: 20px 0 4px; }
 .mono { font-variant-numeric: tabular-nums; }
 button.reimp { padding: 8px 16px; border: 0; border-radius: 8px; background: #1c1c1e;
   color: #fff; cursor: pointer; font-size: 14px; }
+.links { font-size: 12.5px; margin-top: 5px; color: #6b6b70; }
+.links a { color: #0a64d8; text-decoration: none; }
+.dl { display: flex; gap: 8px; margin: 10px 0 2px; flex-wrap: wrap; }
+.dl a { font-size: 13px; padding: 5px 12px; border: 1px solid #c9c9cd; border-radius: 99px;
+  color: #1c1c1e; text-decoration: none; background: #fff; }
+.dl a:hover { border-color: #0a64d8; color: #0a64d8; }
+.b-src { background: #eef0ff; color: #3a3fb0; }
+.b-tr { background: #e8f6ee; color: #14662e; }
+.b-notr { background: #f0f0ee; color: #6b6b70; }
+.b-nomd { background: #f0f0ee; color: #6b6b70; }
+.b-err { background: #fde8e8; color: #a11; }
+.tgl { font-size: 13.5px; margin: 2px 0 12px; }
+.tgl a { color: #0a64d8; text-decoration: none; }
+.tgl .on { font-weight: 700; color: #1c1c1e; }
 """
 
 
@@ -717,10 +866,26 @@ def _badges(r, hit_label=None):
              else "<span class=\"b b-md\">仅摘要</span>")
     if r["video_id"]:
         b.append(f"<span class=\"b b-yt\" title=\"{_html.escape(r['video_id'])}\">YouTube 已匹配</span>")
+    keys = r.keys()
+    origin = r["origin"] if "origin" in keys else "bv"
+    if origin == "yt":
+        b.append("<span class=\"b b-src\">YouTube 批</span>")
+    elif "yt_md_body" in keys and r["yt_md_body"]:
+        b.append("<span class=\"b b-src\">双来源</span>")
+    else:
+        b.append("<span class=\"b b-src\">BV 批</span>")
     return "<div class=\"badges\">" + "".join(b) + "</div>"
 
 
-def _row(r, hit_label=None):
+def _row(r, hit_label=None, views=None):
+    links = ""
+    if r["video_id"]:
+        links += (f"<a href=\"https://www.youtube.com/watch?v={r['video_id']}\" "
+                  "target=\"_blank\" rel=\"noopener\">YouTube ↗</a> · ")
+    links += (f"<a href=\"https://www.bilibili.com/video/{r['source_bv']}\" "
+              "target=\"_blank\" rel=\"noopener\">Bilibili ↗</a>")
+    if views is not None and str(views) != "":
+        links += f" · <span>播放 {_fmt_views(views)}</span>"
     return (
         "<div class=\"row\">"
         f"<a class=\"seq\" href=\"{U('/r/%d' % r['seq'])}\">#{r['seq']:03d}</a>"
@@ -728,6 +893,7 @@ def _row(r, hit_label=None):
         f"<a class=\"t\" href=\"{U('/r/%d' % r['seq'])}\">{_html.escape(r['title_zh'])}</a>"
         f"<div class=\"sub\">{_html.escape(r['title_original'] or '')}</div>"
         f"<div class=\"kw\">{_html.escape(r['keywords'] or '')}</div>"
+        f"<div class=\"links\">{links}</div>"
         "</div>" + _badges(r, hit_label) + "</div>")
 
 
@@ -737,6 +903,8 @@ PER_PAGE = 30
 @app.route("/")
 def index():
     db = get_db()
+    if (request.args.get("view") or "") == "base":
+        return _base_page(db)
     q = (request.args.get("q") or "").strip()
     total = db.execute("SELECT COUNT(*) FROM records").fetchone()[0]
     n_matched = db.execute(
@@ -745,7 +913,8 @@ def index():
     head = ("<h1 class=\"pt\">野兽素材库</h1>"
             f"<div class=\"stats\">共 {total} 条 · 有原文 {n_txt} 条 · "
             f"YouTube 已匹配 {n_matched} 条 · "
-            f"<a href=\"{U('/report')}\">入库报告</a></div>"
+            f"<a href=\"{U('/report')}\">入库报告</a> · "
+            f"<a href=\"{U('/?view=base')}\">全部底座</a></div>"
             f"<form class=\"search\" method=\"get\" action=\"{U('/')}\">"
             f"<input name=\"q\" value=\"{_html.escape(q)}\" "
             "placeholder=\"搜索中文名 / 原名 / 关键词 / 正文 / 原文\">"
@@ -754,7 +923,9 @@ def index():
         hits = search_records(db, q)
         body = head + f"<div class=\"stats\">搜索「{_html.escape(q)}」命中 {len(hits)} 条 · <a href=\"{U('/')}\">清除</a></div>"
         if hits:
-            body += "".join(_row(r, label) for label, r in hits)
+            bmap = _base_map(db, [r["video_id"] for _, r in hits])
+            body += "".join(_row(r, label, _disp_views(r, bmap))
+                            for label, r in hits)
         else:
             body += "<div class=\"empty\">没有命中。</div>"
         return page("搜索 · 野兽素材库", body)
@@ -766,7 +937,8 @@ def index():
     p = min(p, pages)
     rows = db.execute("SELECT * FROM records ORDER BY seq LIMIT ? OFFSET ?",
                       (PER_PAGE, (p - 1) * PER_PAGE)).fetchall()
-    body = head + "".join(_row(r) for r in rows)
+    bmap = _base_map(db, [r["video_id"] for r in rows])
+    body = head + "".join(_row(r, views=_disp_views(r, bmap)) for r in rows)
     prev = (f"<a href=\"{U('/?p=%d' % (p - 1))}\">上一页</a>" if p > 1
             else "<span class=\"off\">上一页</span>")
     nxt = (f"<a href=\"{U('/?p=%d' % (p + 1))}\">下一页</a>" if p < pages
@@ -775,10 +947,127 @@ def index():
     return page("野兽素材库", body)
 
 
+def _brow(b):
+    badges = []
+    if b["error"]:
+        badges.append("<span class=\"b b-err\">抓取失败</span>")
+    if b["rseq"] is not None:
+        badges.append(f"<span class=\"b b-yt\">有摘要 #{b['rseq']:03d}</span>")
+    else:
+        badges.append("<span class=\"b b-nomd\">无摘要</span>")
+    badges.append("<span class=\"b b-tr\">转写就绪</span>" if b["transcript_ready"]
+                  else "<span class=\"b b-notr\">未转写</span>")
+    if "tab" in b.keys() and b["tab"] == "shorts":
+        badges.append("<span class=\"b b-src\">Shorts</span>")
+    title = b["title"] or b["video_id"]
+    if b["rseq"] is not None:
+        tlink = (f"<a class=\"t\" href=\"{U('/r/%d' % b['rseq'])}\">"
+                 f"{_html.escape(title)}</a>")
+    else:
+        tlink = (f"<a class=\"t\" href=\"https://www.youtube.com/watch?v={b['video_id']}\" "
+                 f"target=\"_blank\" rel=\"noopener\">{_html.escape(title)}</a>")
+    links = (f"<a href=\"https://www.youtube.com/watch?v={b['video_id']}\" "
+             "target=\"_blank\" rel=\"noopener\">YouTube ↗</a>")
+    if b["rseq"] is not None:
+        links += f" · <a href=\"{U('/r/%d' % b['rseq'])}\">看摘要 →</a>"
+    if b["view_count"] is not None:
+        links += f" · <span>播放 {_fmt_views(b['view_count'])}</span>"
+    sub = (f"{b['video_id']} · 发布 {_fmt_date(b['upload_date'])} · "
+           f"时长 {_fmt_dur(b['duration'])}")
+    if b["error"]:
+        sub += f" · {_html.escape(b['error'])}"
+    return ("<div class=\"row\"><div class=\"seq\">底座</div><div class=\"main\">"
+            + tlink + f"<div class=\"sub\">{_html.escape(sub)}</div>"
+            f"<div class=\"links\">{links}</div></div>"
+            "<div class=\"badges\">" + "".join(badges) + "</div></div>")
+
+
+def _base_page(db):
+    back = f"<div class=\"back\"><a href=\"{U('/')}\">← 素材记录</a></div>"
+    if not _has_base(db):
+        return page("元数据底座 · 野兽素材库",
+                    back + "<div class=\"empty\">底座尚未入库。</div>")
+    total = db.execute("SELECT COUNT(*) FROM yt_base").fetchone()[0]
+    ok = db.execute(
+        "SELECT COUNT(*) FROM yt_base WHERE error IS NULL").fetchone()[0]
+    tr = db.execute(
+        "SELECT COUNT(*) FROM yt_base WHERE transcript_ready=1").fetchone()[0]
+    n_md = db.execute(
+        "SELECT COUNT(DISTINCT video_id) FROM records "
+        "WHERE video_id IS NOT NULL").fetchone()[0]
+    head = (back + "<h1 class=\"pt\">元数据底座</h1>"
+            f"<div class=\"stats\">共 {total} 条 · 抓取成功 {ok} · 失败 {total - ok} · "
+            f"转写就绪 {tr} · 已挂摘要 {n_md} 条</div>"
+            f"<div class=\"tgl\"><a href=\"{U('/')}\">素材记录（摘要）</a> · "
+            "<span class=\"on\">全部底座</span></div>"
+            "<div class=\"stats\">底座为清单 706 个 video_id 的 yt-dlp 实抓元数据，"
+            "按播放量排序；有摘要的挂素材记录序号，无摘要的只有 video_id 身份"
+            "（底座不用 # 序号）。</div>")
+    try:
+        p = max(1, int(request.args.get("p", "1")))
+    except ValueError:
+        p = 1
+    pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
+    p = min(p, pages)
+    rows = db.execute(
+        "SELECT b.*, r.seq AS rseq FROM yt_base b "
+        "LEFT JOIN records r ON r.video_id = b.video_id "
+        "ORDER BY (b.view_count IS NULL), b.view_count DESC LIMIT ? OFFSET ?",
+        (PER_PAGE, (p - 1) * PER_PAGE)).fetchall()
+    body = head + "".join(_brow(b) for b in rows)
+    prev = (f"<a href=\"{U('/?view=base&p=%d' % (p - 1))}\">上一页</a>" if p > 1
+            else "<span class=\"off\">上一页</span>")
+    nxt = (f"<a href=\"{U('/?view=base&p=%d' % (p + 1))}\">下一页</a>" if p < pages
+           else "<span class=\"off\">下一页</span>")
+    body += f"<div class=\"pager\">{prev}<span>第 {p} / {pages} 页</span>{nxt}</div>"
+    return page("元数据底座 · 野兽素材库", body)
+
+
 def _fmt_views(v):
     if v and str(v).isdigit():
         return f"{int(v):,}"
     return v or "—"
+
+
+def _fmt_dur(sec):
+    try:
+        sec = int(sec)
+    except (TypeError, ValueError):
+        return "—"
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _fmt_date(d):
+    d = str(d or "")
+    if len(d) == 8 and d.isdigit():
+        return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    return d or "—"
+
+
+def _has_base(db):
+    return db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='yt_base'"
+    ).fetchone() is not None
+
+
+def _base_map(db, vids):
+    vids = list(dict.fromkeys(v for v in vids if v))
+    if not vids or not _has_base(db):
+        return {}
+    rows = db.execute(
+        "SELECT * FROM yt_base WHERE video_id IN (%s)"
+        % ",".join("?" * len(vids)), vids).fetchall()
+    return {r["video_id"]: r for r in rows}
+
+
+def _disp_views(r, bmap):
+    """展示播放量: 底座 (yt-dlp 实抓) 优先, 缺失时回落清单回填值。"""
+    b = bmap.get(r["video_id"]) if r["video_id"] else None
+    if b is not None and not b["error"] and b["view_count"] is not None:
+        return b["view_count"]
+    return r["yt_view_count"]
 
 
 @app.route("/r/<int:seq>")
@@ -790,31 +1079,230 @@ def detail(seq):
     p = (seq - 1) // PER_PAGE + 1
     fm_items = [
         ("序号", f"#{r['seq']:03d}"), ("来源 BV", r["source_bv"]),
+        ("来源批次", "YouTube 字幕批" if r["origin"] == "yt" else "BV 精选批"),
         ("YouTube ID", r["video_id"]), ("发布时间", r["published_at"]),
         ("来源", r["source"]), ("来源日期", r["source_date"]),
         ("来源文件", r["source_file"]), ("来源序号", r["source_index"]),
         ("标注字数", r["declared_words"]), ("转写状态", r["transcript_status"]),
     ]
+    keys = set(r.keys())
     if r["video_id"]:
-        fm_items += [("清单标题", r["yt_title"]),
-                     ("清单播放量", _fmt_views(r["yt_view_count"])),
-                     ("清单时长(秒)", r["yt_duration_sec"])]
+        fm_items += [("清单标题", r["yt_title"])]
+        method = r["match_method"] if "match_method" in keys else None
+        label = {"title": "标题匹配", "content": "内容核验",
+                 "title+content": "标题匹配 + 内容核验",
+                 "title_v2": "标题匹配 v2（多信号裁定）",
+                 "direct": "批次直供（video_id 自带）"}.get(
+                     method or "title", method or "标题匹配")
+        fm_items.append(("匹配方式", label))
+        if "content_cov" in keys and r["content_cov"] is not None:
+            fm_items.append(("内容覆盖", "%.1f%%" % (r["content_cov"] * 100)))
+        if "content_shared" in keys and r["content_shared"]:
+            fm_items.append(("共享片段", "%d 段" % r["content_shared"]))
     fm = "<dl class=\"fm\">" + "".join(
         f"<div><dt>{k}：</dt><dd>{_html.escape(str(v)) if v else '—'}</dd></div>"
         for k, v in fm_items) + "</dl>"
-    note = ("<p class=\"note\">YouTube 字段由用户下载清单按英文标题匹配回填（确定匹配）；"
-            "front-matter 原值未改。</p>" if r["video_id"] else "")
+    dl = "<div class=\"dl\">"
+    if r["video_id"]:
+        dl += (f"<a href=\"https://www.youtube.com/watch?v={r['video_id']}\" "
+               "target=\"_blank\" rel=\"noopener\">YouTube ↗</a>")
+    dl += (f"<a href=\"https://www.bilibili.com/video/{r['source_bv']}\" "
+           "target=\"_blank\" rel=\"noopener\">Bilibili 源 ↗</a></div>")
+    stats = ""
+    base = (_base_map(db, [r["video_id"]]).get(r["video_id"])
+            if r["video_id"] else None)
+    if base is not None and not base["error"]:
+        items = [("播放量", _fmt_views(base["view_count"])),
+                 ("点赞", _fmt_views(base["like_count"])),
+                 ("评论", _fmt_views(base["comment_count"])),
+                 ("时长", _fmt_dur(base["duration"])),
+                 ("发布日期", _fmt_date(base["upload_date"])),
+                 ("底座标题", base["title"])]
+        if "tab" in base.keys() and base["tab"]:
+            items.append(("类型", "Shorts" if base["tab"] == "shorts" else "长视频"))
+        stats = ("<h3>统计 · 元数据底座</h3><dl class=\"fm\">" + "".join(
+            f"<div><dt>{k}：</dt><dd>{_html.escape(str(v)) if v else '—'}</dd></div>"
+            for k, v in items) + "</dl>"
+            f"<p class=\"note\">统计来自元数据底座（yt-dlp 实抓，数据日期 "
+            f"{_html.escape(base['fetched_at'] or '')}）；与清单回填值冲突时以底座为准。</p>")
+    elif r["video_id"]:
+        items = [("清单播放量", _fmt_views(r["yt_view_count"])),
+                 ("清单时长", _fmt_dur(r["yt_duration_sec"]))]
+        stats = ("<h3>统计 · 下载清单</h3><dl class=\"fm\">" + "".join(
+            f"<div><dt>{k}：</dt><dd>{_html.escape(str(v)) if v else '—'}</dd></div>"
+            for k, v in items) + "</dl>"
+            "<p class=\"note\">底座暂无此条，统计为下载清单回填值。</p>")
     body = (f"<div class=\"back\"><a href=\"{U('/?p=%d' % p)}\">← 返回列表</a></div>"
             "<article>"
             f"<h1>{_html.escape(r['title_zh'])}</h1>"
             f"<div class=\"orig\">{_html.escape(r['title_original'] or '')}</div>"
-            + fm + note + render_md(r["md_body"]) + "</article>")
+            + fm + dl + stats + render_md(r["md_body"]) + "</article>")
     if r["has_txt"] and r["txt_text"] is not None:
-        body += (f"<details class=\"txt\"><summary>配对原文（{_html.escape(r['source_file'] or '')}）</summary>"
+        summ = (f"配对原文（SRT · {_html.escape(r['source_file'] or '')}）"
+                if r["origin"] == "yt"
+                else f"配对原文（{_html.escape(r['source_file'] or '')}）")
+        body += (f"<details class=\"txt\"><summary>{summ}</summary>"
                  f"<pre>{_html.escape(r['txt_text'])}</pre></details>")
     else:
         body += "<details class=\"txt\"><summary>配对原文</summary><p>无配对原文。</p></details>"
+    if "yt_md_body" in keys and r["yt_md_body"]:
+        body += ("<article style=\"margin-top:14px\">"
+                 "<div class=\"orig\">第二套来源文档 · YouTube SRT 字幕批</div>"
+                 + render_md(r["yt_md_body"]) + "</article>")
+        if r["yt_srt_text"]:
+            body += (f"<details class=\"txt\"><summary>YouTube 来源原文"
+                     f"（{_html.escape(r['yt_doc_name'] or '')}）</summary>"
+                     f"<pre>{_html.escape(r['yt_srt_text'])}</pre></details>")
     return page(r["title_zh"] + " · 野兽素材库", body)
+
+
+def _report_extra(db):
+    h = []
+    tiers = dict(db.execute(
+        "SELECT match_tier, COUNT(*) FROM records GROUP BY match_tier").fetchall())
+    methods = dict(db.execute(
+        "SELECT COALESCE(match_method, '-'), COUNT(*) FROM records "
+        "WHERE video_id IS NOT NULL GROUP BY 1").fetchall())
+    h.append("<h2>最终匹配汇总（实时）</h2>")
+    h.append(
+        f"<div class=\"stats\">确定 {tiers.get('matched', 0)} 条"
+        f"（标题 {methods.get('title', 0)} · 标题+内容核验 {methods.get('title+content', 0)}"
+        f" · 内容核验 {methods.get('content', 0)} · 标题v2 {methods.get('title_v2', 0)}）· "
+        f"疑似 {tiers.get('suspect', 0)} 条 · 未匹配 {tiers.get('unmatched', 0)} 条 · "
+        f"无原版 {tiers.get('no_original', 0)} 条</div>")
+    no_rows = db.execute(
+        "SELECT seq, source_bv, match_method FROM records"
+        " WHERE match_tier='no_original' ORDER BY seq").fetchall()
+    if no_rows:
+        tag = {"no_original": "B站独家", "compilation": "合集",
+               "off_base": "底座外"}
+        items = "、".join(
+            "#%03d（%s）" % (x["seq"], tag.get(
+                x["match_method"] or "no_original",
+                x["match_method"] or "B站独家")) for x in no_rows)
+        h.append(f"<div class=\"stats\">无原版明细：{items}</div>")
+    if _has_base(db):
+        total = db.execute("SELECT COUNT(*) FROM yt_base").fetchone()[0]
+        ok = db.execute(
+            "SELECT COUNT(*) FROM yt_base WHERE error IS NULL").fetchone()[0]
+        tr = db.execute(
+            "SELECT COUNT(*) FROM yt_base WHERE transcript_ready=1").fetchone()[0]
+        n_md = db.execute(
+            "SELECT COUNT(DISTINCT video_id) FROM records "
+            "WHERE video_id IS NOT NULL").fetchone()[0]
+        brow = db.execute(
+            "SELECT value FROM meta WHERE key='base_report'").fetchone()
+        bat = ""
+        if brow:
+            try:
+                bat = " · 入库时间 " + json.loads(brow["value"]).get("at", "")
+            except Exception:
+                bat = ""
+        h.append("<h2>元数据底座（yt-dlp 实抓）</h2>")
+        h.append(f"<div class=\"stats\">共 {total} 条 · 抓取成功 {ok} · 失败 {total - ok} · "
+                 f"转写就绪 {tr} · 已挂摘要 {n_md}{bat}</div>")
+        if brow:
+            try:
+                sc = json.loads(brow["value"]).get("scope") or {}
+            except Exception:
+                sc = {}
+            if sc:
+                h.append(
+                    f"<div class=\"stats\">底座范围三方对账（频道枚举 ∪ 清单）："
+                    f"频道长视频 {sc.get('channel_videos_tab')} 条（清单含 "
+                    f"{sc.get('videos_in_list')}、缺 {sc.get('videos_not_list')}）· "
+                    f"频道 Shorts {sc.get('channel_shorts_tab')} 条（清单含 "
+                    f"{sc.get('shorts_in_list')}、缺 {sc.get('shorts_not_list')}）· "
+                    f"清单 {sc.get('list_total')} 条（多出 {sc.get('list_not_channel')} 条）· "
+                    f"两页交集 {sc.get('tab_overlap')} · 底座共 {sc.get('base_total')} 条；"
+                    "Shorts 在底座里以 tab=shorts 标记，与长视频分开</div>")
+        fails = db.execute(
+            "SELECT video_id, error FROM yt_base WHERE error IS NOT NULL "
+            "ORDER BY video_id").fetchall()
+        if fails:
+            h.append("<div class=\"scroll\"><table><tr><th>video_id</th><th>失败原因</th></tr>")
+            for f in fails:
+                h.append(f"<tr><td>{_html.escape(f['video_id'])}</td>"
+                         f"<td>{_html.escape(f['error'] or '')}</td></tr>")
+            h.append("</table></div>")
+    crow = db.execute(
+        "SELECT value FROM meta WHERE key='content_report'").fetchone()
+    if crow:
+        try:
+            cr = json.loads(crow["value"])
+        except Exception:
+            cr = None
+        if cr:
+            h.append("<h2>内容核验（升级层：标题不够时读转写片段核验）</h2>")
+            h.append(
+                f"<div class=\"stats\">核验时间 {cr.get('at', '')} · 索引转写 "
+                f"{cr.get('transcripts_indexed', 0)} 条 · 内容确认救回 "
+                f"{len(cr.get('confirmed', []))} 条 · 标题匹配经内容确认 "
+                f"{len(cr.get('verified', []))} 条 · 内容疑似 "
+                f"{len(cr.get('suspects', []))} 条 · 冲突 "
+                f"{len(cr.get('conflicts', []))} 条 · 未核验 "
+                f"{cr.get('unverified', 0)} 条（候选转写未就绪）</div>")
+            if cr.get("confirmed"):
+                h.append("<div class=\"scroll\"><table><tr><th>序号</th><th>BV</th>"
+                         "<th>中文名</th><th>YouTube ID</th><th>覆盖</th>"
+                         "<th>共享片段</th><th>标题 dice</th><th>原层级</th></tr>")
+                for m in cr["confirmed"]:
+                    h.append("<tr><td class=\"mono\">#%03d</td><td>%s</td><td>%s</td>"
+                             "<td>%s</td><td>%.1f%%</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                                 m["seq"], _html.escape(m["bv"]),
+                                 _html.escape(m["title_zh"] or ""),
+                                 _html.escape(m["video_id"] or ""),
+                                 (m["cov"] or 0) * 100, m["shared"],
+                                 m["title_dice"], _html.escape(m["from_tier"] or "")))
+                h.append("</table></div>")
+            for s in cr.get("suspects", []):
+                h.append(f"<p><strong>#{s['seq']:03d} {_html.escape(s['bv'])}</strong> "
+                         f"{_html.escape(s['title_zh'] or '')}<br>"
+                         f"<span class=\"cand\">内容候选：{_html.escape(s['cand_title'] or '')} "
+                         f"[{_html.escape(s['video_id'] or '')}] · 覆盖 "
+                         f"{(s['cov'] or 0) * 100:.1f}% · 共享片段 {s['shared']} · "
+                         f"标题 dice {s['title_dice']}</span><br>"
+                         f"<span class=\"note\">{_html.escape(s['reason'] or '')}</span></p>")
+            for c in cr.get("conflicts", []):
+                h.append(f"<p><strong>#{c['seq']:03d} {_html.escape(c['bv'])}</strong> "
+                         f"{_html.escape(c['title_zh'] or '')}：标题层保留 "
+                         f"{_html.escape(c['kept_video_id'] or '')}，内容最强指向 "
+                         f"{_html.escape(c['content_video_id'] or '')}"
+                         f"（覆盖 {(c['cov'] or 0) * 100:.1f}%，共享 {c['shared']} 段）"
+                         "——不自动改，待裁决。</p>")
+            if cr.get("negative_control"):
+                nc = cr["negative_control"]
+                h.append(f"<p>负控制 {_html.escape(nc.get('bv', ''))}："
+                         f"{_html.escape(nc.get('result', ''))}</p>")
+            for d in cr.get("demoted", []):
+                h.append(f"<p>{_html.escape(d['bv'])}：{_html.escape(d['reason'])}</p>")
+    yrow = db.execute(
+        "SELECT value FROM meta WHERE key='yt_batch_report'").fetchone()
+    if yrow:
+        try:
+            yb = json.loads(yrow["value"])
+        except Exception:
+            yb = None
+        if yb:
+            h.append("<h2>YouTube 字幕批入库（video_id 精确挂接，不做模糊匹配）</h2>")
+            h.append(
+                f"<div class=\"stats\">入库时间 {yb.get('at', '')} · 视频 md "
+                f"{yb.get('total_md', 0)} 篇 · 新建 {yb.get('new', 0)} 条"
+                f"（序号自 #125 起：按发布日期升序、video_id 字典序定序）· "
+                f"并入已有 {yb.get('merged', 0)} 条（第二套来源文档）· "
+                f"重跑已在库 {yb.get('already', 0)} 条 · 底座覆盖 "
+                f"{yb.get('base_covered', 0)}/{yb.get('total_md', 0)} · "
+                f"待底座补齐 {len(yb.get('base_pending', []))} 条 · "
+                f"无 md 的 srt {yb.get('srt_only', 0)} 个未建记录</div>")
+            if yb.get("base_pending"):
+                h.append("<div class=\"scroll\"><p>待底座补齐 video_id："
+                         + " · ".join(_html.escape(v)
+                                      for v in yb["base_pending"])
+                         + "</p></div>")
+            for s in yb.get("skipped_files", []):
+                h.append(f"<p><strong>{_html.escape(s['file'])}</strong>："
+                         f"{_html.escape(s['desc'])}</p>")
+    return "".join(h)
 
 
 @app.route("/report")
@@ -828,8 +1316,10 @@ def report():
          "<section class=\"rep\">",
          "<h1 class=\"pt\">入库报告</h1>",
          f"<div class=\"stats\">导入时间 {rep['at']} · 共 {rep['total']} 条 · "
-         f"配对原文 {rep['paired']} 条 · 仅摘要 {len(rep['md_only'])} 条</div>",
-         "<h2>YouTube 标题匹配（来源：用户下载清单）</h2>",
+         f"配对原文 {rep['paired']} 条 · 仅摘要 {len(rep['md_only'])} 条</div>"]
+    h.append(_report_extra(db))
+    h += ["<h2>标题匹配（标题层）</h2>",
+          f"<div class=\"stats\">来源：{_html.escape(rep.get('title_source') or '用户下载清单')}</div>",
          f"<div class=\"stats\">确定匹配 {rep['matched']} 条（{rep['matched_rate']}%）· "
          f"疑似 {rep['suspect']} 条（不落库，待裁决）· 未匹配 {rep['unmatched']} 条（video_id 留空）</div>"]
     h.append("<div class=\"scroll\"><table><tr><th>序号</th><th>BV</th><th>中文名</th>"
@@ -842,7 +1332,8 @@ def report():
                      _html.escape(m["video_id"] or ""),
                      _html.escape(m["yt_title"] or ""),
                      _html.escape(_fmt_views(m["views"])),
-                     m["dice"], _html.escape(m["rule"])))
+                     ("—" if m["dice"] is None else m["dice"]),
+                     _html.escape(m["rule"])))
     h.append("</table></div>")
     h.append("<h2>疑似匹配（并排列出，供裁决）</h2><div class=\"scroll\">")
     for s in rep["suspect_list"]:

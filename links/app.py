@@ -502,7 +502,7 @@ os.makedirs(RUNTIME, exist_ok=True)
 
 # ---------------------------------------------------------------- page
 
-PAGE = """<!DOCTYPE html>
+PAGE_HOME = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -630,41 +630,20 @@ PAGE = """<!DOCTYPE html>
     <p class="msg" id="sheetMsg"></p>
   </form>
 </div>
-
-<div class="overlay" id="poverlay">
-  <form class="sheet" id="psheet">
-    <h3 id="psTitle">发布项目</h3>
-    <label>名称</label>
-    <input id="p-name" type="text" required maxlength="100" placeholder="例如 天气看板">
-    <label>标识 slug（小写字母 / 数字 / 连字符，定后即网址的一部分）</label>
-    <input id="p-slug" type="text" required maxlength="63" placeholder="例如 weather-board" pattern="[a-z0-9][a-z0-9\-_]*">
-    <label>说明（可选，显示为卡片小字）</label>
-    <input id="p-desc" type="text" maxlength="500">
-    <label id="p-code-label">代码</label>
-    <textarea id="p-code" rows="10" required spellcheck="false" placeholder="把完整代码粘贴到这里"></textarea>
-    <div class="srow">
-      <span style="flex:1"></span>
-      <button id="p-cancel" type="button" class="sbtn ghost">取消</button>
-      <button type="submit" class="sbtn" id="p-submit">发布</button>
-    </div>
-    <p class="msg" id="psheetMsg"></p>
-  </form>
-</div>
-
 <script>
 const $ = id => document.getElementById(id);
 let allLinks = [];
 let editing = false;
 let sheetId = null;
 let regData = {html: [], py: []};
-const PROJCAT = {html: {name: "HTML 项目", file: "index.html", btn: "发布 HTML 项目"},
-                 py: {name: "PY 项目", file: "main.py", btn: "发布 PY 项目"}};
+const PROJCAT = {html: {name: "HTML 项目"}, py: {name: "PY 项目"}};
 const viewMatch = location.pathname.match(/\/(html|py)\/?$/);
 const catKind = viewMatch ? viewMatch[1] : null;
 const basePath = location.pathname.replace(/\/(html|py)\/?$/, "").replace(/\/?$/, "/");
 
 async function api(path, options) {
-  const res = await fetch(path, {credentials: "same-origin", cache: "no-store", ...options});
+  const url = path.startsWith("/") ? path : basePath + path;
+  const res = await fetch(url, {credentials: "same-origin", cache: "no-store", ...options});
   let data = {};
   try { data = await res.json(); } catch (e) {}
   return {status: res.status, data};
@@ -743,9 +722,7 @@ function specialSectionsHtml() {
 function render() {
   const gs = groups();
   const board = $("board");
-  if (catKind) {
-    renderCatPage(board);
-  } else if (!allLinks.length) {
+  if (!allLinks.length) {
     board.innerHTML = specialSectionsHtml() + `<div class="empty">暂无链接。点右上角「编辑」添加第一个。</div>`;
   } else if (!gs.length) {
     board.innerHTML = `<div class="empty">没有匹配的链接。</div>`;
@@ -765,42 +742,11 @@ function render() {
       (editing && !($("q").value.trim()) ? `<button type="button" class="addcard" data-add="${esc(g.cat)}">＋ 添加</button>` : "") +
       `</div>`).join("");
   }
-  board.querySelectorAll("[data-padd]").forEach(el => el.onclick = () => openProjSheet(el.dataset.padd));
   board.querySelectorAll("[data-edit]").forEach(el => el.onclick = () => openSheet(el.dataset.edit));
   board.querySelectorAll("[data-add]").forEach(el => el.onclick = () => openSheet(null, el.dataset.add));
   const cats = [...new Set(allLinks.map(l => (l.category || "").trim()).filter(Boolean))];
   $("catlist").innerHTML = cats.map(c => `<option value="${esc(c)}">`).join("");
   $("foot").textContent = allLinks.length ? `共 ${allLinks.length} 条 · 点卡片打开，编辑是低频操作，收在右上角「编辑」里` : "";
-}
-
-function renderCatPage(board) {
-  const meta = PROJCAT[catKind];
-  const items = regData[catKind] || [];
-  const q = $("q").value.trim().toLowerCase();
-  const filtered = items.filter(p => !q ||
-    (p.name + " " + (p.note || "") + " " + p.slug).toLowerCase().includes(q));
-  let h = `<div class="crumb"><a href="${basePath}">← 返回微书签</a></div>` +
-    `<h2 class="cat" style="font-size:17px;opacity:1;margin-top:10px;">${meta.name}<span class="n">${items.length}</span></h2>` +
-    `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台登记的 Python 脚本项目，点卡片打开运行页（填参数执行）。"}</div>`;
-  if (!editing && !q) {
-    const recent = [...items].filter(p => p.created_at)
-      .sort((a, b) => b.created_at - a.created_at).slice(0, 8);
-    if (recent.length >= 2) {
-      h += `<h2 class="cat">最近添加</h2><div class="grid">` +
-        recent.map(p => projCard(p)).join("") + `</div>`;
-    }
-  }
-  h += `<h2 class="cat">全部项目<span class="n">${filtered.length}</span></h2>`;
-  if (!items.length) {
-    h += `<div class="empty">本类暂无项目。用下方「添加项目」发布第一个。</div>`;
-  } else if (!filtered.length) {
-    h += `<div class="empty">没有匹配的项目。</div>`;
-  } else {
-    h += `<div class="grid">` + filtered.map(p => projCard(p)).join("") + `</div>`;
-  }
-  if (!q) h += `<button type="button" class="addcard" style="display:flex;width:100%;margin-top:12px;" data-padd="${catKind}">＋ 添加项目</button>`;
-  board.innerHTML = h;
-  $("foot").textContent = `共 ${items.length} 个${meta.name} · 由平台项目登记驱动，登记增减自动同步`;
 }
 
 async function loadLinks() {
@@ -812,33 +758,6 @@ async function loadLinks() {
   if (catKind) document.title = PROJCAT[catKind].name + " · 微书签";
   render();
 }
-
-function openProjSheet(kind) {
-  const meta = PROJCAT[kind];
-  $("psTitle").textContent = meta.btn;
-  $("p-name").value = ""; $("p-slug").value = ""; $("p-desc").value = ""; $("p-code").value = "";
-  $("p-code-label").textContent = kind === "html" ? "HTML 代码（将保存为 index.html）" : "Python 代码（将保存为 main.py）";
-  $("p-code").placeholder = kind === "html" ? "粘贴完整的 HTML 代码（单个文件）" : "粘贴完整的 Python 脚本代码（单个文件）";
-  $("p-submit").textContent = meta.btn;
-  $("psheetMsg").textContent = "";
-  $("psheet").dataset.kind = kind;
-  $("poverlay").classList.add("show");
-  setTimeout(() => $("p-name").focus(), 30);
-}
-function closeProjSheet() { $("poverlay").classList.remove("show"); }
-$("p-cancel").onclick = closeProjSheet;
-$("poverlay").addEventListener("click", e => { if (e.target === $("poverlay")) closeProjSheet(); });
-$("psheet").onsubmit = async (e) => {
-  e.preventDefault();
-  const kind = $("psheet").dataset.kind;
-  const body = {name: $("p-name").value, slug: $("p-slug").value,
-                description: $("p-desc").value, code: $("p-code").value};
-  $("psheetMsg").textContent = "正在登记到平台…";
-  const {status, data} = await post("api/projects/" + kind, body);
-  if (status !== 200) { $("psheetMsg").innerHTML = `<span class="err">${esc(data.message || "发布失败")}</span>`; return; }
-  closeProjSheet();
-  await loadLinks();
-};
 
 function openSheet(id, presetCat) {
   const l = id ? allLinks.find(x => x.id === id) : null;
@@ -885,7 +804,7 @@ $("editToggle").onclick = () => {
 $("q").addEventListener("input", render);
 
 $("expBtn").onclick = async () => {
-  const r = await fetch("api/links/export");
+  const r = await fetch(basePath + "api/links/export");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(await r.blob());
   a.download = "links-backup.json";
@@ -896,7 +815,7 @@ $("impFile").addEventListener("change", async (e) => {
   if (!f) return;
   try {
     const payload = JSON.parse(await f.text());
-    const r = await fetch("api/links/import", {method: "POST",
+    const r = await fetch(basePath + "api/links/import", {method: "POST",
       headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
     const d = await r.json();
     if (!d.ok) throw new Error(d.message || "导入失败");
@@ -908,13 +827,764 @@ $("impFile").addEventListener("change", async (e) => {
 
 (async () => {
   const {data} = await api("api/session");
-  if (!data.authenticated) { $("gate-note").style.display = "block"; return; }
+  if (!data.authenticated) {
+    if (!sessionStorage.getItem("gateRetried")) { sessionStorage.setItem("gateRetried", "1"); location.reload(); return; }
+    $("gate-note").style.display = "block"; return;
+  }
+  sessionStorage.removeItem("gateRetried");
   await loadLinks();
+  if (window.__afterLoad) window.__afterLoad();
 })();
 </script>
 </body>
 </html>
 """
+
+PAGE_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>微书签</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0 auto; max-width: 880px; padding: 0 14px 56px; line-height: 1.5;
+         -webkit-tap-highlight-color: transparent; }
+  header { position: sticky; top: 0; z-index: 20; display: flex; gap: 8px; align-items: center;
+           padding: 12px 2px 10px;
+           background: color-mix(in srgb, Canvas 88%, transparent);
+           backdrop-filter: blur(8px); }
+  header h1 { font-size: 19px; margin: 0; white-space: nowrap; }
+  #q { flex: 1; min-width: 0; padding: 9px 12px; border-radius: 999px; font-size: 15px;
+       border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+       background: transparent; color: inherit; outline: none; }
+  #q:focus { border-color: #2f6fd0; }
+  .tbtn { padding: 8px 14px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+          background: transparent; color: inherit; font-size: 14px; cursor: pointer; white-space: nowrap; }
+  .tbtn.on { background: #2f6fd0; border-color: #2f6fd0; color: #fff; }
+  .hintbar { display: none; font-size: 13px; opacity: .65; padding: 2px 2px 8px; }
+  body.editing .hintbar { display: block; }
+  .editbar { display: none; gap: 8px; align-items: center; padding: 0 2px 10px; flex-wrap: wrap; }
+  body.editing .editbar { display: flex; }
+  #impMsg { font-size: 12px; opacity: .75; }
+  h2.cat { font-size: 14px; margin: 20px 2px 10px; opacity: .75; font-weight: 600;
+           display: flex; align-items: baseline; gap: 8px; }
+  h2.cat .n { font-size: 12px; opacity: .6; font-weight: 400; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px 8px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: repeat(4, 1fr); } }
+  .card { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0;
+          padding: 12px 4px 10px; border-radius: 16px;
+          border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
+          background: color-mix(in srgb, currentColor 4%, transparent);
+          text-decoration: none; color: inherit; position: relative;
+          transition: transform .05s ease; }
+  .card:active { transform: scale(.97); }
+  .tile { flex: 0 0 auto; width: 52px; height: 52px; border-radius: 14px; color: #fff;
+          display: flex; align-items: center; justify-content: center; overflow: hidden;
+          font-size: 22px; font-weight: 700; background: hsl(var(--h, 210) 52% 44%); }
+  .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .meta { width: 100%; min-width: 0; text-align: center; }
+  .name { display: block; min-width: 0; font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub2 { display: block; font-size: 11px; height: 15px; line-height: 15px; opacity: .55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .date2 { display: block; font-size: 10px; height: 13px; line-height: 13px; opacity: .45; }
+  body.editing .card { border-style: dashed; cursor: pointer; }
+  body.editing .card::after { content: "编辑"; position: absolute; top: 6px; right: 8px;
+          font-size: 11px; opacity: .55; }
+  .addcard { display: none; flex-direction: column; align-items: center; justify-content: center; gap: 6px; min-height: 118px;
+          border-radius: 16px; border: 1.5px dashed color-mix(in srgb, currentColor 30%, transparent);
+          font-size: 14px; opacity: .75; cursor: pointer; background: transparent; color: inherit; }
+  body.editing .addcard { display: flex; }
+  .empty { opacity: .55; font-size: 14px; padding: 26px 2px; }
+  .sheet textarea { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 13px;
+           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+           background: transparent; color: inherit; outline: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .sheet textarea:focus { border-color: #2f6fd0; }
+  .crumb { font-size: 13px; padding: 2px 2px 0; }
+  .crumb a { color: #2f6fd0; text-decoration: none; }
+  .intro { font-size: 13px; opacity: .65; padding: 4px 2px 0; }
+  body:not(.editing) .delcard { display: none !important; }
+  footer { margin-top: 30px; font-size: 12px; opacity: .45; padding: 0 2px; }
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.48); z-index: 50;
+             display: none; align-items: flex-end; justify-content: center; }
+  .overlay.show { display: flex; }
+  .sheet { background: Canvas; color: CanvasText; width: 100%; max-width: 520px;
+           border-radius: 18px 18px 0 0; padding: 18px 18px 22px; }
+  @media (min-width: 640px) { .overlay { align-items: center; } .sheet { border-radius: 18px; } }
+  .sheet h3 { margin: 0 0 6px; font-size: 16px; }
+  .sheet label { display: block; font-size: 13px; margin: 12px 0 4px; opacity: .8; }
+  .sheet input { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 15px;
+           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+           background: transparent; color: inherit; outline: none; }
+  .sheet input:focus { border-color: #2f6fd0; }
+  .srow { display: flex; gap: 8px; margin-top: 18px; align-items: center; }
+  .sbtn { padding: 10px 18px; border-radius: 10px; border: 0; background: #2f6fd0; color: #fff;
+          font-size: 14px; cursor: pointer; }
+  .sbtn.ghost { background: transparent; color: inherit;
+          border: 1px solid color-mix(in srgb, currentColor 28%, transparent); }
+  .sbtn.danger { background: transparent; color: #dc2626;
+          border: 1px solid color-mix(in srgb, #dc2626 45%, transparent); }
+  .msg { min-height: 18px; font-size: 13px; margin-top: 8px; }
+  .err { color: #dc2626; }
+  #gate-note { display: none; padding: 40px 6px; font-size: 15px; opacity: .75; }
+</style>
+</head>
+<body>
+<header>
+  <h1>微书签</h1>
+  <input id="q" type="search" placeholder="搜索链接…" autocomplete="off">
+  <button id="editToggle" class="tbtn" type="button">编辑</button>
+</header>
+<div class="hintbar">编辑模式：点任意卡片修改，点虚线框添加新链接；打开链接请先退出编辑模式。</div>
+<div class="editbar">
+  <button id="expBtn" class="tbtn" type="button">导出备份</button>
+  <label class="tbtn" for="impFile" style="cursor:pointer">导入备份</label>
+  <input id="impFile" type="file" accept=".json,application/json" hidden>
+  <span id="impMsg"></span>
+</div>
+<main id="board"></main>
+<style>
+  #pubwrap { margin-top: 6px; }
+  .pubform label { display: block; font-size: 13px; margin: 12px 0 4px; opacity: .8; }
+  .pubform input { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 15px;
+           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+           background: transparent; color: inherit; outline: none; }
+  .pubform input:focus { border-color: #2f6fd0; }
+  .pubform textarea { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 13px;
+           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+           background: transparent; color: inherit; outline: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .pubform textarea:focus { border-color: #2f6fd0; }
+</style>
+<section id="pubwrap" hidden>
+  <h2 class="cat" style="font-size:17px;opacity:1;">发布 HTML 项目</h2>
+  <form id="pubform" class="pubform">
+    <label>名称</label>
+    <input id="pf-name" type="text" required maxlength="100" placeholder="例如 天气看板">
+    <label>标识 slug（小写字母 / 数字 / 连字符，定后即网址的一部分）</label>
+    <input id="pf-slug" type="text" required maxlength="63" placeholder="例如 weather-board" pattern="[a-z0-9][a-z0-9\-_]*">
+    <label>说明（可选，显示为卡片小字）</label>
+    <input id="pf-desc" type="text" maxlength="500">
+    <label>HTML 代码（将保存为 index.html）</label>
+    <textarea id="pf-code" rows="10" required spellcheck="false" placeholder="粘贴完整的 HTML 代码（单个文件）"></textarea>
+    <div class="srow">
+      <span style="flex:1"></span>
+      <button type="submit" class="sbtn">发布</button>
+    </div>
+    <p class="msg" id="pf-msg"></p>
+  </form>
+</section>
+<div id="gate-note">这个页面由平台统一验证。请从控制台进入，或完成平台验证后刷新本页。</div>
+<footer id="foot"></footer>
+
+<div class="overlay" id="overlay">
+  <form class="sheet" id="sheet">
+    <h3 id="sheetTitle">添加链接</h3>
+    <label>名称</label>
+    <input id="s-name" type="text" required maxlength="80" placeholder="例如 OpenCode">
+    <label>链接</label>
+    <input id="s-url" type="url" required maxlength="2048" placeholder="https://…">
+    <label>备注（可选）</label>
+    <input id="s-note" type="text" maxlength="200">
+    <label>分类（可选）</label>
+    <input id="s-cat" type="text" maxlength="40" list="catlist" placeholder="例如 平台 / 工具 / 记录">
+    <datalist id="catlist"></datalist>
+    <div class="srow">
+      <button id="s-del" type="button" class="sbtn danger" hidden>删除</button>
+      <span style="flex:1"></span>
+      <button id="s-cancel" type="button" class="sbtn ghost">取消</button>
+      <button type="submit" class="sbtn">保存</button>
+    </div>
+    <p class="msg" id="sheetMsg"></p>
+  </form>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let allLinks = [];
+let editing = false;
+let sheetId = null;
+let regData = {html: [], py: []};
+const PROJCAT = {html: {name: "HTML 项目"}, py: {name: "PY 项目"}};
+const viewMatch = location.pathname.match(/\/(html|py)\/?$/);
+const catKind = viewMatch ? viewMatch[1] : null;
+const basePath = location.pathname.replace(/\/(html|py)\/?$/, "").replace(/\/?$/, "/");
+
+async function api(path, options) {
+  const url = path.startsWith("/") ? path : basePath + path;
+  const res = await fetch(url, {credentials: "same-origin", cache: "no-store", ...options});
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  return {status: res.status, data};
+}
+const post = (path, body) => api(path, {method: "POST",
+  headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
+function hueOf(s) { let h = 0; for (const ch of s) h = (h * 31 + ch.codePointAt(0)) % 360; return h; }
+function hostOf(u) { try { return new URL(u).host; } catch (e) { return u; } }
+
+function groups() {
+  const q = $("q").value.trim().toLowerCase();
+  const filtered = allLinks.filter(l => !q ||
+    (l.name + " " + (l.note || "") + " " + l.url + " " + (l.category || "")).toLowerCase().includes(q));
+  const order = [];
+  const byCat = new Map();
+  for (const l of filtered) {
+    const c = (l.category || "").trim();
+    if (!byCat.has(c)) { byCat.set(c, []); order.push(c); }
+    byCat.get(c).push(l);
+  }
+  order.sort((a, b) => (a === "" ? 1 : 0) - (b === "" ? 1 : 0));
+  return order.map(c => ({cat: c, items: byCat.get(c)}));
+}
+
+function slugOf(u) { const m = String(u || "").match(/\/web\/([a-z0-9\-_]+)\//); return m ? m[1] : null; }
+function tileFallback(img) { const t = img.parentNode; t.textContent = t.dataset.letter || "?"; }
+function dateLabel(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const day = x => x.toDateString();
+  if (day(d) === day(now)) return "今天添加";
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (day(d) === day(y)) return "昨天添加";
+  return (d.getMonth() + 1) + "-" + String(d.getDate()).padStart(2, "0") + " 添加";
+}
+function cardHtml(l, withDate) {
+  const letter = esc(Array.from(l.name || "?")[0] || "?");
+  const sub = esc(l.note || "");
+  const dateHtml = withDate ? `<span class="date2">${esc(dateLabel(l.created_at))}</span>` : "";
+  const slug = slugOf(l.url);
+  const tileInner = slug
+    ? `<img src="/assets/logos/${slug}" alt="" loading="lazy" onerror="tileFallback(this)">`
+    : letter;
+  const inner = `<span class="tile" data-letter="${letter}" style="--h:${hueOf(l.name || "")}">${tileInner}</span>` +
+    `<span class="meta"><span class="name">${esc(l.name)}</span>` +
+    `<span class="sub2">${sub}</span>${dateHtml}</span>`;
+  if (editing) return `<div class="card" data-edit="${l.id}">${inner}</div>`;
+  return `<a class="card" href="${esc(l.url)}" target="_blank" rel="noopener">${inner}</a>`;
+}
+
+function projCard(p) {
+  const letter = esc(Array.from(p.name || "?")[0] || "?");
+  const tileInner = p.kind === "html"
+    ? `<img src="/assets/logos/${p.slug}" alt="" loading="lazy" onerror="tileFallback(this)">`
+    : letter;
+  const inner = `<span class="tile" data-letter="${letter}" style="--h:${hueOf(p.name || "")}">${tileInner}</span>` +
+    `<span class="meta"><span class="name">${esc(p.name)}</span>` +
+    `<span class="sub2">${esc(p.note || "")}</span></span>`;
+  if (editing) return `<a class="card" href="${esc(p.url)}" target="_blank" rel="noopener" title="编辑模式下也能打开">${inner}</a>`;
+  return `<a class="card" href="${esc(p.url)}" target="_blank" rel="noopener">${inner}</a>`;
+}
+function render() {
+  renderCatPage($("board"));
+}
+
+function renderCatPage(board) {
+  const meta = PROJCAT[catKind];
+  const items = regData[catKind] || [];
+  const q = $("q").value.trim().toLowerCase();
+  const filtered = items.filter(p => !q ||
+    (p.name + " " + (p.note || "") + " " + p.slug).toLowerCase().includes(q));
+  let h = `<div class="crumb"><a href="${basePath}">← 返回微书签</a></div>` +
+    `<h2 class="cat" style="font-size:17px;opacity:1;margin-top:10px;">${meta.name}<span class="n">${items.length}</span></h2>` +
+    `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台登记的 Python 脚本项目，点卡片打开运行页（填参数执行）。"}</div>`;
+  if (!editing && !q) {
+    const recent = [...items].filter(p => p.created_at)
+      .sort((a, b) => b.created_at - a.created_at).slice(0, 8);
+    if (recent.length >= 2) {
+      h += `<h2 class="cat">最近添加</h2><div class="grid">` +
+        recent.map(p => projCard(p)).join("") + `</div>`;
+    }
+  }
+  h += `<h2 class="cat">全部项目<span class="n">${filtered.length}</span></h2>`;
+  if (!items.length) {
+    h += `<div class="empty">本类暂无项目。用下方表单发布第一个。</div>`;
+  } else if (!filtered.length) {
+    h += `<div class="empty">没有匹配的项目。</div>`;
+  } else {
+    h += `<div class="grid">` + filtered.map(p => projCard(p)).join("") + `</div>`;
+  }
+  board.innerHTML = h;
+  $("foot").textContent = `共 ${items.length} 个${meta.name} · 由平台项目登记驱动，登记增减自动同步`;
+}
+
+async function loadLinks() {
+  const {status, data} = await api("api/links");
+  if (status !== 200) { $("board").innerHTML = `<div class="empty">加载失败，请刷新重试。</div>`; return; }
+  allLinks = data.links || [];
+  const pr = await api("api/projects");
+  if (pr.status === 200 && pr.data.projects) regData = pr.data.projects;
+  if (catKind) document.title = PROJCAT[catKind].name + " · 微书签";
+  render();
+}
+
+function openSheet(id, presetCat) {
+  const l = id ? allLinks.find(x => x.id === id) : null;
+  sheetId = id || null;
+  $("sheetTitle").textContent = l ? "编辑链接" : "添加链接";
+  $("s-name").value = l ? l.name : "";
+  $("s-url").value = l ? l.url : "";
+  $("s-note").value = l ? (l.note || "") : "";
+  $("s-cat").value = l ? (l.category || "") : (presetCat || "");
+  $("s-del").hidden = !l;
+  $("sheetMsg").textContent = "";
+  $("overlay").classList.add("show");
+  setTimeout(() => $("s-name").focus(), 30);
+}
+function closeSheet() { $("overlay").classList.remove("show"); }
+$("s-cancel").onclick = closeSheet;
+$("overlay").addEventListener("click", e => { if (e.target === $("overlay")) closeSheet(); });
+
+$("sheet").onsubmit = async (e) => {
+  e.preventDefault();
+  const body = {name: $("s-name").value, url: $("s-url").value,
+                note: $("s-note").value, category: $("s-cat").value};
+  const path = sheetId ? "api/links/" + sheetId : "api/links";
+  const {status, data} = await post(path, body);
+  if (status !== 200) { $("sheetMsg").innerHTML = `<span class="err">${esc(data.message || "保存失败")}</span>`; return; }
+  closeSheet();
+  await loadLinks();
+};
+$("s-del").onclick = async () => {
+  if (!sheetId || !confirm("删除这条链接？")) return;
+  const {status, data} = await api("api/links/" + sheetId, {method: "DELETE"});
+  if (status !== 200) { $("sheetMsg").innerHTML = `<span class="err">${esc(data.message || "删除失败")}</span>`; return; }
+  closeSheet();
+  await loadLinks();
+};
+
+$("editToggle").onclick = () => {
+  editing = !editing;
+  document.body.classList.toggle("editing", editing);
+  $("editToggle").textContent = editing ? "完成" : "编辑";
+  $("editToggle").classList.toggle("on", editing);
+  render();
+};
+$("q").addEventListener("input", render);
+
+$("expBtn").onclick = async () => {
+  const r = await fetch(basePath + "api/links/export");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(await r.blob());
+  a.download = "links-backup.json";
+  document.body.appendChild(a); a.click(); a.remove();
+};
+$("impFile").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    const payload = JSON.parse(await f.text());
+    const r = await fetch(basePath + "api/links/import", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.message || "导入失败");
+    $("impMsg").textContent = `导入完成：新增 ${d.added}，跳过 ${d.skipped}（按网址去重）`;
+    await loadLinks();
+  } catch (err) { $("impMsg").textContent = "导入失败：" + err.message; }
+  e.target.value = "";
+});
+
+$("pubform").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = {name: $("pf-name").value, slug: $("pf-slug").value,
+                description: $("pf-desc").value, code: $("pf-code").value};
+  $("pf-msg").textContent = "正在登记到平台…";
+  const {status, data} = await post("api/projects/" + catKind, body);
+  if (status !== 200) { $("pf-msg").innerHTML = `<span class="err">${esc(data.message || "发布失败")}</span>`; return; }
+  $("pubform").reset();
+  $("pf-msg").textContent = "已发布，列表已刷新。";
+  await loadLinks();
+});
+window.__afterLoad = () => { $("pubwrap").hidden = false; };
+
+(async () => {
+  const {data} = await api("api/session");
+  if (!data.authenticated) {
+    if (!sessionStorage.getItem("gateRetried")) { sessionStorage.setItem("gateRetried", "1"); location.reload(); return; }
+    $("gate-note").style.display = "block"; return;
+  }
+  sessionStorage.removeItem("gateRetried");
+  await loadLinks();
+  if (window.__afterLoad) window.__afterLoad();
+})();
+</script>
+</body>
+</html>
+"""
+
+PAGE_PY = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>微书签</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0 auto; max-width: 880px; padding: 0 14px 56px; line-height: 1.5;
+         -webkit-tap-highlight-color: transparent; }
+  header { position: sticky; top: 0; z-index: 20; display: flex; gap: 8px; align-items: center;
+           padding: 12px 2px 10px;
+           background: color-mix(in srgb, Canvas 88%, transparent);
+           backdrop-filter: blur(8px); }
+  header h1 { font-size: 19px; margin: 0; white-space: nowrap; }
+  #q { flex: 1; min-width: 0; padding: 9px 12px; border-radius: 999px; font-size: 15px;
+       border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+       background: transparent; color: inherit; outline: none; }
+  #q:focus { border-color: #2f6fd0; }
+  .tbtn { padding: 8px 14px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+          background: transparent; color: inherit; font-size: 14px; cursor: pointer; white-space: nowrap; }
+  .tbtn.on { background: #2f6fd0; border-color: #2f6fd0; color: #fff; }
+  .hintbar { display: none; font-size: 13px; opacity: .65; padding: 2px 2px 8px; }
+  body.editing .hintbar { display: block; }
+  .editbar { display: none; gap: 8px; align-items: center; padding: 0 2px 10px; flex-wrap: wrap; }
+  body.editing .editbar { display: flex; }
+  #impMsg { font-size: 12px; opacity: .75; }
+  h2.cat { font-size: 14px; margin: 20px 2px 10px; opacity: .75; font-weight: 600;
+           display: flex; align-items: baseline; gap: 8px; }
+  h2.cat .n { font-size: 12px; opacity: .6; font-weight: 400; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px 8px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: repeat(4, 1fr); } }
+  .card { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0;
+          padding: 12px 4px 10px; border-radius: 16px;
+          border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
+          background: color-mix(in srgb, currentColor 4%, transparent);
+          text-decoration: none; color: inherit; position: relative;
+          transition: transform .05s ease; }
+  .card:active { transform: scale(.97); }
+  .tile { flex: 0 0 auto; width: 52px; height: 52px; border-radius: 14px; color: #fff;
+          display: flex; align-items: center; justify-content: center; overflow: hidden;
+          font-size: 22px; font-weight: 700; background: hsl(var(--h, 210) 52% 44%); }
+  .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .meta { width: 100%; min-width: 0; text-align: center; }
+  .name { display: block; min-width: 0; font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub2 { display: block; font-size: 11px; height: 15px; line-height: 15px; opacity: .55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .date2 { display: block; font-size: 10px; height: 13px; line-height: 13px; opacity: .45; }
+  body.editing .card { border-style: dashed; cursor: pointer; }
+  body.editing .card::after { content: "编辑"; position: absolute; top: 6px; right: 8px;
+          font-size: 11px; opacity: .55; }
+  .addcard { display: none; flex-direction: column; align-items: center; justify-content: center; gap: 6px; min-height: 118px;
+          border-radius: 16px; border: 1.5px dashed color-mix(in srgb, currentColor 30%, transparent);
+          font-size: 14px; opacity: .75; cursor: pointer; background: transparent; color: inherit; }
+  body.editing .addcard { display: flex; }
+  .empty { opacity: .55; font-size: 14px; padding: 26px 2px; }
+  .sheet textarea { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 13px;
+           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+           background: transparent; color: inherit; outline: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .sheet textarea:focus { border-color: #2f6fd0; }
+  .crumb { font-size: 13px; padding: 2px 2px 0; }
+  .crumb a { color: #2f6fd0; text-decoration: none; }
+  .intro { font-size: 13px; opacity: .65; padding: 4px 2px 0; }
+  body:not(.editing) .delcard { display: none !important; }
+  footer { margin-top: 30px; font-size: 12px; opacity: .45; padding: 0 2px; }
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.48); z-index: 50;
+             display: none; align-items: flex-end; justify-content: center; }
+  .overlay.show { display: flex; }
+  .sheet { background: Canvas; color: CanvasText; width: 100%; max-width: 520px;
+           border-radius: 18px 18px 0 0; padding: 18px 18px 22px; }
+  @media (min-width: 640px) { .overlay { align-items: center; } .sheet { border-radius: 18px; } }
+  .sheet h3 { margin: 0 0 6px; font-size: 16px; }
+  .sheet label { display: block; font-size: 13px; margin: 12px 0 4px; opacity: .8; }
+  .sheet input { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 15px;
+           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+           background: transparent; color: inherit; outline: none; }
+  .sheet input:focus { border-color: #2f6fd0; }
+  .srow { display: flex; gap: 8px; margin-top: 18px; align-items: center; }
+  .sbtn { padding: 10px 18px; border-radius: 10px; border: 0; background: #2f6fd0; color: #fff;
+          font-size: 14px; cursor: pointer; }
+  .sbtn.ghost { background: transparent; color: inherit;
+          border: 1px solid color-mix(in srgb, currentColor 28%, transparent); }
+  .sbtn.danger { background: transparent; color: #dc2626;
+          border: 1px solid color-mix(in srgb, #dc2626 45%, transparent); }
+  .msg { min-height: 18px; font-size: 13px; margin-top: 8px; }
+  .err { color: #dc2626; }
+  #gate-note { display: none; padding: 40px 6px; font-size: 15px; opacity: .75; }
+</style>
+</head>
+<body>
+<header>
+  <h1>微书签</h1>
+  <input id="q" type="search" placeholder="搜索链接…" autocomplete="off">
+  <button id="editToggle" class="tbtn" type="button">编辑</button>
+</header>
+<div class="hintbar">编辑模式：点任意卡片修改，点虚线框添加新链接；打开链接请先退出编辑模式。</div>
+<div class="editbar">
+  <button id="expBtn" class="tbtn" type="button">导出备份</button>
+  <label class="tbtn" for="impFile" style="cursor:pointer">导入备份</label>
+  <input id="impFile" type="file" accept=".json,application/json" hidden>
+  <span id="impMsg"></span>
+</div>
+<main id="board"></main>
+<style>
+  #pubwrap { margin-top: 6px; }
+  .pubform label { display: block; font-size: 13px; margin: 12px 0 4px; opacity: .8; }
+  .pubform input { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 15px;
+           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+           background: transparent; color: inherit; outline: none; }
+  .pubform input:focus { border-color: #2f6fd0; }
+  .pubform textarea { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 13px;
+           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+           background: transparent; color: inherit; outline: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .pubform textarea:focus { border-color: #2f6fd0; }
+</style>
+<section id="pubwrap" hidden>
+  <h2 class="cat" style="font-size:17px;opacity:1;">发布 PY 项目</h2>
+  <form id="pubform" class="pubform">
+    <label>名称</label>
+    <input id="pf-name" type="text" required maxlength="100" placeholder="例如 天气看板">
+    <label>标识 slug（小写字母 / 数字 / 连字符，定后即网址的一部分）</label>
+    <input id="pf-slug" type="text" required maxlength="63" placeholder="例如 weather-board" pattern="[a-z0-9][a-z0-9\-_]*">
+    <label>说明（可选，显示为卡片小字）</label>
+    <input id="pf-desc" type="text" maxlength="500">
+    <label>Python 代码（将保存为 main.py）</label>
+    <textarea id="pf-code" rows="10" required spellcheck="false" placeholder="粘贴完整的 Python 脚本代码（单个文件）"></textarea>
+    <div class="srow">
+      <span style="flex:1"></span>
+      <button type="submit" class="sbtn">发布</button>
+    </div>
+    <p class="msg" id="pf-msg"></p>
+  </form>
+</section>
+<div id="gate-note">这个页面由平台统一验证。请从控制台进入，或完成平台验证后刷新本页。</div>
+<footer id="foot"></footer>
+
+<div class="overlay" id="overlay">
+  <form class="sheet" id="sheet">
+    <h3 id="sheetTitle">添加链接</h3>
+    <label>名称</label>
+    <input id="s-name" type="text" required maxlength="80" placeholder="例如 OpenCode">
+    <label>链接</label>
+    <input id="s-url" type="url" required maxlength="2048" placeholder="https://…">
+    <label>备注（可选）</label>
+    <input id="s-note" type="text" maxlength="200">
+    <label>分类（可选）</label>
+    <input id="s-cat" type="text" maxlength="40" list="catlist" placeholder="例如 平台 / 工具 / 记录">
+    <datalist id="catlist"></datalist>
+    <div class="srow">
+      <button id="s-del" type="button" class="sbtn danger" hidden>删除</button>
+      <span style="flex:1"></span>
+      <button id="s-cancel" type="button" class="sbtn ghost">取消</button>
+      <button type="submit" class="sbtn">保存</button>
+    </div>
+    <p class="msg" id="sheetMsg"></p>
+  </form>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let allLinks = [];
+let editing = false;
+let sheetId = null;
+let regData = {html: [], py: []};
+const PROJCAT = {html: {name: "HTML 项目"}, py: {name: "PY 项目"}};
+const viewMatch = location.pathname.match(/\/(html|py)\/?$/);
+const catKind = viewMatch ? viewMatch[1] : null;
+const basePath = location.pathname.replace(/\/(html|py)\/?$/, "").replace(/\/?$/, "/");
+
+async function api(path, options) {
+  const url = path.startsWith("/") ? path : basePath + path;
+  const res = await fetch(url, {credentials: "same-origin", cache: "no-store", ...options});
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  return {status: res.status, data};
+}
+const post = (path, body) => api(path, {method: "POST",
+  headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
+function hueOf(s) { let h = 0; for (const ch of s) h = (h * 31 + ch.codePointAt(0)) % 360; return h; }
+function hostOf(u) { try { return new URL(u).host; } catch (e) { return u; } }
+
+function groups() {
+  const q = $("q").value.trim().toLowerCase();
+  const filtered = allLinks.filter(l => !q ||
+    (l.name + " " + (l.note || "") + " " + l.url + " " + (l.category || "")).toLowerCase().includes(q));
+  const order = [];
+  const byCat = new Map();
+  for (const l of filtered) {
+    const c = (l.category || "").trim();
+    if (!byCat.has(c)) { byCat.set(c, []); order.push(c); }
+    byCat.get(c).push(l);
+  }
+  order.sort((a, b) => (a === "" ? 1 : 0) - (b === "" ? 1 : 0));
+  return order.map(c => ({cat: c, items: byCat.get(c)}));
+}
+
+function slugOf(u) { const m = String(u || "").match(/\/web\/([a-z0-9\-_]+)\//); return m ? m[1] : null; }
+function tileFallback(img) { const t = img.parentNode; t.textContent = t.dataset.letter || "?"; }
+function dateLabel(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const day = x => x.toDateString();
+  if (day(d) === day(now)) return "今天添加";
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (day(d) === day(y)) return "昨天添加";
+  return (d.getMonth() + 1) + "-" + String(d.getDate()).padStart(2, "0") + " 添加";
+}
+function cardHtml(l, withDate) {
+  const letter = esc(Array.from(l.name || "?")[0] || "?");
+  const sub = esc(l.note || "");
+  const dateHtml = withDate ? `<span class="date2">${esc(dateLabel(l.created_at))}</span>` : "";
+  const slug = slugOf(l.url);
+  const tileInner = slug
+    ? `<img src="/assets/logos/${slug}" alt="" loading="lazy" onerror="tileFallback(this)">`
+    : letter;
+  const inner = `<span class="tile" data-letter="${letter}" style="--h:${hueOf(l.name || "")}">${tileInner}</span>` +
+    `<span class="meta"><span class="name">${esc(l.name)}</span>` +
+    `<span class="sub2">${sub}</span>${dateHtml}</span>`;
+  if (editing) return `<div class="card" data-edit="${l.id}">${inner}</div>`;
+  return `<a class="card" href="${esc(l.url)}" target="_blank" rel="noopener">${inner}</a>`;
+}
+
+function projCard(p) {
+  const letter = esc(Array.from(p.name || "?")[0] || "?");
+  const tileInner = p.kind === "html"
+    ? `<img src="/assets/logos/${p.slug}" alt="" loading="lazy" onerror="tileFallback(this)">`
+    : letter;
+  const inner = `<span class="tile" data-letter="${letter}" style="--h:${hueOf(p.name || "")}">${tileInner}</span>` +
+    `<span class="meta"><span class="name">${esc(p.name)}</span>` +
+    `<span class="sub2">${esc(p.note || "")}</span></span>`;
+  if (editing) return `<a class="card" href="${esc(p.url)}" target="_blank" rel="noopener" title="编辑模式下也能打开">${inner}</a>`;
+  return `<a class="card" href="${esc(p.url)}" target="_blank" rel="noopener">${inner}</a>`;
+}
+function render() {
+  renderCatPage($("board"));
+}
+
+function renderCatPage(board) {
+  const meta = PROJCAT[catKind];
+  const items = regData[catKind] || [];
+  const q = $("q").value.trim().toLowerCase();
+  const filtered = items.filter(p => !q ||
+    (p.name + " " + (p.note || "") + " " + p.slug).toLowerCase().includes(q));
+  let h = `<div class="crumb"><a href="${basePath}">← 返回微书签</a></div>` +
+    `<h2 class="cat" style="font-size:17px;opacity:1;margin-top:10px;">${meta.name}<span class="n">${items.length}</span></h2>` +
+    `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台登记的 Python 脚本项目，点卡片打开运行页（填参数执行）。"}</div>`;
+  if (!editing && !q) {
+    const recent = [...items].filter(p => p.created_at)
+      .sort((a, b) => b.created_at - a.created_at).slice(0, 8);
+    if (recent.length >= 2) {
+      h += `<h2 class="cat">最近添加</h2><div class="grid">` +
+        recent.map(p => projCard(p)).join("") + `</div>`;
+    }
+  }
+  h += `<h2 class="cat">全部项目<span class="n">${filtered.length}</span></h2>`;
+  if (!items.length) {
+    h += `<div class="empty">本类暂无项目。用下方表单发布第一个。</div>`;
+  } else if (!filtered.length) {
+    h += `<div class="empty">没有匹配的项目。</div>`;
+  } else {
+    h += `<div class="grid">` + filtered.map(p => projCard(p)).join("") + `</div>`;
+  }
+  board.innerHTML = h;
+  $("foot").textContent = `共 ${items.length} 个${meta.name} · 由平台项目登记驱动，登记增减自动同步`;
+}
+
+async function loadLinks() {
+  const {status, data} = await api("api/links");
+  if (status !== 200) { $("board").innerHTML = `<div class="empty">加载失败，请刷新重试。</div>`; return; }
+  allLinks = data.links || [];
+  const pr = await api("api/projects");
+  if (pr.status === 200 && pr.data.projects) regData = pr.data.projects;
+  if (catKind) document.title = PROJCAT[catKind].name + " · 微书签";
+  render();
+}
+
+function openSheet(id, presetCat) {
+  const l = id ? allLinks.find(x => x.id === id) : null;
+  sheetId = id || null;
+  $("sheetTitle").textContent = l ? "编辑链接" : "添加链接";
+  $("s-name").value = l ? l.name : "";
+  $("s-url").value = l ? l.url : "";
+  $("s-note").value = l ? (l.note || "") : "";
+  $("s-cat").value = l ? (l.category || "") : (presetCat || "");
+  $("s-del").hidden = !l;
+  $("sheetMsg").textContent = "";
+  $("overlay").classList.add("show");
+  setTimeout(() => $("s-name").focus(), 30);
+}
+function closeSheet() { $("overlay").classList.remove("show"); }
+$("s-cancel").onclick = closeSheet;
+$("overlay").addEventListener("click", e => { if (e.target === $("overlay")) closeSheet(); });
+
+$("sheet").onsubmit = async (e) => {
+  e.preventDefault();
+  const body = {name: $("s-name").value, url: $("s-url").value,
+                note: $("s-note").value, category: $("s-cat").value};
+  const path = sheetId ? "api/links/" + sheetId : "api/links";
+  const {status, data} = await post(path, body);
+  if (status !== 200) { $("sheetMsg").innerHTML = `<span class="err">${esc(data.message || "保存失败")}</span>`; return; }
+  closeSheet();
+  await loadLinks();
+};
+$("s-del").onclick = async () => {
+  if (!sheetId || !confirm("删除这条链接？")) return;
+  const {status, data} = await api("api/links/" + sheetId, {method: "DELETE"});
+  if (status !== 200) { $("sheetMsg").innerHTML = `<span class="err">${esc(data.message || "删除失败")}</span>`; return; }
+  closeSheet();
+  await loadLinks();
+};
+
+$("editToggle").onclick = () => {
+  editing = !editing;
+  document.body.classList.toggle("editing", editing);
+  $("editToggle").textContent = editing ? "完成" : "编辑";
+  $("editToggle").classList.toggle("on", editing);
+  render();
+};
+$("q").addEventListener("input", render);
+
+$("expBtn").onclick = async () => {
+  const r = await fetch(basePath + "api/links/export");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(await r.blob());
+  a.download = "links-backup.json";
+  document.body.appendChild(a); a.click(); a.remove();
+};
+$("impFile").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    const payload = JSON.parse(await f.text());
+    const r = await fetch(basePath + "api/links/import", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.message || "导入失败");
+    $("impMsg").textContent = `导入完成：新增 ${d.added}，跳过 ${d.skipped}（按网址去重）`;
+    await loadLinks();
+  } catch (err) { $("impMsg").textContent = "导入失败：" + err.message; }
+  e.target.value = "";
+});
+
+$("pubform").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = {name: $("pf-name").value, slug: $("pf-slug").value,
+                description: $("pf-desc").value, code: $("pf-code").value};
+  $("pf-msg").textContent = "正在登记到平台…";
+  const {status, data} = await post("api/projects/" + catKind, body);
+  if (status !== 200) { $("pf-msg").innerHTML = `<span class="err">${esc(data.message || "发布失败")}</span>`; return; }
+  $("pubform").reset();
+  $("pf-msg").textContent = "已发布，列表已刷新。";
+  await loadLinks();
+});
+window.__afterLoad = () => { $("pubwrap").hidden = false; };
+
+(async () => {
+  const {data} = await api("api/session");
+  if (!data.authenticated) {
+    if (!sessionStorage.getItem("gateRetried")) { sessionStorage.setItem("gateRetried", "1"); location.reload(); return; }
+    $("gate-note").style.display = "block"; return;
+  }
+  sessionStorage.removeItem("gateRetried");
+  await loadLinks();
+  if (window.__afterLoad) window.__afterLoad();
+})();
+</script>
+</body>
+</html>
+"""
+
+PAGES = {None: PAGE_HOME, "html": PAGE_HTML, "py": PAGE_PY}
 
 # ---------------------------------------------------------------- router
 
@@ -968,7 +1638,12 @@ def application(environ, start_response):
             return _json(start_response, "404 Not Found",
                          {"ok": False, "error": "not_found", "message": "接口不存在。"})
         if path in ("/", "/html", "/html/", "/py", "/py/") and method == "GET":
-            body = PAGE.encode("utf-8")
+            kind = None
+            if path.startswith("/html"):
+                kind = "html"
+            elif path.startswith("/py"):
+                kind = "py"
+            body = PAGES[kind].encode("utf-8")
             start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
                                       ("Content-Length", str(len(body))),
                                       ("Cache-Control", "no-store")])
