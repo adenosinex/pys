@@ -152,9 +152,18 @@ def _public_source(src):
             (_node_detail(e) for e in nodes.values()),
             key=lambda d: (_DETAIL_ORDER.get(d["status"], 9),
                            -(d["speed_mbps"] or 0))),
-        "test_state": (dict(_test_state) if _test_state.get("source_id") == src["id"]
-                       else None),
+        "test_state": _source_test_state(src),
     }
+
+
+def _source_test_state(src):
+    if _test_state.get("source_id") == src["id"]:
+        return dict(_test_state)
+    if any(j["source_id"] == src["id"] for j in _test_queue):
+        return {"running": False, "queued": True, "source_id": src["id"],
+                "done": 0, "total": 0,
+                "message": "测试已排队，等待前面的测试完成…"}
+    return None
 
 
 # ---------------------------------------------------------------- core
@@ -634,7 +643,15 @@ BIN_DIR = os.path.join(DATA_DIR, "bin")
 SCRATCH_DIR = os.path.join(DATA_DIR, ".test-scratch")
 
 _test_state = {"running": False, "source_id": None, "done": 0,
-               "total": 0, "started_at": None, "message": ""}
+               "total": 0, "started_at": None, "message": "",
+               "trigger": None, "queued": 0, "last_run": None}
+
+# Pending test jobs, consumed one at a time by _chain_worker so that
+# sources.json keeps exactly one writer thread no matter which trigger
+# (manual button / auto-add / daily timer) asked for the run.
+_test_queue = []
+_test_lock = threading.Lock()
+RUNS_LOG = os.path.join(DATA_DIR, "test_runs.jsonl")
 
 
 def ensure_mihomo():
@@ -759,6 +776,7 @@ def test_node(mihomo, node):
         if len(parts) == 2:
             try:
                 size, secs = float(parts[0]), float(parts[1])
+                result["dl_bytes"] = int(size)
                 if size >= 200000 and secs > 0:
                     result["speed_mbps"] = round(size * 8 / secs / 1_000_000, 2)
             except ValueError:
@@ -792,23 +810,53 @@ def _needs_test(entry, force):
     return True
 
 
-def _test_worker(source_id, force):
+def _record_run(rec):
+    try:
+        with open(RUNS_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _recent_runs(limit=8):
+    try:
+        with open(RUNS_LOG, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines[-limit:]:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def _run_source_tests(source_id, force):
+    """Run the whole test pipeline for one source (per-node probes,
+    Scamalytics backfill, output rebuild) and return a run summary.
+    The caller (_chain_worker) owns the running flag and the run log,
+    so this function must not touch them."""
+    summary = {"planned": 0, "tested": 0, "ok": 0, "traffic_bytes": 0,
+               "label": "", "message": ""}
     try:
         mihomo = ensure_mihomo()
     except Exception as exc:
-        _test_state.update({"running": False, "message": "mihomo 准备失败：%s" % str(exc)[:120]})
-        return
+        summary["message"] = "mihomo 准备失败：%s" % str(exc)[:120]
+        return summary
     with _lock:
         store = _load_store()
         src = _find_source(store, source_id)
     if src is None:
-        _test_state.update({"running": False, "message": "订阅源不存在。"})
-        return
+        summary["message"] = "订阅源不存在。"
+        return summary
+    summary["label"] = src.get("label") or src.get("host") or ""
     try:
         proxies, _headers = fetch_subscription(src["url"])
     except Exception as exc:
-        _test_state.update({"running": False, "message": "拉取订阅失败：%s" % str(exc)[:120]})
-        return
+        summary["message"] = "拉取订阅失败：%s" % str(exc)[:120]
+        return summary
     kept, _info, _di, _dd = filter_nodes(proxies)
     node_by_fp = dict(kept)
     with _lock:
@@ -817,9 +865,14 @@ def _test_worker(source_id, force):
         registry = (src_now or {}).get("nodes") or {}
     work = [fp for fp in node_by_fp if _needs_test(registry.get(fp) or {}, force)]
     _test_state.update({"total": len(work), "done": 0})
+    summary["planned"] = len(work)
     for fp in work:
         node = node_by_fp[fp]
         res = test_node(mihomo, node)
+        summary["traffic_bytes"] += res.pop("dl_bytes", 0) or 0
+        summary["tested"] += 1
+        if res.get("ok"):
+            summary["ok"] += 1
         with _lock:
             store = _load_store()
             src_now = _find_source(store, source_id)
@@ -881,20 +934,138 @@ def _test_worker(source_id, force):
             except Exception as exc:
                 src_now["last_error"] = str(exc)[:200]
             _save_store(store)
-    _test_state.update({"running": False,
-                        "message": "测试完成：%d 个节点。" % _test_state["done"]})
+    summary["message"] = "测试完成：%d 个节点。" % summary["tested"]
+    return summary
 
 
-def start_tests(source_id, force=False):
-    if _test_state["running"]:
-        return dict(_test_state)
-    _test_state.update({"running": True, "source_id": source_id, "done": 0,
-                        "total": 0, "started_at": time.time(), "message": ""})
-    thread = threading.Thread(target=_test_worker, args=(source_id, force),
-                              daemon=True)
-    thread.start()
-    return dict(_test_state)
+def _chain_worker():
+    """Single consumer of the test queue: runs queued jobs strictly
+    one at a time (sources.json has exactly one writer thread) and
+    appends one metrics record per finished source run."""
+    while True:
+        with _test_lock:
+            if not _test_queue:
+                _test_state.update({"running": False, "queued": 0})
+                return
+            job = _test_queue.pop(0)
+            _test_state.update({"running": True,
+                                "source_id": job["source_id"], "done": 0,
+                                "total": 0, "started_at": time.time(),
+                                "message": "", "trigger": job["trigger"],
+                                "queued": len(_test_queue)})
+        started = time.time()
+        try:
+            summary = _run_source_tests(job["source_id"], job["force"])
+        except Exception as exc:  # a broken run must never wedge the queue
+            summary = {"planned": 0, "tested": 0, "ok": 0,
+                       "traffic_bytes": 0, "label": "",
+                       "message": "测试异常：%s" % str(exc)[:120]}
+        finished = time.time()
+        _record_run({"trigger": job["trigger"],
+                     "source_id": job["source_id"],
+                     "label": summary.get("label") or "",
+                     "started_at": started, "finished_at": finished,
+                     "duration_s": round(finished - started, 1),
+                     "planned": summary["planned"],
+                     "tested": summary["tested"], "ok": summary["ok"],
+                     "est_bytes": summary["traffic_bytes"],
+                     "message": summary["message"]})
+        with _test_lock:
+            _test_state.update({
+                "message": summary["message"],
+                "last_run": {"trigger": job["trigger"],
+                             "source_id": job["source_id"],
+                             "label": summary.get("label") or "",
+                             "tested": summary["tested"],
+                             "ok": summary["ok"],
+                             "duration_s": round(finished - started, 1),
+                             "est_bytes": summary["traffic_bytes"],
+                             "finished_at": finished}})
 
+
+def start_tests(source_id, force=False, trigger="manual"):
+    """Enqueue one source's test run. Triggers: the page button
+    ("manual"), a freshly added source ("auto-add") and the daily
+    timer ("daily"). A source that is already running or queued is
+    folded into the existing job; the returned state says so via
+    "enqueued": False."""
+    with _test_lock:
+        busy = (_test_state.get("running")
+                and _test_state.get("source_id") == source_id)
+        queued = any(j["source_id"] == source_id for j in _test_queue)
+        if busy or queued:
+            state = dict(_test_state)
+            state["enqueued"] = False
+            state["queued"] = len(_test_queue)
+            return state
+        _test_queue.append({"source_id": source_id, "force": bool(force),
+                            "trigger": trigger})
+        spawn = not _test_state.get("running")
+        if spawn:
+            _test_state.update({"running": True, "source_id": source_id,
+                                "done": 0, "total": 0,
+                                "started_at": time.time(), "message": "",
+                                "trigger": trigger,
+                                "queued": len(_test_queue) - 1})
+        else:
+            _test_state["queued"] = len(_test_queue)
+        state = dict(_test_state)
+        state["enqueued"] = True
+    if spawn:
+        thread = threading.Thread(target=_chain_worker, daemon=True)
+        thread.start()
+    return state
+
+
+
+def _register_source(store, url, label):
+    """The one add-source pipeline, shared by the paste-add endpoint
+    and the link-file import: build the record, fetch + convert,
+    persist, and auto-test a successfully converted source. The
+    caller holds _lock. A failed first fetch still registers the
+    source with last_error set — exactly what the paste-add path has
+    always done — and the caller decides how to report it."""
+    parsed = urlparse(url)
+    src = {"id": secrets.token_hex(4), "label": label, "url": url,
+           "host": parsed.hostname, "token": secrets.token_hex(12),
+           "created": time.time(), "updated": None, "nodes": {},
+           "node_count": 0, "last_error": None}
+    try:
+        refresh_source(src)
+    except Exception as exc:
+        src["last_error"] = str(exc)[:200]
+        src["updated"] = time.time()
+    store["sources"].append(src)
+    _save_store(store)
+    state = None
+    if not src["last_error"]:
+        state = start_tests(src["id"], force=False, trigger="auto-add")
+    return src, state
+
+
+_URL_RE = re.compile(r"https?://[^\s<>\"'\)\]）】」]+")
+_URL_TRAIL = ",.;，。；：、!！?？*\"'"
+
+
+def _extract_urls(text):
+    """Extract subscription URLs from imported file text: every line
+    is regex-scanned (a bare-URL line and a URL embedded in prose are
+    both caught), hits are de-duplicated in first-seen order with
+    trailing prose punctuation trimmed. Returns (urls, junk_lines),
+    where junk_lines counts non-empty lines that yielded no URL."""
+    urls, seen, junk = [], set(), 0
+    for line in text.splitlines():
+        found = _URL_RE.findall(line)
+        if not found:
+            if line.strip():
+                junk += 1
+            continue
+        for u in found:
+            u = u.rstrip(_URL_TRAIL)
+            if u and u not in seen:
+                seen.add(u)
+                urls.append(u)
+    return urls, junk
 
 
 # ---------------------------------------------------------------- http
@@ -918,6 +1089,19 @@ def _read_json(environ, limit=65536):
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _is_loopback_direct(environ):
+    """True only for a direct call from the box itself: the peer is
+    loopback AND the request carries no proxy forwarding headers
+    (requests arriving via the panel /web proxy are also loopback at
+    the TCP level, but the panel stamps X-Forwarded-For / X-Hub-Passed
+    on them, so they are told apart here)."""
+    if (environ.get("REMOTE_ADDR") or "") not in ("127.0.0.1", "::1"):
+        return False
+    if environ.get("HTTP_X_FORWARDED_FOR") or environ.get("HTTP_X_HUB_PASSED"):
+        return False
+    return True
 
 
 def _auto_refresh_stale(store):
@@ -955,7 +1139,9 @@ def application(environ, start_response):
             store = _load_store()
             _auto_refresh_stale(store)
             return _json(start_response, "200 OK",
-                         {"ok": True, "sources": [_public_source(s) for s in store["sources"]]})
+                         {"ok": True,
+                          "sources": [_public_source(s) for s in store["sources"]],
+                          "recent_runs": _recent_runs(5)})
 
     if path == "/api/sources" and method == "POST":
         data = _read_json(environ)
@@ -967,18 +1153,69 @@ def application(environ, start_response):
                          {"ok": False, "error": "bad_url", "message": "请填写完整的 http(s) 订阅链接。"})
         with _lock:
             store = _load_store()
-            src = {"id": secrets.token_hex(4), "label": label, "url": url,
-                   "host": parsed.hostname, "token": secrets.token_hex(12),
-                   "created": time.time(), "updated": None, "nodes": {},
-                   "node_count": 0, "last_error": None}
-            try:
-                refresh_source(src)
-            except Exception as exc:
-                src["last_error"] = str(exc)[:200]
-                src["updated"] = time.time()
-            store["sources"].append(src)
-            _save_store(store)
-            return _json(start_response, "200 OK", {"ok": True, "source": _public_source(src)})
+            src, state = _register_source(store, url, label)
+            return _json(start_response, "200 OK",
+                         {"ok": True, "source": _public_source(src),
+                          "test_state": state})
+
+    if path == "/api/sources/import" and method == "POST":
+        # Link-file import: the page sends the picked file as base64;
+        # decoding (with a visible mojibake warning) and URL parsing
+        # happen here. Each link then goes through the exact paste-add
+        # pipeline; URLs already registered are skipped and reported
+        # with their existing converted link.
+        data = _read_json(environ, limit=4 * 1024 * 1024)
+        try:
+            raw = base64.b64decode(str(data.get("content_b64") or ""),
+                                   validate=True)
+        except Exception:
+            raw = None
+        if raw is None:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False, "error": "bad_file",
+                          "message": "文件内容读取失败，请重新选择文件。"})
+        if len(raw) > 2 * 1024 * 1024:
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False, "error": "too_large",
+                          "message": "文件超过 2 MB 上限。"})
+        text = raw.decode("utf-8", errors="replace")
+        decode_warning = "�" in text
+        urls, junk = _extract_urls(text)
+        items = []
+        added = duplicates = failed = 0
+        with _lock:
+            store = _load_store()
+            by_url = {s["url"]: s for s in store["sources"]}
+            for u in urls:
+                host = urlparse(u).hostname or ""
+                if u in by_url:
+                    old = by_url[u]
+                    duplicates += 1
+                    items.append({
+                        "status": "duplicate", "host": host,
+                        "label": old.get("label") or old.get("host") or "",
+                        "link": "%s/sub/conv/%s.yaml" % (PUBLIC_BASE,
+                                                         old["token"])})
+                    continue
+                src, _state = _register_source(store, u, "")
+                by_url[u] = src
+                if src["last_error"]:
+                    failed += 1
+                    items.append({"status": "failed", "host": host,
+                                  "label": src.get("label") or host,
+                                  "error": src["last_error"]})
+                else:
+                    added += 1
+                    items.append({
+                        "status": "added", "host": host,
+                        "label": src.get("label") or host,
+                        "link": "%s/sub/conv/%s.yaml" % (PUBLIC_BASE,
+                                                         src["token"])})
+        return _json(start_response, "200 OK",
+                     {"ok": True, "found": len(urls), "added": added,
+                      "duplicates": duplicates, "failed": failed,
+                      "skipped_lines": junk,
+                      "decode_warning": decode_warning, "items": items})
 
     if path.startswith("/api/sources/") and method == "GET":
         parts = path.split("/")
@@ -1058,6 +1295,28 @@ def application(environ, start_response):
         return _json(start_response, "404 Not Found",
                      {"ok": False, "error": "not_found", "message": "接口不存在。"})
 
+    if path == "/internal/daily-tests" and method == "POST":
+        # Box-local trigger for the systemd timer: full re-test of
+        # every registered source, through the same queue/pipeline as
+        # the page button. Loopback-only (see _is_loopback_direct);
+        # the platform gate keeps this path unreachable from outside.
+        if not _is_loopback_direct(environ):
+            return _json(start_response, "403 Forbidden",
+                         {"ok": False, "error": "forbidden",
+                          "message": "仅限盒上回环直连调用。"})
+        with _lock:
+            store = _load_store()
+            ids = [s["id"] for s in store["sources"]]
+        enqueued = []
+        for sid in ids:
+            state = start_tests(sid, force=True, trigger="daily")
+            if state.get("enqueued"):
+                enqueued.append(sid)
+        return _json(start_response, "200 OK",
+                     {"ok": True, "sources": len(ids),
+                      "enqueued": enqueued,
+                      "test_state": dict(_test_state)})
+
     return _json(start_response, "404 Not Found",
                  {"ok": False, "error": "not_found", "message": "路径不存在。"})
 
@@ -1119,6 +1378,13 @@ PAGE = """<!DOCTYPE html>
       <button id="f-add" class="primary" type="button">生成新链接</button>
       <span id="f-msg" class="msg"></span>
     </div>
+    <div class="meta" style="margin-top:14px">或导入链接文件：一个文本文件里有多少订阅链接就导多少（每行一个、夹在文字里都可以），已注册的会跳过并给出原转化链接。</div>
+    <div class="row" style="margin-top:6px">
+      <input id="f-file" type="file" accept=".txt,.list,.md,text/plain">
+      <button id="f-import" type="button">导入文件</button>
+      <span id="f-import-msg" class="msg"></span>
+    </div>
+    <div id="import-result" style="margin-top:10px"></div>
   </div>
 
   <div class="card">
@@ -1131,6 +1397,7 @@ PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="sub" id="runs-line"></div>
   <div id="list"></div>
 </div>
 <script>
@@ -1198,6 +1465,7 @@ function render(sources) {
     const ps = s.plan_stats || {};
     if (s.tested) meta += `<br>出口实测：正常 ${ps.ok || 0} · 待中国实测 ${ps.china || 0} · 未测 ${ps.untested || 0}` + ((ps.dropped_dead || ps.dropped_dup_ok) ? ` · 已剔除 死节点 ${ps.dropped_dead || 0} / 同出口重复 ${ps.dropped_dup_ok || 0}` : "");
     if (s.test_state && s.test_state.running) meta += `<br>正在测试：${s.test_state.done}/${s.test_state.total}…`;
+    else if (s.test_state && s.test_state.queued) meta += `<br>测试已排队，等待自动开始…`;
     else if (s.test_state && s.test_state.message) meta += `<br>${s.test_state.message}`;
     if (s.last_error) meta += `<br><span class="err">最近一次拉取失败：${s.last_error}</span>`;
     card.innerHTML = `
@@ -1262,12 +1530,57 @@ async function load() {
   const d = await api("api/sources");
   if (d.ok) {
     render(d.sources);
-    const running = d.sources.some((x) => x.test_state && x.test_state.running);
+    const lr = (d.recent_runs || []).slice(-1)[0];
+    if (lr) {
+      const trig = {daily: "每日自动", "auto-add": "新源自动", manual: "手动"}[lr.trigger] || lr.trigger;
+      $("runs-line").textContent = `最近一轮测试（${trig}）：${lr.label || lr.source_id} · 测 ${lr.tested} 个，正常 ${lr.ok} 个 · 用时 ${lr.duration_s}s · 测速流量约 ${(lr.est_bytes / 1e6).toFixed(1)} MB · ${fmtTime(lr.finished_at)}`;
+    }
+    const running = d.sources.some((x) => x.test_state && (x.test_state.running || x.test_state.queued));
     if (running && !pollTimer) pollTimer = setInterval(load, 4000);
     if (!running && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   }
 }
 function poll() { if (!pollTimer) pollTimer = setInterval(load, 4000); load(); }
+function renderImport(d) {
+  const box = $("import-result");
+  let head = `导入汇总：共找到链接 ${d.found} 个 · 新增 ${d.added} · 重复跳过 ${d.duplicates} · 失败 ${d.failed} · 跳过杂讯行 ${d.skipped_lines}`;
+  if (d.decode_warning) head += `<br><span class="err">注意：文件含非 UTF-8 字节，已容错解码，个别字符可能损坏。</span>`;
+  let html = `<div class="meta">${head}</div>`;
+  for (const it of d.items || []) {
+    if (it.status === "failed") {
+      html += `<div class="meta"><span class="err">✗ 失败</span> ${esc(it.label || it.host)}：${esc(it.error || "")}</div>`;
+    } else {
+      const tag = it.status === "duplicate" ? "已存在，跳过（原转化链接）" : "✓ 新增";
+      html += `<div class="meta">${tag} ${esc(it.label || it.host)}</div>` +
+        `<div class="linkbox"><input type="text" readonly value="${esc(it.link)}"><button type="button" class="imp-copy">复制链接</button></div>`;
+    }
+  }
+  box.innerHTML = html;
+  box.querySelectorAll(".imp-copy").forEach((b) => {
+    b.onclick = async () => {
+      const inp = b.parentElement.querySelector("input");
+      try { await navigator.clipboard.writeText(inp.value); b.textContent = "已复制"; }
+      catch (e) { inp.select(); document.execCommand("copy"); b.textContent = "已复制"; }
+      setTimeout(() => { b.textContent = "复制链接"; }, 1500);
+    };
+  });
+}
+$("f-import").onclick = async () => {
+  const msg = $("f-import-msg");
+  const file = $("f-file").files[0];
+  if (!file) { msg.textContent = "先选择一个文本文件。"; return; }
+  if (file.size > 2 * 1024 * 1024) { msg.textContent = "文件超过 2 MB 上限。"; return; }
+  msg.textContent = "正在导入…";
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 32768) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 32768));
+  const d = await api("api/sources/import", "POST", {content_b64: btoa(bin)});
+  if (!d.ok) { msg.textContent = "失败：" + (d.message || ""); return; }
+  msg.textContent = "导入完成，转化链接见下方汇总。";
+  renderImport(d);
+  load();
+  poll();
+};
 $("f-add").onclick = async () => {
   const url = $("f-url").value.trim();
   if (!url) { $("f-msg").textContent = "先粘贴订阅链接。"; return; }
@@ -1275,8 +1588,8 @@ $("f-add").onclick = async () => {
   const d = await api("api/sources", "POST", {label: $("f-label").value.trim(), url});
   if (!d.ok) { $("f-msg").textContent = "失败：" + (d.message || ""); return; }
   $("f-url").value = ""; $("f-label").value = "";
-  $("f-msg").textContent = d.source.last_error ? ("已保存，但首次拉取失败：" + d.source.last_error) : "已生成，去下面复制新链接。";
-  load();
+  $("f-msg").textContent = d.source.last_error ? ("已保存，但首次拉取失败：" + d.source.last_error) : (d.test_state ? "已生成，新源已自动开始测试，进度见下方卡片。" : "已生成，去下面复制新链接。");
+  if (d.test_state) poll(); else load();
 };
 load();
 </script>

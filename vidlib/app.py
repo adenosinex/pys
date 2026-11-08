@@ -290,6 +290,27 @@ def init_db():
             conn.execute(
                 "ALTER TABLE entries ADD COLUMN library_id "
                 "INTEGER DEFAULT 0")
+        if "orig_name" not in _ecols:
+            conn.execute(
+                "ALTER TABLE entries ADD COLUMN orig_name "
+                "TEXT DEFAULT ''")
+            # Backfill legacy rows with the codebase's own
+            # notion of the original filename (title + "." +
+            # ext, cf. _mark_filename) so the upload name
+            # precheck can hit pre-existing entries too.
+            for _r in conn.execute(
+                    "SELECT e.id AS id, e.title AS title, "
+                    "f.ext AS ext FROM entries e "
+                    "JOIN files f ON f.hash = e.hash").fetchall():
+                conn.execute(
+                    "UPDATE entries SET orig_name = ? "
+                    "WHERE id = ?",
+                    (_r["title"] + (
+                        "." + _r["ext"] if _r["ext"] else ""),
+                     _r["id"]))
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entries_lib_orig "
+                "ON entries(library_id, orig_name)")
         for _k, _n, _p in (("video", "默认库", "视频/默认库"),
                            ("image", "默认库", "图片"),
                            ("novel", "默认库", "小说"),
@@ -3496,7 +3517,7 @@ def _unique_title(conn, folder, title, exclude_id=None):
 
 
 def insert_entry(hash_, title, folder, tags="", source="",
-                 library_id=None):
+                 library_id=None, orig_name=""):
     now = time.time()
     if library_id is None:
         f = get_file(hash_)
@@ -3506,10 +3527,11 @@ def insert_entry(hash_, title, folder, tags="", source="",
         title = _unique_title(conn, folder, title[:200])
         cur = conn.execute(
             "INSERT INTO entries(hash, title, folder, tags, source, "
-            "library_id, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
+            "library_id, orig_name, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
             (hash_, title, folder, (tags or "")[:200],
-             (source or "")[:120], library_id, now, now))
+             (source or "")[:120], library_id,
+             (orig_name or "")[:255], now, now))
         return cur.lastrowid
 
 
@@ -3727,7 +3749,8 @@ def ingest_staged_file(staged_path, display_name, folder=None, tags="",
             digest, title, folder, tags, source,
             library_id=_resolve_library_id(
                 (existing["kind"] if "kind" in existing.keys()
-                 else None) or _kind(existing["ext"]), library_id))
+                 else None) or _kind(existing["ext"]), library_id),
+            orig_name=orig)
         return entry_id, digest, True
     if not ext:
         ext = "mp4"
@@ -3774,7 +3797,8 @@ def ingest_staged_file(staged_path, display_name, folder=None, tags="",
         title = audio["title"]
     entry_id = insert_entry(
         digest, title, folder, tags, source,
-        library_id=_resolve_library_id(kind, library_id))
+        library_id=_resolve_library_id(kind, library_id),
+        orig_name=orig)
     _ensure_worker()
     return entry_id, digest, False
 
@@ -3864,7 +3888,103 @@ def register_dup(digest, name, tags, source, library_id=None):
     return insert_entry(
         digest, title, _folder_of(now), tags, source,
         library_id=_resolve_library_id(
-            (f["kind"] if f else "video") or "video", library_id))
+            (f["kind"] if f else "video") or "video", library_id),
+        orig_name=name or "")
+
+
+def _upload_check_one(item):
+    """One precheck verdict for the batch upload check.
+
+    Accepts {'hash'|'digest', size, name} dicts or a bare digest
+    string. exists is true only when a stored file has this
+    digest (and the given size, when provided, matches it)."""
+    if isinstance(item, str):
+        item = {"hash": item}
+    if not isinstance(item, dict):
+        return {"hash": "", "exists": False}
+    digest = (item.get("hash") or item.get("digest")
+              or "")
+    if not isinstance(digest, str):
+        digest = ""
+    digest = digest.strip().lower()
+    out = {"hash": digest, "exists": False}
+    if re.fullmatch(r"[a-f0-9]{64}", digest) is None:
+        return out
+    f = get_file(digest)
+    if f is None:
+        return out
+    try:
+        want = int(item.get("size") or 0)
+    except Exception:
+        want = 0
+    if want and int(f["size"] or 0) != want:
+        return out
+    title = None
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT title FROM entries WHERE hash = ? "
+            "ORDER BY id LIMIT 1", (digest,)).fetchone()
+        if row is not None:
+            title = row["title"]
+    out["exists"] = True
+    out["file"] = {"size": int(f["size"] or 0),
+                   "ext": f["ext"] or "",
+                   "status": f["status"] or "",
+                   "title": title}
+    return out
+
+
+def _upload_name_check_one(item, library_id=None):
+    """One filename-phase precheck verdict.
+
+    Scope: the entry must already live in the upload's
+    destination scope -- the kind derived from the filename
+    extension (the same _kind() the ingest path uses) and the
+    library that _resolve_library_id(kind, library_id) yields,
+    exactly as ingest would file it. A hit requires the stored
+    original filename (entries.orig_name; legacy rows backfilled
+    as title + "." + ext, the _mark_filename convention) AND
+    the stored file size to both equal the candidate's. Other
+    kinds / other libraries never match."""
+    if not isinstance(item, dict):
+        return {"name": "", "exists": False}
+    name = (item.get("name") or "").strip()
+    out = {"name": name, "exists": False}
+    if not name:
+        return out
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    out["name"] = base
+    if not base:
+        return out
+    try:
+        size = int(item.get("size") or 0)
+    except Exception:
+        size = 0
+    if size <= 0:
+        return out
+    ext = base.rsplit(".", 1)[1].lower() if "." in base else ""
+    kind = _kind(ext)
+    lib = _resolve_library_id(kind, library_id)
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT e.id AS id, e.title AS title, "
+            "f.size AS size, f.ext AS ext, f.status AS status "
+            "FROM entries e JOIN files f ON f.hash = e.hash "
+            "WHERE e.library_id = ? AND f.kind = ? AND f.size = ? "
+            "AND (e.orig_name = ? OR "
+            "(COALESCE(e.orig_name, '') = '' AND "
+            "(e.title || CASE WHEN f.ext <> '' "
+            "THEN '.' || f.ext ELSE '' END) = ?)) "
+            "ORDER BY e.id LIMIT 1",
+            (lib, kind, size, base, base)).fetchone()
+    if row is None:
+        return out
+    out["exists"] = True
+    out["entry"] = {"id": row["id"], "title": row["title"],
+                    "size": int(row["size"] or 0),
+                    "ext": row["ext"] or "",
+                    "status": row["status"] or ""}
+    return out
 
 
 def upload_init(name, size, title, tags, source, relpath="",
@@ -6845,9 +6965,9 @@ UPLOAD_PAGE = r"""<div class="topbar"><a class="btn ghost" href="./">← 返回<
 <div id="list-done" style="display:grid;gap:10px;margin-top:8px"></div>
 </details>
 </div>
-<p style="color:#8b94a7;font-size:12.5px;line-height:1.7">分片上传（8MB/片）：最多 3 个文件并行、每个文件 3 片并行，失败分片自动重试 3 次。速度为近几秒的实时速度，不是全程平均。文件先到服务器暂存区，后台算哈希去重、抽缩略图，再自动归档到谷歌硬盘并删除本地副本；同哈希重复上传只新增一个条目，不重复占谷歌空间。排队中的文件可点 ✕ 取消，上传中的也可中止（已传分片作废）。暂存区预算 __BUDGET__，归档跟不上时请稍后再传。</p></div>
+<p style="color:#8b94a7;font-size:12.5px;line-height:1.7">分片上传（8MB/片）：最多 4 个文件并行、每个文件 3 片并行，失败分片自动重试 3 次。入队后先按文件名+大小整批预检：同名同大小的直接跳过（不读文件内容）；没中的逐个计算哈希，算完一个就预检一个、命中同样跳过，没中的立刻开始上传（不等整批算完），已存在的文件一个分片都不传。速度为近几秒的实时速度，不是全程平均。文件先到服务器暂存区，后台算哈希去重、抽缩略图，再自动归档到谷歌硬盘并删除本地副本；同哈希重复上传只新增一个条目，不重复占谷歌空间。排队中的文件可点 ✕ 取消，上传中的也可中止（已传分片作废）。暂存区预算 __BUDGET__，归档跟不上时请稍后再传。</p></div>
 <script>
-const CH=8*1024*1024,PARF=3,PARC=3;
+const CH=8*1024*1024,PARF=4,PARC=3;
 const elActive=document.getElementById("list-active");
 const elQueue=document.getElementById("list-queue");
 const elDone=document.getElementById("list-done");
@@ -6888,6 +7008,122 @@ async function digestOf(f){
   all.set(new Uint8Array(await f.slice(midOff,midOff+SMP).arrayBuffer()),pre.length+SMP);
   all.set(new Uint8Array(await f.slice(f.size-SMP).arrayBuffer()),pre.length+2*SMP);
   return hex(await crypto.subtle.digest("SHA-256",all));}
+// ---- 先按文件名预检（整批一次，在哈希之前）----
+// 文件入队后先按 (文件名, 大小) 在目标种类/库内查同名条目：
+// 命中直接跳过，不读文件内容、不算哈希；没命中才进哈希队列。
+// 同一批里同名同大小的重复项只让第一个按名跳过（seen 集合），
+// 其余照常走哈希相位，避免批内互跳。查询失败整批回退哈希相位。
+let namePending=[],nameBusy=false,nameSched=false;
+function nameEnqueue(job){
+  job.nameState="wait";
+  job.stEl.textContent="等待按文件名预检…";
+  namePending.push(job);
+  if(!nameSched){nameSched=true;
+    setTimeout(()=>{nameSched=false;flushNameCheck();},0);}}
+async function flushNameCheck(){
+  if(nameBusy)return;
+  const batch=namePending.splice(0,namePending.length);
+  if(!batch.length)return;
+  nameBusy=true;
+  const live=batch.filter(j=>!j.cancelled&&j.state!=="cancel");
+  for(const j of live)j.stEl.textContent="按文件名预检中…";
+  let results=null;
+  try{const r=await jpost("api/uploads/check",{names:live.map(j=>({
+      name:j.file.name,size:j.file.size})),
+    library_id:document.getElementById("libsel").value});
+    if(r&&r.ok&&Array.isArray(r.results))results=r.results;}
+  catch(e){results=null;}
+  nameBusy=false;
+  const seen=new Set();
+  for(let i=0;i<live.length;i++){
+    const j=live[i];
+    if(j.cancelled||j.state==="cancel")continue;
+    const it=results?results[i]:null;
+    const key=j.file.name+"|"+j.file.size;
+    if(it&&it.exists&&!seen.has(key)){
+      seen.add(key);markNameSkip(j);}
+    else hashEnqueue(j);}
+  layout();
+  if(namePending.length)flushNameCheck();}
+function markNameSkip(j){
+  j.nameSkip=true;j.done=true;j.state="ok";j.dup=true;
+  j.barEl.style.width="100%";hideX(j);
+  j.stEl.textContent="同名已存在，跳过（按文件名）";
+  const b=document.createElement("button");b.type="button";
+  b.className="ghost";b.textContent="仍要上传";
+  b.style.marginLeft="8px";
+  b.onclick=()=>{b.remove();j.nameBtn=null;releaseNameSkip(j);};
+  j.stEl.after(b);j.nameBtn=b;layout();}
+function releaseNameSkip(j){
+  j.nameSkip=false;j.done=false;j.state="queue";j.dup=false;
+  j.barEl.style.width="0%";
+  if(j.xBtn)j.xBtn.style.display="";
+  hashEnqueue(j);layout();pump();}
+// ---- 入队即算哈希 + 流水线预检 ----
+// 名字没命中的文件一入队就计算摘要（并发 4，逐个显示进度，可取消）。
+// 摘要算完一个就攒进预检缓冲：攒满 8 个、或 200ms 到时、或哈希队列
+// 排空，任一先到就发一次批量预检——命中的立刻秒传跳过、没中的立刻
+// 进上传队列开传，绝不等全批算完。批量预检失败时回退 runJob 逐个预检。
+const HASHPAR=4,CHECK_BATCH=8,CHECK_MS=200;
+let hashActive=0,hashWait=[],checkPending=[],checkBusy=false,checkTimer=null;
+function hashEnqueue(job){
+  job.hashState="wait";
+  job.stEl.textContent="等待计算哈希…";
+  hashWait.push(job);hashPump();}
+function hashPump(){
+  while(hashActive<HASHPAR&&hashWait.length){
+    const job=hashWait.shift();
+    if(job.cancelled||job.state==="cancel")continue;
+    hashActive++;job.hashState="doing";
+    job.stEl.textContent="计算哈希中…";
+    hashOne(job);}}
+async function hashOne(job){
+  let digest=null;
+  try{digest=await digestOf(job.file);}catch(e){digest=null;}
+  hashActive--;job.hashState="done";job.digestCache=digest;
+  if(job.cancelled||job.state==="cancel"){
+    hashPump();scheduleCheck();return;}
+  if(digest){
+    job.stEl.textContent="哈希已算，预检中…";
+    checkPending.push(job);scheduleCheck();}
+  else{job.ready=true;job.stEl.textContent="排队";pump();}
+  hashPump();
+  if(!hashActive&&!hashWait.length)flushCheck();}
+function scheduleCheck(){
+  if(checkPending.length>=CHECK_BATCH){flushCheck();return;}
+  if(checkPending.length&&!checkTimer){
+    checkTimer=setTimeout(()=>{checkTimer=null;flushCheck();},
+      CHECK_MS);}}
+async function flushCheck(){
+  if(checkBusy)return;
+  if(checkTimer){clearTimeout(checkTimer);checkTimer=null;}
+  if(!checkPending.length)return;
+  const batch=checkPending.splice(0,checkPending.length);
+  checkBusy=true;
+  for(const j of batch)j.stEl.textContent="预检中…";
+  let results=null;
+  try{const r=await jpost("api/uploads/check",{items:batch.map(j=>({
+    hash:j.digestCache,size:j.file.size,name:j.file.name}))});
+    if(r&&r.ok&&Array.isArray(r.results))results=r.results;}
+  catch(e){results=null;}
+  checkBusy=false;
+  if(!results){
+    for(const j of batch){
+      if(j.cancelled||j.state==="cancel")continue;
+      j.ready=true;j.stEl.textContent="排队";}
+    pump();if(checkPending.length)scheduleCheck();return;}
+  const byHash=new Map();
+  for(const it of results)if(it&&it.hash)byHash.set(it.hash,it);
+  for(const j of batch){
+    if(j.cancelled||j.state==="cancel")continue;
+    const it=byHash.get(j.digestCache);
+    if(it&&it.exists){
+      j.stEl.textContent="已存在，跳过上传（秒传）";
+      if(!(await fastRegister(j,j.digestCache))){
+        j.ready=true;j.stEl.textContent="排队";}}
+    else{j.prechecked=true;j.ready=true;
+      j.stEl.textContent="排队";}}
+  layout();pump();if(checkPending.length)scheduleCheck();}
 let pausedAll=false,pauseReason="",consecFails=0,probeTimer=null;
 function noteNetOk(){consecFails=0;}
 function noteNetFail(){consecFails++;
@@ -6980,30 +7216,37 @@ function sendChunk(job,idx){const f=job.file,off=idx*CH,
   tries++;
   if(tries<3)return new Promise(r=>setTimeout(r,1000)).then(go);throw e;});
   return go();}
+async function fastRegister(job,digest){
+  let reg=null;
+  try{reg=await jpost("api/uploads/register",{digest:digest,
+    name:job.file.name,tags:document.getElementById("tags").value,
+    source:document.getElementById("source").value,
+    relpath:job.rel,
+    library_id:document.getElementById("libsel").value});}catch(e){reg=null;}
+  if(reg&&reg.ok){
+    job.done=true;job.state="ok";job.dup=true;
+    job.barEl.style.width="100%";hideX(job);
+    job.stEl.textContent="已存在，跳过上传（秒传）";
+    batchDone.set(digest,true);
+    layout();return true;}
+  return false;}
 async function runJob(job){const f=job.file;
   if(job.cancelled){job.state="cancel";job.done=true;
   job.stEl.textContent="已取消";return;}
-  job.state="init";job.stEl.textContent="本地校验是否已存在…";
-  let digest=null;
-  try{digest=await digestOf(f);}catch(e){digest=null;}
-  job.digestCache=digest;
-  if(digest){
-    let exists=batchDone.has(digest);
-    if(!exists){
-      try{const c=await jpost("api/uploads/check",{digest:digest});
-        exists=!!(c&&c.ok&&c.exists);}catch(e){exists=false;}}
-    if(exists){
-      let reg=null;
-      try{reg=await jpost("api/uploads/register",{digest:digest,
-        name:f.name,tags:document.getElementById("tags").value,
-        source:document.getElementById("source").value,
-        relpath:job.rel,
-        library_id:document.getElementById("libsel").value});}catch(e){reg=null;}
-      if(reg&&reg.ok){
-        job.done=true;job.state="ok";job.dup=true;
-        job.barEl.style.width="100%";hideX(job);
-        job.stEl.textContent="已存在，秒传（跳过上传）";
-        return;}}}
+  job.state="init";
+  if(!job.prechecked){
+    job.stEl.textContent="本地校验是否已存在…";
+    let digest=job.digestCache;
+    if(!digest){
+      try{digest=await digestOf(f);}catch(e){digest=null;}
+      job.digestCache=digest;}
+    if(digest){
+      let exists=batchDone.has(digest);
+      if(!exists){
+        try{const c=await jpost("api/uploads/check",{digest:digest});
+          exists=!!(c&&c.ok&&c.exists);}catch(e){exists=false;}}
+      if(exists){
+        if(await fastRegister(job,digest))return;}}}
   job.stEl.textContent="初始化…";
   const base=job.rel.split("/").pop();
   let init;try{init=await jpost("api/uploads/init",{name:f.name,size:f.size,
@@ -7110,13 +7353,16 @@ function cancelJob(job){
 async function worker(){workers++;
   for(;;){
     if(pausedAll)break;
-    const j=jobs.find(x=>x.state==="queue");
+    const j=jobs.find(x=>x.state==="queue"&&x.ready);
     if(!j)break;
     await runJob(j);}
-  workers--;if(!workers){clearInterval(timer);timer=null;tick();
-  const c=counts();
-  document.getElementById("msg").textContent=
-    (c.q||c.up)?"已暂停（进度保留）":"本批处理完";}}
+  workers--;if(!workers){const c=counts();
+  if((c.q||c.up)&&!pausedAll){
+    document.getElementById("msg").textContent=
+      "正在预检（文件名 / 哈希）…";}
+  else{clearInterval(timer);timer=null;tick();
+    document.getElementById("msg").textContent=
+      (c.q||c.up)?"已暂停（进度保留）":"本批处理完";}}}
 function pump(){document.getElementById("sum").style.display="";
   if(!timer){samples=[];timer=setInterval(tick,500);}
   let need=jobs.filter(j=>j.state==="queue").length;
@@ -7143,9 +7389,11 @@ function enqueue(pairs){
     state:"queue",done:false,cancelled:false,dup:false,retryBtn:null,
     uid:null,next:0,active:0,retryChunks:[],failed:null,
     sessionLost:false,phase:"",digestCache:null,
+    ready:false,prechecked:false,hashState:"",
+    nameState:"",nameSkip:false,nameBtn:null,
     _finChunks:null,_launchChunks:null};
     xb.onclick=()=>cancelJob(job);
-    jobs.push(job);added++;}
+    jobs.push(job);added++;nameEnqueue(job);}
   if(skipped)document.getElementById("msg").textContent=
     "已跳过 "+skipped+" 个空文件 / 系统文件";
   if(added){layout();pump();}}
@@ -9502,11 +9750,50 @@ def application(environ, start_response):
 
     if path == "/api/uploads/check" and method == "POST":
         data = _read_json(environ)
-        digest = (data.get("digest") or "").strip().lower()
-        exists = (re.fullmatch(r"[a-f0-9]{64}", digest) is not None
-                  and get_file(digest) is not None)
+        if isinstance(data, dict) and isinstance(
+                data.get("names"), list):
+            return _json(start_response, "200 OK",
+                         {"ok": True, "results": [
+                             _upload_name_check_one(
+                                 it, _safe_lib(
+                                     data.get("library_id")))
+                             for it in data["names"][:1000]]})
+        if isinstance(data, dict) and isinstance(
+                data.get("items"), list):
+            return _json(start_response, "200 OK",
+                         {"ok": True, "results": [
+                             _upload_check_one(it)
+                             for it in data["items"][:1000]]})
+        digest = ""
+        if isinstance(data, dict):
+            digest = (data.get("digest") or "").strip().lower()
+        one = _upload_check_one({"hash": digest})
         return _json(start_response, "200 OK",
-                     {"ok": True, "exists": exists})
+                     {"ok": True, "exists": one["exists"]})
+
+    if path == "/api/upload/check" and method == "POST":
+        data = _read_json(environ)
+        if isinstance(data, dict) and isinstance(
+                data.get("names"), list):
+            return _json(start_response, "200 OK",
+                         {"ok": True, "results": [
+                             _upload_name_check_one(
+                                 it, _safe_lib(
+                                     data.get("library_id")))
+                             for it in data["names"][:1000]]})
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = (data.get("items") or data.get("digests")
+                     or [])
+        else:
+            items = []
+        if not isinstance(items, list):
+            items = []
+        return _json(start_response, "200 OK",
+                     {"ok": True, "results": [
+                         _upload_check_one(it)
+                         for it in items[:1000]]})
 
     if path == "/api/uploads/register" and method == "POST":
         data = _read_json(environ)
