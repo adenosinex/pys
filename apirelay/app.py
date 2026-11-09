@@ -782,6 +782,14 @@ def _html_resp(start_response, status, text):
     return [body]
 
 
+def _redirect(start_response, location):
+    start_response("302 Found", [("Location", location),
+                                 ("Content-Type", "text/html; charset=utf-8"),
+                                 ("Content-Length", "0"),
+                                 ("Cache-Control", "no-store")])
+    return [b""]
+
+
 def _download(start_response, filename, body, ctype):
     start_response("200 OK", [("Content-Type", ctype),
                               ("Content-Disposition",
@@ -1148,6 +1156,9 @@ def app(environ, start_response):
                                      "/".join(seg[2:]))
             return _json(start_response, "404 Not Found",
                          {"ok": False, "error": "转发路径格式: /r/<上游名>/v1/<path>"})
+        if method in ("GET", "HEAD") and not path.startswith("/api/"):
+            # 人类路径打错/被拼坏时回网页首页, 不给裸 JSON; JSON 只留在 /api/*
+            return _redirect(start_response, prefix + "/")
         return _json(start_response, "404 Not Found",
                      {"ok": False, "error": "not found"})
     except Exception as exc:
