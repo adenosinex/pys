@@ -19,7 +19,7 @@
     <header>
       <div class="brandline">
         <a class="brand-logo" href="/" aria-label="链接转文本首页"><img src="/static/logo.svg" width="44" height="44" alt=""></a>
-        <div class="brand-title"><h1>链接转文本</h1><p>粘贴链接或整段文本，自动识别知乎、YouTube、抖音、B站和已配置的网站：视频有字幕时直接输出字幕文本，没有字幕时给出音视频直链。支持 Markdown / 纯文本 / JSON。</p></div>
+        <div class="brand-title"><h1>链接转文本</h1><p>粘贴链接或整段文本，自动识别知乎、YouTube、抖音、B站和已配置的网站：视频优先输出字幕文本，YouTube 没有字幕时会自动下载音频送 Mac 转写。支持 Markdown / 纯文本 / JSON。</p></div>
       </div>
     </header>
     <section id="workspace">
@@ -33,6 +33,7 @@
         <div class="links" id="links" hidden><div class="linkshead" id="linkCount"></div><div class="chips" id="linkChips"></div></div>
         <div class="row format-row"><div><label for="format">输出格式</label><select id="format"><option value="text" selected>纯文本（推荐，喂 LLM / 检索）</option><option value="markdown">Markdown（含格式）</option><option value="json">JSON（含元数据）</option></select></div><div class="image-options"><label class="image-option"><input id="keep-images" type="checkbox" checked>保留图片链接</label></div></div>
         <div class="actions"><button id="extract-button" class="btn btn-primary" type="submit">提取文本</button><button id="oneClick" class="btn btn-ghost" type="button">⚡ 一键获取</button><button id="download" class="btn btn-ghost" type="button" disabled>下载</button><button id="reset" class="btn btn-ghost" type="button">清空</button><button id="cancel-extract" class="btn btn-ghost" type="button" hidden>取消请求</button><span id="status" class="status" role="status">就绪</span></div>
+        <div id="task-progress" class="task-progress" hidden><div class="spread"><span id="tp-stage">正在处理…</span><span id="tp-elapsed">00:00</span></div><progress id="tp-bar" max="100" value="0"></progress><div class="task-metrics"><span id="tp-detail"></span><span>总进度为估算 · 长视频转写以分钟计属正常</span></div></div>
         <p class="hint quick-hint">「一键获取」会读取剪贴板中的链接并立即提取；完成后再次点击即可复制正文。Ctrl / ⌘ + Enter 可提取输入框中的链接。</p>
       </form>
       <div id="extract-message" class="message extract-message" role="status" aria-live="polite"></div>
@@ -59,6 +60,10 @@
         <div class="cookiebody"><div class="cookie-links">
           <label>测试视频（用它验证 Cookie 能否取到字幕，可修改，自动保存到服务器）<input id="bili-test-url" type="url" value="https://www.bilibili.com/video/BV1VeHQ6tEaS/"><a id="bili-test-link" class="hint" href="https://www.bilibili.com/video/BV1VeHQ6tEaS/" target="_blank" rel="noopener noreferrer">点击打开测试视频 ↗</a></label>
         </div><form id="bili-cookie-form"><p class="hint">B站字幕列表对未登录请求返回空（已实测），粘贴你自己浏览器登录 B 站后的完整 Cookie（含 SESSDATA），解析 B 站链接时就能优先抓取字幕并按文字输出。获取方式：浏览器登录 bilibili.com → F12 → Network → 刷新 → 点任意请求 → Headers → 复制 Cookie 整行。输入后自动预验证，保存后其他浏览器可直接复用；已保存的 Cookie 不会回显。</p><label class="sr-only" for="bili-cookie-input">Bilibili Cookie 请求头</label><textarea id="bili-cookie-input" rows="3" maxlength="32768" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴整行 Cookie：SESSDATA=…; bili_jct=…; DedeUserID=…"></textarea><div class="actions"><button id="save-bili-cookie" class="btn btn-primary" type="submit">保存到服务器并自动测试</button><button id="test-bili-cookie" class="btn btn-ghost" type="button" disabled>重新测试 Cookie</button><button id="remove-bili-cookie" class="btn btn-ghost" type="button" disabled>删除服务器 Cookie</button></div><p id="bili-cookie-message" class="message" role="status" aria-live="polite"></p></form></div>
+      </details>
+      <details id="mac-panel" class="card cookiewrap">
+        <summary><span>Mac 转写（YouTube 无字幕时兜底）</span><span id="mac-badge" class="badge" data-state="unchecked">读取状态中</span><span class="chev" aria-hidden="true">▾</span></summary>
+        <div class="cookiebody"><form id="mac-form"><p class="hint">粘贴 YouTube 链接时先取字幕；没有可用字幕时，才会把音频送到你的 Mac（mac-compute）转写。这里保存它的访问码：只写入服务器、不回显，保存后其他浏览器可直接复用。</p><label class="sr-only" for="mac-input">Mac 转写访问码</label><input id="mac-input" type="password" maxlength="512" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴 mac-compute 访问码"><div class="actions"><button id="save-mac" class="btn btn-primary" type="submit">保存访问码</button><button id="remove-mac" class="btn btn-ghost" type="button" disabled>删除已保存的访问码</button></div><p id="mac-message" class="message" role="status" aria-live="polite"></p></form></div>
       </details>
       <details id="settings-panel" class="card cookiewrap">
         <summary><span>链接与分流设置</span><span class="badge" id="settings-badge">读取中</span><span class="chev" aria-hidden="true">▾</span></summary>

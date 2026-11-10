@@ -121,7 +121,7 @@ def _read_registry():
         db = _panel_db_connect()
         try:
             rows = db.execute(
-                "SELECT slug, name, project_type, description, created_at "
+                "SELECT id, slug, name, project_type, description, created_at "
                 "FROM projects WHERE project_type IN ('html', 'script', 'web') "
                 "ORDER BY created_at ASC, id ASC").fetchall()
         finally:
@@ -129,7 +129,7 @@ def _read_registry():
     except Exception:
         return None
     out = {"html": [], "py": []}
-    for slug, name, ptype, desc, created in rows:
+    for pid, slug, name, ptype, desc, created in rows:
         kind = "html" if ptype == "html" else "py"
         # The panel's Python web apps register as project_type "web";
         # they form the "py" zone here and open at /web/<slug>/.
@@ -141,7 +141,7 @@ def _read_registry():
         else:
             url = "/app/%s/" % slug
         out[kind].append({
-            "slug": slug, "name": name or slug, "kind": kind,
+            "id": pid, "slug": slug, "name": name or slug, "kind": kind,
             "note": desc or "",
             "url": url,
             "created_at": created,
@@ -667,17 +667,25 @@ const APPCATS = {
     {name: "网络工具", slugs: ["subconv", "dnsmap", "speedtest", "openrouter"]},
     {name: "平台效率", slugs: ["links", "clipboard", "burn", "medatlas"]}
   ],
-  html: ["平台与发布", "导入页"]
+  html: [
+    {name: "实用工具", slugs: ["p1791363651", "p1791168459", "p1790594923", "p1789779981", "p1789648409", "p1785485829", "p1785306635", "p1785206347", "p1780063319", "p1778768844", "magnet", "textuni"]},
+    {name: "AI 与模型", slugs: ["aicn", "p1788428731", "p1788428729", "p1787576892", "p1785741597", "p1780733162", "p1779539600", "aitest", "ormodel"]},
+    {name: "健身与体能", slugs: ["p1783040627", "p1779874258", "p1779872310", "p1779868187", "p1779266591", "p1779202861", "p1779198872", "p1779109601", "p1779020616", "p1778982714", "p1778769593"]},
+    {name: "健康与身体", slugs: ["p1790396626", "p1790396609", "p1783259896", "p1781665039", "p1779697722", "p1778981387"]},
+    {name: "户外与出行", slugs: ["p1792850445", "p1787039714", "p1781923402", "p1780188079", "p1778984453", "p1778983199", "p1778983019", "p1778981876", "p1778981444", "p1778980516"]},
+    {name: "设备与车辆", slugs: ["p1783476971", "p1782215175", "p1779544522", "p1779349290", "p1779001444", "p1778982865", "p1778982461", "p1778981955"]},
+    {name: "认知与社会", slugs: ["p1792563415", "p1791946410", "p1790172372", "p1779853529", "p1779778997", "p1779546460", "p1779090887", "p1778991781", "p1778983287", "p1778982505"]},
+    {name: "选购依据", slugs: ["vps-buying-guide", "vps-benchmark-compare", "vps-platform-limits"]},
+  ]
 };
 function catOf(p) {
-  if (p.kind === "py") {
-    for (const c of APPCATS.py) if (c.slugs.indexOf(p.slug) >= 0) return c.name;
-    return "其他";
-  }
-  return /^p[0-9]+$/.test(p.slug) ? "导入页" : "平台与发布";
+  const cats = p.kind === "py" ? APPCATS.py : APPCATS.html;
+  for (const c of cats) if (c.slugs.indexOf(p.slug) >= 0) return c.name;
+  return "其他";
 }
 function catOrder(kind) {
-  return kind === "py" ? APPCATS.py.map(c => c.name).concat(["其他"]) : APPCATS.html.slice();
+  const cats = kind === "py" ? APPCATS.py : APPCATS.html;
+  return cats.map(c => c.name).concat(["其他"]);
 }
 function groupProjects(items, kind) {
   const by = new Map();
@@ -1087,17 +1095,25 @@ const APPCATS = {
     {name: "网络工具", slugs: ["subconv", "dnsmap", "speedtest", "openrouter"]},
     {name: "平台效率", slugs: ["links", "clipboard", "burn", "medatlas"]}
   ],
-  html: ["平台与发布", "导入页"]
+  html: [
+    {name: "实用工具", slugs: ["p1791363651", "p1791168459", "p1790594923", "p1789779981", "p1789648409", "p1785485829", "p1785306635", "p1785206347", "p1780063319", "p1778768844", "magnet", "textuni"]},
+    {name: "AI 与模型", slugs: ["aicn", "p1788428731", "p1788428729", "p1787576892", "p1785741597", "p1780733162", "p1779539600", "aitest", "ormodel"]},
+    {name: "健身与体能", slugs: ["p1783040627", "p1779874258", "p1779872310", "p1779868187", "p1779266591", "p1779202861", "p1779198872", "p1779109601", "p1779020616", "p1778982714", "p1778769593"]},
+    {name: "健康与身体", slugs: ["p1790396626", "p1790396609", "p1783259896", "p1781665039", "p1779697722", "p1778981387"]},
+    {name: "户外与出行", slugs: ["p1792850445", "p1787039714", "p1781923402", "p1780188079", "p1778984453", "p1778983199", "p1778983019", "p1778981876", "p1778981444", "p1778980516"]},
+    {name: "设备与车辆", slugs: ["p1783476971", "p1782215175", "p1779544522", "p1779349290", "p1779001444", "p1778982865", "p1778982461", "p1778981955"]},
+    {name: "认知与社会", slugs: ["p1792563415", "p1791946410", "p1790172372", "p1779853529", "p1779778997", "p1779546460", "p1779090887", "p1778991781", "p1778983287", "p1778982505"]},
+    {name: "选购依据", slugs: ["vps-buying-guide", "vps-benchmark-compare", "vps-platform-limits"]},
+  ]
 };
 function catOf(p) {
-  if (p.kind === "py") {
-    for (const c of APPCATS.py) if (c.slugs.indexOf(p.slug) >= 0) return c.name;
-    return "其他";
-  }
-  return /^p[0-9]+$/.test(p.slug) ? "导入页" : "平台与发布";
+  const cats = p.kind === "py" ? APPCATS.py : APPCATS.html;
+  for (const c of cats) if (c.slugs.indexOf(p.slug) >= 0) return c.name;
+  return "其他";
 }
 function catOrder(kind) {
-  return kind === "py" ? APPCATS.py.map(c => c.name).concat(["其他"]) : APPCATS.html.slice();
+  const cats = kind === "py" ? APPCATS.py : APPCATS.html;
+  return cats.map(c => c.name).concat(["其他"]);
 }
 function groupProjects(items, kind) {
   const by = new Map();
@@ -1202,7 +1218,7 @@ function renderCatPage(board) {
     `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台的 Python 应用与脚本项目，点卡片打开。"}</div>`;
   if (!editing && !searching && !focusCat) {
     const recent = [...items].filter(p => p.created_at)
-      .sort((a, b) => b.created_at - a.created_at).slice(0, 8);
+      .sort((a, b) => (b.created_at - a.created_at) || ((b.id || 0) - (a.id || 0))).slice(0, 5);
     if (recent.length >= 2) {
       h += `<h2 class="cat">最近添加</h2><div class="grid">` +
         recent.map(p => projCard(p)).join("") + `</div>`;
@@ -1589,17 +1605,25 @@ const APPCATS = {
     {name: "网络工具", slugs: ["subconv", "dnsmap", "speedtest", "openrouter"]},
     {name: "平台效率", slugs: ["links", "clipboard", "burn", "medatlas"]}
   ],
-  html: ["平台与发布", "导入页"]
+  html: [
+    {name: "实用工具", slugs: ["p1791363651", "p1791168459", "p1790594923", "p1789779981", "p1789648409", "p1785485829", "p1785306635", "p1785206347", "p1780063319", "p1778768844", "magnet", "textuni"]},
+    {name: "AI 与模型", slugs: ["aicn", "p1788428731", "p1788428729", "p1787576892", "p1785741597", "p1780733162", "p1779539600", "aitest", "ormodel"]},
+    {name: "健身与体能", slugs: ["p1783040627", "p1779874258", "p1779872310", "p1779868187", "p1779266591", "p1779202861", "p1779198872", "p1779109601", "p1779020616", "p1778982714", "p1778769593"]},
+    {name: "健康与身体", slugs: ["p1790396626", "p1790396609", "p1783259896", "p1781665039", "p1779697722", "p1778981387"]},
+    {name: "户外与出行", slugs: ["p1792850445", "p1787039714", "p1781923402", "p1780188079", "p1778984453", "p1778983199", "p1778983019", "p1778981876", "p1778981444", "p1778980516"]},
+    {name: "设备与车辆", slugs: ["p1783476971", "p1782215175", "p1779544522", "p1779349290", "p1779001444", "p1778982865", "p1778982461", "p1778981955"]},
+    {name: "认知与社会", slugs: ["p1792563415", "p1791946410", "p1790172372", "p1779853529", "p1779778997", "p1779546460", "p1779090887", "p1778991781", "p1778983287", "p1778982505"]},
+    {name: "选购依据", slugs: ["vps-buying-guide", "vps-benchmark-compare", "vps-platform-limits"]},
+  ]
 };
 function catOf(p) {
-  if (p.kind === "py") {
-    for (const c of APPCATS.py) if (c.slugs.indexOf(p.slug) >= 0) return c.name;
-    return "其他";
-  }
-  return /^p[0-9]+$/.test(p.slug) ? "导入页" : "平台与发布";
+  const cats = p.kind === "py" ? APPCATS.py : APPCATS.html;
+  for (const c of cats) if (c.slugs.indexOf(p.slug) >= 0) return c.name;
+  return "其他";
 }
 function catOrder(kind) {
-  return kind === "py" ? APPCATS.py.map(c => c.name).concat(["其他"]) : APPCATS.html.slice();
+  const cats = kind === "py" ? APPCATS.py : APPCATS.html;
+  return cats.map(c => c.name).concat(["其他"]);
 }
 function groupProjects(items, kind) {
   const by = new Map();

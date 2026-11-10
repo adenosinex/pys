@@ -12,16 +12,21 @@ from urllib.parse import parse_qs, urlsplit
 
 if __package__:
     from .cookie_manager import CookieManager, DEFAULT_TEST_URL, FileCookieStore, timestamp
-    from .site_settings import SiteSettings
+    from .site_settings import SiteSettings, matches_host
     from .site_router import SiteRouter
     from .extractor import ZhihuError, extract, render, validate_cookie
     from .video_parse import bili_cookie_probe, open_download, parse_video, safe_filename
+    from . import yt_text
 else:
     from cookie_manager import CookieManager, DEFAULT_TEST_URL, FileCookieStore, timestamp
-    from site_settings import SiteSettings
+    from site_settings import SiteSettings, matches_host
     from site_router import SiteRouter
     from extractor import ZhihuError, extract, render, validate_cookie
     from video_parse import bili_cookie_probe, open_download, parse_video, safe_filename
+    import yt_text
+
+YOUTUBE_HOSTS = {'youtube.com', 'www.youtube.com', 'm.youtube.com',
+                 'youtu.be', 'www.youtu.be', 'music.youtube.com'}
 
 MAX_REQUEST_BYTES = 16 * 1024
 DEFAULT_BILI_TEST_URL = 'https://www.bilibili.com/video/BV1VeHQ6tEaS/'
@@ -146,7 +151,7 @@ def create_app(*, extract_fn=None, max_concurrency=None,
     def application(environ, start_response):
         path, method = environ.get('PATH_INFO', ''), environ.get('REQUEST_METHOD', 'GET')
         if path in {'/health', '/api/health'} and method == 'GET':
-            return response(start_response, 200, {'ok': True, 'service': 'zhihu-core', 'version': '1.4.0'})
+            return response(start_response, 200, {'ok': True, 'service': 'zhihu-core', 'version': '1.5.0'})
         if path in assets and method == 'GET':
             if path == '/':
                 origins = []
@@ -165,7 +170,9 @@ def create_app(*, extract_fn=None, max_concurrency=None,
                    '/api/settings': ('GET', 'POST'),
                    '/api/bili-cookie': ('GET', 'POST'),
                    '/api/bili-cookie/remove': ('POST',),
-                   '/api/bili-cookie/test': ('POST',)}
+                   '/api/bili-cookie/test': ('POST',),
+                   '/api/mac-code': ('GET', 'POST'),
+                   '/api/mac-code/remove': ('POST',)}
         if path == '/api/video/stream' and method == 'GET':
             query = parse_qs(environ.get('QUERY_STRING', ''))
             try:
@@ -193,6 +200,14 @@ def create_app(*, extract_fn=None, max_concurrency=None,
                     body.close()
 
             return stream()
+        if path.startswith('/api/yt-task/'):
+            if method != 'GET':
+                return response(start_response, 405, {'ok': False, 'error': '请求方法无效。', 'code': 'method_not_allowed'},
+                                [('Allow', 'GET')])
+            task = yt_text.get_task(path.rsplit('/', 1)[-1])
+            if task is None:
+                return error(start_response, 404, '任务不存在或已过期。', 'not_found')
+            return response(start_response, 200, {'ok': True, 'task': task})
         if path not in methods:
             return error(start_response, 404, '接口不存在。', 'not_found')
         if method not in methods[path]:
@@ -216,6 +231,35 @@ def create_app(*, extract_fn=None, max_concurrency=None,
                 return response(start_response, 200, {'ok': True, **result})
             except ZhihuError as exc:
                 return error(start_response, exc.status, str(exc), exc.code)
+        if path in {'/api/mac-code', '/api/mac-code/remove'}:
+            # Write-only store for the mac-compute access code used by the
+            # YouTube ASR fallback: the value is accepted and reported
+            # only as configured / not configured, never read back.
+            if environ.get('QUERY_STRING'):
+                return error(start_response, 400, '参数请放在 JSON 请求体中。', 'invalid_request')
+            try:
+                if method == 'GET':
+                    return response(start_response, 200,
+                                    {'ok': True, 'configured': yt_text.mac_code_configured()})
+                data = read_json(environ)
+                if path == '/api/mac-code/remove':
+                    if set(data):
+                        raise ZhihuError('请求参数无效。', 'invalid_request', 400)
+                    return response(start_response, 200,
+                                    {'ok': True, 'configured': yt_text.remove_mac_code()})
+                if set(data) - {'access_code'}:
+                    raise ZhihuError('请求参数无效。', 'invalid_request', 400)
+                code = data.get('access_code')
+                if not isinstance(code, str):
+                    raise ValueError('invalid access code')
+                yt_text.save_mac_code(code)
+                return response(start_response, 200, {'ok': True, 'configured': True})
+            except ZhihuError as exc:
+                return error(start_response, exc.status, str(exc), exc.code)
+            except ValueError:
+                return error(start_response, 400, '访问码无效（应为非空文本）。', 'invalid_request')
+            except OSError:
+                return error(start_response, 503, '无法保存访问码，请稍后重试。', 'store_unavailable')
         if path in {'/api/cookie', '/api/cookie/test', '/api/cookie/remove'}:
             if environ.get('QUERY_STRING'):
                 return error(start_response, 400, 'Cookie 和测试参数请放在 JSON 请求体中。', 'invalid_request')
@@ -356,6 +400,39 @@ def create_app(*, extract_fn=None, max_concurrency=None,
             return error(start_response, exc.status, str(exc), exc.code)
         except (ValueError, UnicodeError, RecursionError):
             return error(start_response, 400, '请求参数无效，请检查 url、format 和 keep_images。', 'invalid_request')
+        # YouTube links with no configured routing rule take the built-in
+        # subtitle-first / ASR-fallback pipeline (yt_text). It runs
+        # asynchronously: this request only creates the task, and the
+        # page polls /api/yt-task/<id> for progress and the result.
+        # Configured rules (browser or server transport) keep their
+        # existing behavior via the router below.
+        try:
+            _host = (urlsplit(url.strip()).hostname or '').lower().rstrip('.')
+        except ValueError:
+            _host = ''
+        if _host in YOUTUBE_HOSTS:
+            try:
+                _routes = settings.read().get('routes', [])
+            except Exception:
+                _routes = []
+            _ruled = any(isinstance(rule, dict) and rule.get('enabled')
+                         and any(matches_host(_host, pattern)
+                                 for pattern in rule.get('hosts', []))
+                         for rule in _routes)
+            if not _ruled:
+                try:
+                    task = yt_text.create_task(url.strip(), fmt)
+                except OSError:
+                    task = None
+                    _ruled = True  # fall back to the router's explanation
+                if not _ruled:
+                    if task is None:
+                        return response(start_response, 429,
+                                        {'ok': False, 'error': '转写任务已满，请稍后重试。', 'code': 'busy'},
+                                        [('Retry-After', '3')])
+                    return response(start_response, 200,
+                                    {'ok': True, 'async': True,
+                                     'task_id': task['id'], 'task': task})
         if not slots.acquire(blocking=False):
             return response(start_response, 429, {'ok': False, 'error': '提取任务已满，请稍后重试。', 'code': 'busy'},
                             [('Retry-After', '3')])

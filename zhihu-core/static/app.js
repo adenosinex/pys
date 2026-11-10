@@ -35,6 +35,7 @@ function showAccount(username) {
   window.siteSettingsUI.accountChanged(activeUsername);
   loadCookieState();
   loadBiliCookieState();
+  loadMacCodeState();
 }
 
 function cookieMessage(message, kind = '') {
@@ -312,6 +313,99 @@ $('remove-bili-cookie').addEventListener('click', async () => {
   finally { biliCookieBusy = false; biliCookieButtons(); }
 });
 
+// Mac transcription access code (write-only): the value is stored
+// server-side for the YouTube ASR fallback and never read back; the
+// panel only ever learns whether one is configured.
+let macCodeState = null;
+let macCodeBusy = false;
+
+function macMessage(message, kind = '') {
+  $('mac-message').textContent = message;
+  $('mac-message').className = 'message' + (kind ? ' ' + kind : '');
+}
+
+function renderMacCodeState(data) {
+  macCodeState = data;
+  $('mac-badge').textContent = data.configured ? '已保存' : '未配置';
+  $('mac-badge').dataset.state = data.configured ? 'valid' : 'unchecked';
+  $('save-mac').disabled = macCodeBusy;
+  $('remove-mac').disabled = macCodeBusy || !data.configured;
+}
+
+async function loadMacCodeState() {
+  try {
+    const data = await api('/api/mac-code');
+    if (!activeUsername) return;
+    renderMacCodeState(data);
+    macMessage(data.configured ? '已保存访问码，YouTube 无字幕时会自动用 Mac 转写。'
+      : '尚未配置：YouTube 视频没有字幕时将无法转写。');
+  } catch (error) { macMessage(error.message, 'warning'); }
+}
+
+$('mac-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (macCodeBusy || !activeUsername) return;
+  const value = $('mac-input').value.trim();
+  if (!value) { macMessage('请先粘贴访问码。', 'warning'); return; }
+  macCodeBusy = true;
+  renderMacCodeState(macCodeState || {configured: false});
+  try {
+    const data = await api('/api/mac-code', {access_code: value});
+    $('mac-input').value = '';
+    renderMacCodeState(data);
+    macMessage('访问码已保存到服务器。', 'success');
+  } catch (error) { macMessage(error.message, 'warning'); }
+  finally { macCodeBusy = false; renderMacCodeState(macCodeState || {configured: false}); }
+});
+
+$('remove-mac').addEventListener('click', async () => {
+  if (macCodeBusy || !activeUsername) return;
+  macCodeBusy = true;
+  renderMacCodeState(macCodeState || {configured: false});
+  try {
+    const data = await api('/api/mac-code/remove', {});
+    renderMacCodeState(data);
+    macMessage('已删除保存的访问码。');
+  } catch (error) { macMessage(error.message, 'warning'); }
+  finally { macCodeBusy = false; renderMacCodeState(macCodeState || {configured: false}); }
+});
+
+// Live progress for the built-in YouTube pipeline. settings.js polls
+// the task and forwards snapshots here; null hides the block again.
+let tpTimer = null;
+let tpAnchor = 0;
+
+function tpFormatElapsed(sec) {
+  const total = Math.max(0, Math.floor(sec));
+  return String(Math.floor(total / 60)).padStart(2, '0') + ':'
+    + String(total % 60).padStart(2, '0');
+}
+
+function ytTaskProgress(task) {
+  const block = $('task-progress');
+  if (!task) {
+    block.hidden = true;
+    if (tpTimer) { clearInterval(tpTimer); tpTimer = null; }
+    return;
+  }
+  block.hidden = false;
+  const label = task.stage_label || '正在处理…';
+  $('tp-stage').textContent = label + (task.position > 1 ? `（排队第 ${task.position} 位）` : '');
+  $('tp-detail').textContent = task.detail || '';
+  const bar = $('tp-bar');
+  if (typeof task.overall_percent === 'number') bar.value = task.overall_percent;
+  else bar.removeAttribute('value');
+  $('status').textContent = label;
+  tpAnchor = Date.now() - (task.elapsed_sec || 0) * 1000;
+  $('tp-elapsed').textContent = tpFormatElapsed((Date.now() - tpAnchor) / 1000);
+  if (!tpTimer) {
+    tpTimer = setInterval(() => {
+      $('tp-elapsed').textContent = tpFormatElapsed((Date.now() - tpAnchor) / 1000);
+    }, 500);
+  }
+}
+window.onYtTaskProgress = ytTaskProgress;
+
 // Clipboard workflow follows the supplied page: read/extract, then click/copy.
 const flow = {links: [], selected: '', busy: false, reading: false, copying: false,
   phase: 'idle', controller: null, generation: 0, lastCopiedText: ''};
@@ -431,6 +525,7 @@ function renderLinks() {
 
 function cancelExtraction(quiet = false) {
   flow.generation += 1;
+  ytTaskProgress(null);
   flow.controller?.abort();
   flow.controller = null;
   flow.busy = false;
@@ -505,7 +600,7 @@ async function extractContent({copyOnNextClick = false} = {}) {
     currentResult = data;
     $('result-title').textContent = data.title || '提取结果';
     $('result-meta').textContent = [data.author, data.published].filter(Boolean).join(' · ') || '—';
-    { const elapsedMs = Math.round(performance.now() - startedAt); const kb = n => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? (n / 1024).toFixed(1) + ' KB' : n + ' B'; const parts = ['用时 ' + (elapsedMs >= 1000 ? (elapsedMs / 1000).toFixed(1) + ' 秒' : elapsedMs + ' 毫秒')]; if (typeof data.stats?.fetched_bytes === 'number') parts.push('拉取 ' + kb(data.stats.fetched_bytes)); const outBytes = new TextEncoder().encode(data.content).length; parts.push('输出 ' + kb(outBytes) + '（' + data.content.length.toLocaleString() + ' 字）'); $('result-meta').textContent += ' · ' + parts.join(' · '); }
+    { const elapsedMs = Math.round(performance.now() - startedAt); const kb = n => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? (n / 1024).toFixed(1) + ' KB' : n + ' B'; const parts = ['用时 ' + (elapsedMs >= 1000 ? (elapsedMs / 1000).toFixed(1) + ' 秒' : elapsedMs + ' 毫秒')]; if (typeof data.stats?.fetched_bytes === 'number') parts.push('拉取 ' + kb(data.stats.fetched_bytes)); if (data.origin) parts.push('来源 ' + data.origin); const outBytes = new TextEncoder().encode(data.content).length; parts.push('输出 ' + kb(outBytes) + '（' + data.content.length.toLocaleString() + ' 字）'); $('result-meta').textContent += ' · ' + parts.join(' · '); }
     $('result-source').href = flow.selected;
     $('result-source').hidden = false;
     $('content').textContent = data.content;

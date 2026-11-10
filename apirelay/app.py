@@ -2,15 +2,22 @@
 """API 中转检测 (apirelay): AI API 集中转发 + 上游中转站检测。
 
 - 上游管理: 网页添加 (名称 / base_url / API key 导入), key 只写不
-  回显, 存在平台数据目录 credentials.json (0600)。
+  回显, 存在平台数据目录 credentials.json (0600)。已添加上游可在
+  卡片上编辑 (改名 / 改 base_url / 换 key; key 留空 = 保持不变,
+  保存后自动重测; 改名同步默认上游指向, 删除默认上游时清空指向)。
 - 自动检测: 添加后自动跑一轮, 之后可手动重测单个或全部。每个 key
   最多测两个模型: 从上游 /v1/models 里挑最新 Opus 与最新 Sol, 各发
   一个固定简单问题, 记录 token 用量核对 (上游自报 vs 本地估算)、
   延迟、对端 IP 与归属 (ip-api + Scamalytics, 一周缓存)、机器特点
   推测。结果逐行落 tests.csv, 网页可下载。
-- 透明转发: /r/<上游名>/v1/<path> 原样透传 (含流式), 服务端注入
-  上游 key; 调用方持本服务的转发令牌 (页面设置, 只写不回显)。
-  每次转发记一条日志 (SQLite), 网页可看最近记录与导出 CSV。
+- 透明转发: 统一入口 /v1/<path>, 靠 model 名前缀 <上游名>/<模型名>
+  识别上游 (前缀剥离后转发), 无前缀走默认上游; GET /v1/models
+  聚合全部上游模型 (id 带前缀)。旧 /r/<上游名>/v1/<path> 兼容保留。
+  原样透传 (含流式), 服务端注入上游 key; 调用方持本服务的转发
+  令牌 (页面设置, 只写不回显)。每次转发记一条日志 (SQLite, 含
+  解析上游、剥前缀后模型与原文模型串), 网页可看与导出 CSV。
+- base_url 归一化: 登记值带不带 /v1 后缀都接受 (_api_base), 请求
+  时归一, 不改登记原文。
 - 项目内无任何验证代码: 身份网关在面板层 (平台规则)。Stdlib only。
 """
 import csv
@@ -70,10 +77,15 @@ def _load_store():
                 d["upstreams"] = {}
             if not isinstance(d.get("relay_token"), str):
                 d["relay_token"] = ""
+            if not isinstance(d.get("default_upstream"), str):
+                d["default_upstream"] = ""
+            if d.get("models_scope") not in ("core", "all"):
+                d["models_scope"] = "core"
             return d
     except Exception:
         pass
-    return {"upstreams": {}, "relay_token": ""}
+    return {"upstreams": {}, "relay_token": "", "default_upstream": "",
+            "models_scope": "core"}
 
 
 def _save_store(d):
@@ -315,13 +327,9 @@ def _version_key(mid, family):
     dm = re.search(r"(20\d{2})(\d{2})(\d{2})", low)
     date = int("".join(dm.groups())) if dm else 0
     bare = re.sub(r"-?20\d{6}", "", low)
-    idx = bare.find(family)
-    rest = bare[idx + len(family):] if idx >= 0 else bare
-    m = re.match(r"[-_. ]?(\d{1,3})(?:[-_.](\d{1,3}))?(?:[-_.](\d{1,3}))?",
-                 rest)
-    ver = (0, 0, 0)
-    if m:
-        ver = tuple(int(g) if g else 0 for g in m.groups())
+    # Version numbers may sit before the family name (gpt-6.1-sol) or
+    # after it (claude-opus-4-5): take every integer run, in order.
+    ver = tuple(int(x) for x in re.findall(r"\d+", bare)) or (0,)
     return (ver, date, bare)
 
 
@@ -386,7 +394,63 @@ def _geo_into(row, peer_ip):
     row["machine_guess"] = info["guess"]
 
 
-def _chat_test(name, base, auth, mid):
+_ENDPOINT_TAILS = ("/chat/completions", "/completions", "/models",
+                   "/embeddings", "/responses")
+
+
+def _normalize_base(raw):
+    """Add-form entry: whatever shape gets pasted becomes the stored
+    base. Accepts a bare host, host/v1, trailing slashes, a missing
+    scheme, and even a full endpoint URL (.../v1/chat/completions,
+    .../v1/models): known endpoint tails are cut back off, repeatedly.
+    The user never has to figure out which slice to paste. Returns ""
+    when there is no usable host."""
+    b = (raw or "").strip()
+    if not b:
+        return ""
+    if "://" not in b:
+        b = "https://" + b
+    parts = urllib.parse.urlsplit(b)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return ""
+    path = parts.path or ""
+    while True:
+        p = path.rstrip("/")
+        cut = False
+        for tail in _ENDPOINT_TAILS:
+            if p.endswith(tail):
+                p = p[: -len(tail)]
+                cut = True
+                break
+        path = p
+        if not cut:
+            break
+    out = urllib.parse.urlunsplit((parts.scheme, parts.netloc, path,
+                                   "", ""))
+    return out.rstrip("/")
+
+
+def _api_base(base):
+    """Registered base_url -> the API root that /models and
+    /chat/completions hang off. Users paste either https://host or
+    https://host/v1 (the documented OpenAI-style base); accept both
+    and never double-join the /v1 segment (that was the aileader
+    404: base already ended in /v1, code appended another)."""
+    b = (base or "").strip().rstrip("/")
+    if b.endswith("/v1"):
+        return b
+    return b + "/v1"
+
+
+def _body_snip(body, limit=120):
+    try:
+        t = body.decode("utf-8", "replace")
+    except Exception:
+        return ""
+    return " ".join(t.split())[:limit]
+
+
+def _chat_test(name, api, auth, mid):
     row = _blank_row(name, mid)
     payload = {"model": mid,
                "messages": [{"role": "user", "content": TEST_PROMPT}],
@@ -394,7 +458,7 @@ def _chat_test(name, base, auth, mid):
     body = json.dumps(payload).encode("utf-8")
     hdrs = dict(auth)
     hdrs["Content-Type"] = "application/json"
-    res = _http("POST", base + "/v1/chat/completions", headers=hdrs,
+    res = _http("POST", api + "/chat/completions", headers=hdrs,
                 body=body, ctimeout=10, rtimeout=90, max_read=2000000)
     row["http_status"] = res["status"] or ""
     row["latency_ms"] = res["total_ms"]
@@ -456,11 +520,11 @@ def _run_tests(name):
         up = store["upstreams"].get(name)
         if not up:
             return
-        base = (up.get("base_url") or "").rstrip("/")
+        api = _api_base(up.get("base_url"))
         key = up.get("key") or ""
         auth = {"Authorization": "Bearer " + key} if key else {}
         rows = []
-        mres = _http("GET", base + "/v1/models", headers=dict(auth),
+        mres = _http("GET", api + "/models", headers=dict(auth),
                      ctimeout=10, rtimeout=25, max_read=2000000)
         ids = []
         if mres["status"] == 200 and not mres["error"]:
@@ -477,6 +541,10 @@ def _run_tests(name):
             row["latency_ms"] = mres["total_ms"]
             row["ttfb_ms"] = mres["ttfb_ms"]
             why = mres["error"] or ("HTTP %d" % mres["status"])
+            if not mres["error"]:
+                snip = _body_snip(mres.get("body") or b"")
+                if snip:
+                    why += ": " + snip
             row["error"] = "模型列表不可用: " + why
             _geo_into(row, mres.get("peer_ip", ""))
             rows.append(row)
@@ -488,7 +556,7 @@ def _run_tests(name):
                     row["error"] = "上游 /v1/models 无该家族模型"
                     rows.append(row)
                     continue
-                rows.append(_chat_test(name, base, auth, mid))
+                rows.append(_chat_test(name, api, auth, mid))
         _append_test_rows(rows)
         _save_last(name, rows)
     finally:
@@ -513,19 +581,23 @@ def _relay_conn():
         " model TEXT, status INTEGER, latency_ms INTEGER,"
         " prompt_tokens TEXT, completion_tokens TEXT, total_tokens TEXT,"
         " error TEXT)")
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(relay_log)")]
+    if "req_model" not in cols:
+        conn.execute("ALTER TABLE relay_log ADD COLUMN req_model TEXT")
     return conn
 
 
-def _log_relay(upstream, model, status, latency_ms, usage, error):
+def _log_relay(upstream, model, status, latency_ms, usage, error,
+               req_model=""):
     try:
         with _log_lock:
             conn = _relay_conn()
             conn.execute(
-                "INSERT INTO relay_log (ts, upstream, model, status,"
-                " latency_ms, prompt_tokens, completion_tokens,"
-                " total_tokens, error) VALUES (?,?,?,?,?,?,?,?,?)",
-                (_now_str(), upstream, model, status, latency_ms,
-                 usage.get("prompt_tokens", ""),
+                "INSERT INTO relay_log (ts, upstream, model, req_model,"
+                " status, latency_ms, prompt_tokens, completion_tokens,"
+                " total_tokens, error) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (_now_str(), upstream, model, req_model or "", status,
+                 latency_ms, usage.get("prompt_tokens", ""),
                  usage.get("completion_tokens", ""),
                  usage.get("total_tokens", ""), error or ""))
             conn.commit()
@@ -538,7 +610,7 @@ def _recent_logs(limit=100):
     try:
         conn = _relay_conn()
         cur = conn.execute(
-            "SELECT ts, upstream, model, status, latency_ms,"
+            "SELECT ts, upstream, model, req_model, status, latency_ms,"
             " prompt_tokens, completion_tokens, total_tokens, error"
             " FROM relay_log ORDER BY id DESC LIMIT ?", (int(limit),))
         cols = [c[0] for c in cur.description]
@@ -553,7 +625,7 @@ def _logs_csv_text():
     try:
         conn = _relay_conn()
         cur = conn.execute(
-            "SELECT ts, upstream, model, status, latency_ms,"
+            "SELECT ts, upstream, model, req_model, status, latency_ms,"
             " prompt_tokens, completion_tokens, total_tokens, error"
             " FROM relay_log ORDER BY id DESC LIMIT 10000")
         cols = [c[0] for c in cur.description]
@@ -606,16 +678,13 @@ def _extract_usage(acc, tail, is_stream):
     return {}
 
 
-def _handle_relay(environ, start_response, name, rest):
-    store = _load_store()
-    up = store["upstreams"].get(name)
-    if up is None:
-        return _json(start_response, "404 Not Found",
-                     {"ok": False, "error": "上游不存在: " + name})
+def _check_relay_token(environ, store):
+    """None when the caller carries the relay token, else an
+    (status, payload) error tuple."""
     token = store.get("relay_token") or ""
     if not token:
-        return _json(start_response, "503 Service Unavailable",
-                     {"ok": False, "error": "转发令牌未设置, 请先在页面设置"})
+        return ("503 Service Unavailable",
+                {"ok": False, "error": "转发令牌未设置, 请先在页面设置"})
     given = ""
     authz = environ.get("HTTP_AUTHORIZATION", "")
     if authz.lower().startswith("bearer "):
@@ -623,17 +692,22 @@ def _handle_relay(environ, start_response, name, rest):
     if not given:
         given = environ.get("HTTP_X_API_KEY", "")
     if not given or not _sec.compare_digest(given, token):
-        return _json(start_response, "401 Unauthorized",
-                     {"ok": False, "error": "转发令牌无效"})
-    method = environ.get("REQUEST_METHOD", "GET")
+        return ("401 Unauthorized", {"ok": False, "error": "转发令牌无效"})
+    return None
+
+
+def _read_relay_body(environ):
+    """Read the request body (32 MiB cap) and peek at model/stream.
+    Returns {"body", "model", "stream"} or {"error_status",
+    "error_payload"}."""
     raw_len = environ.get("CONTENT_LENGTH") or ""
     try:
         length = int(raw_len) if raw_len else 0
     except Exception:
         length = 0
     if length > 32 * 1024 * 1024:
-        return _json(start_response, "413 Payload Too Large",
-                     {"ok": False, "error": "请求体过大"})
+        return {"error_status": "413 Payload Too Large",
+                "error_payload": {"ok": False, "error": "请求体过大"}}
     wsgi_in = environ.get("wsgi.input")
     body = b""
     if wsgi_in is not None:
@@ -657,8 +731,9 @@ def _handle_relay(environ, start_response, name, rest):
                 chunks.append(chunk)
                 got += len(chunk)
                 if got > 32 * 1024 * 1024:
-                    return _json(start_response, "413 Payload Too Large",
-                                 {"ok": False, "error": "请求体过大"})
+                    return {"error_status": "413 Payload Too Large",
+                            "error_payload": {"ok": False,
+                                              "error": "请求体过大"}}
             body = b"".join(chunks)
     model = ""
     req_stream = False
@@ -670,8 +745,192 @@ def _handle_relay(environ, start_response, name, rest):
                 req_stream = bool(reqj.get("stream"))
         except Exception:
             pass
-    base = (up.get("base_url") or "").rstrip("/")
-    url = base + "/v1/" + rest
+    return {"body": body, "model": model, "stream": req_stream}
+
+
+def _resolve_route(store, model):
+    """Prefix routing: '<upstream>/<model>' routes only when the head
+    is exactly a registered upstream name; otherwise the whole string
+    is the model and the configured default upstream takes it.
+    Returns (upstream_name, model_to_forward) or (None, model)."""
+    head, sep, tail = (model or "").partition("/")
+    if sep and head in store["upstreams"]:
+        return head, tail
+    dflt = store.get("default_upstream") or ""
+    if dflt and dflt in store["upstreams"]:
+        return dflt, model
+    return None, model
+
+
+def _preflight(environ, start_response):
+    """CORS preflight for the relay surface. Browser/WebView clients
+    send OPTIONS *without* any Authorization header (that is the
+    point of a preflight), so it must be answered before the token
+    check — otherwise the real request never leaves the client.
+    (2026-11-09 实测: 一个 WebView 客户端连发 12 次 OPTIONS
+    /v1/models 全被 401 挡下, 真正的 GET 一次都没发出, 客户端只
+    报「获取模型失败」; 非浏览器客户端不发预检, 所以 SDK 实测
+    一直是通的。)"""
+    origin = environ.get("HTTP_ORIGIN", "") or "*"
+    req_hdrs = (environ.get("HTTP_ACCESS_CONTROL_REQUEST_HEADERS", "")
+                or "Authorization, Content-Type, X-Api-Key")
+    start_response("204 No Content", [
+        ("Access-Control-Allow-Origin", origin),
+        ("Access-Control-Allow-Methods",
+         "GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+        ("Access-Control-Allow-Headers", req_hdrs),
+        ("Access-Control-Max-Age", "86400"),
+        ("Vary", "Origin, Access-Control-Request-Headers"),
+        ("Content-Length", "0"),
+    ])
+    return [b""]
+
+
+class _CorsResp:
+    """start_response wrapper that appends Access-Control-Allow-Origin
+    (echoing the request Origin) to every relay-surface response —
+    without it a browser/WebView client refuses to expose even a
+    200 response body to the page's JS."""
+
+    def __init__(self, sr, environ):
+        self.sr = sr
+        self.origin = environ.get("HTTP_ORIGIN", "") or ""
+
+    def __call__(self, status, headers, exc_info=None):
+        if self.origin:
+            headers = list(headers) + [
+                ("Access-Control-Allow-Origin", self.origin),
+                ("Vary", "Origin"),
+            ]
+        return self.sr(status, headers, exc_info)
+
+
+def _handle_relay(environ, start_response, name, rest):
+    """Legacy per-upstream URL: /r/<name>/v1/<path> (kept working)."""
+    store = _load_store()
+    up = store["upstreams"].get(name)
+    if up is None:
+        return _json(start_response, "404 Not Found",
+                     {"ok": False, "error": "上游不存在: " + name})
+    bad = _check_relay_token(environ, store)
+    if bad:
+        return _json(start_response, bad[0], bad[1])
+    rd = _read_relay_body(environ)
+    if "error_status" in rd:
+        return _json(start_response, rd["error_status"],
+                     rd["error_payload"])
+    return _relay_forward(environ, start_response, name, up, rest, rd)
+
+
+def _handle_relay_unified(environ, start_response, rest):
+    """Single entry /v1/<path>: the upstream is chosen by the model
+    name's prefix (or the default upstream), never by the URL."""
+    store = _load_store()
+    bad = _check_relay_token(environ, store)
+    if bad:
+        return _json(start_response, bad[0], bad[1])
+    rd = _read_relay_body(environ)
+    if "error_status" in rd:
+        return _json(start_response, rd["error_status"],
+                     rd["error_payload"])
+    name, fwd_model = _resolve_route(store, rd["model"])
+    if name is None:
+        return _json(start_response, "400 Bad Request",
+                     {"ok": False,
+                      "error": "无法确定上游: model 需写 <上游名>/<模型名>, "
+                               "或先在页面设置默认上游"})
+    up = store["upstreams"][name]
+    return _relay_forward(environ, start_response, name, up, rest, rd,
+                          fwd_model=fwd_model)
+
+
+def _handle_models_agg(environ, start_response):
+    """GET /v1/models: every upstream's models, ids rewritten to
+    '<upstream>/<model>' so one list drives all routing. A single
+    upstream failing is skipped and named in failed_upstreams.
+
+    Directory scope: by default only the Sol / Opus families are
+    listed (same substring rule the tester uses to pick models).
+    The persisted models_scope setting decides; ?all=1 / ?all=0
+    overrides it for a single request without touching the setting.
+    This filter applies ONLY to this aggregated directory -- the
+    per-upstream tester reads each upstream's own /v1/models."""
+    store = _load_store()
+    bad = _check_relay_token(environ, store)
+    if bad:
+        return _json(start_response, bad[0], bad[1])
+    qs = urllib.parse.parse_qs(environ.get("QUERY_STRING", ""))
+    all_par = (qs.get("all") or [None])[0]
+    if all_par == "1":
+        scope = "all"
+    elif all_par == "0":
+        scope = "core"
+    else:
+        scope = store.get("models_scope") or "core"
+    results = {}
+
+    def fetch(nm, up):
+        key = up.get("key") or ""
+        auth = {"Authorization": "Bearer " + key} if key else {}
+        res = _http("GET", _api_base(up.get("base_url")) + "/models",
+                    headers=auth, ctimeout=8, rtimeout=20,
+                    max_read=2000000)
+        ids = []
+        if res["status"] == 200 and not res["error"]:
+            try:
+                data = json.loads(res["body"].decode("utf-8", "replace"))
+                for it in data.get("data", []):
+                    if isinstance(it, dict) and it.get("id"):
+                        ids.append(str(it["id"]))
+            except Exception:
+                ids = []
+        results[nm] = ids
+
+    ths = []
+    for nm in sorted(store["upstreams"]):
+        t = threading.Thread(target=fetch,
+                             args=(nm, store["upstreams"][nm]),
+                             daemon=True)
+        t.start()
+        ths.append(t)
+    for t in ths:
+        t.join(timeout=30)
+    data = []
+    failed = []
+    for nm in sorted(results):
+        if not results[nm]:
+            failed.append(nm)
+        for mid in results[nm]:
+            if scope == "core":
+                low = mid.lower()
+                if "opus" not in low and "sol" not in low:
+                    continue
+            data.append({"id": nm + "/" + mid, "object": "model",
+                         "created": 0, "owned_by": nm})
+    out = {"object": "list", "data": data, "models_scope": scope}
+    if failed:
+        out["failed_upstreams"] = failed
+    return _json(start_response, "200 OK", out)
+
+
+def _relay_forward(environ, start_response, name, up, rest, rd,
+                   fwd_model=None):
+    method = environ.get("REQUEST_METHOD", "GET")
+    body = rd["body"]
+    orig_model = rd["model"]
+    model = orig_model
+    req_stream = rd["stream"]
+    if fwd_model is not None and fwd_model != orig_model and body:
+        try:
+            reqj = json.loads(body.decode("utf-8", "replace"))
+            if isinstance(reqj, dict):
+                reqj["model"] = fwd_model
+                body = json.dumps(reqj,
+                                  ensure_ascii=False).encode("utf-8")
+                model = fwd_model
+        except Exception:
+            pass
+    url = _api_base(up.get("base_url")) + "/" + rest
     qs = environ.get("QUERY_STRING", "")
     if qs:
         url += "?" + qs
@@ -714,7 +973,8 @@ def _handle_relay(environ, start_response, name, rest):
         resp = conn.getresponse()
     except Exception as exc:
         _log_relay(name, model, 0, int((time.time() - t0) * 1000), {},
-                   "%s: %s" % (type(exc).__name__, exc))
+                   "%s: %s" % (type(exc).__name__, exc),
+                   req_model=orig_model)
         try:
             conn.close()
         except Exception:
@@ -759,7 +1019,8 @@ def _handle_relay(environ, start_response, name, rest):
                 pass
             usage = _extract_usage(bytes(acc), bytes(tail), is_stream)
             _log_relay(name, model, status,
-                       int((time.time() - t0) * 1000), usage, err)
+                       int((time.time() - t0) * 1000), usage, err,
+                       req_model=orig_model)
 
     start_response("%d %s" % (status, reason), out_headers)
     return gen()
@@ -816,6 +1077,7 @@ def _api_status():
         ups.append({
             "name": name,
             "base_url": u.get("base_url", ""),
+            "api_base": _api_base(u.get("base_url", "")),
             "key_set": bool(u.get("key")),
             "created": u.get("created", ""),
             "testing": bool(_testing.get(name)),
@@ -824,19 +1086,22 @@ def _api_status():
         })
     return "200 OK", {"ok": True,
                       "relay_token_set": bool(store.get("relay_token")),
+                      "default_upstream":
+                          store.get("default_upstream", ""),
+                      "models_scope": store.get("models_scope", "core"),
                       "est_method": EST_METHOD, "upstreams": ups}
 
 
 def _api_add(environ):
     d = _read_body_json(environ)
     name = (d.get("name") or "").strip()
-    base = (d.get("base_url") or "").strip().rstrip("/")
+    raw_base = (d.get("base_url") or "").strip()
+    base = _normalize_base(raw_base)
     key = (d.get("key") or "").strip()
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$", name):
         return "400 Bad Request", {"ok": False,
                                    "error": "名称只允许字母数字与 _- (1-40 字符)"}
-    parts = urllib.parse.urlsplit(base)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
+    if not base:
         return "400 Bad Request", {"ok": False, "error": "base_url 不合法"}
     if not key:
         return "400 Bad Request", {"ok": False, "error": "API key 不能为空"}
@@ -850,15 +1115,23 @@ def _api_add(environ):
                                     "created": _now_str()}
         _save_store(store)
     _spawn_tests(name)
-    return "200 OK", {"ok": True, "testing": True}
+    return "200 OK", {"ok": True, "testing": True,
+                      "base_url": base, "api_base": _api_base(base),
+                      "normalized": base != raw_base.rstrip("/")}
 
 
 def _api_delete(name):
+    default_cleared = False
     with _store_lock:
         store = _load_store()
         if name not in store["upstreams"]:
             return "404 Not Found", {"ok": False, "error": "上游不存在"}
         del store["upstreams"][name]
+        if store.get("default_upstream") == name:
+            # 默认上游被删时同步清空指向, 不留悬空名字 (此前未处理:
+            # 指针残留, 只是 _resolve_route 兜底落空才没出故障)。
+            store["default_upstream"] = ""
+            default_cleared = True
         _save_store(store)
     with _csv_lock:
         last = _load_last()
@@ -868,7 +1141,80 @@ def _api_delete(name):
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(last, fh, ensure_ascii=False)
             os.replace(tmp, LAST_TESTS)
-    return "200 OK", {"ok": True}
+    return "200 OK", {"ok": True, "default_cleared": default_cleared}
+
+
+def _api_edit(name, environ):
+    """Edit an existing upstream in place. Body fields are all
+    optional: new_name (rename; must not collide), base_url
+    (re-normalized via _normalize_base), key (write-only: an absent
+    or empty key leaves the stored key untouched; only a non-empty
+    key replaces it). A rename moves the last-tests entry to the new
+    name (tests.csv history rows keep the old name — they are
+    historical fact) and retargets default_upstream. Validation
+    failures return before anything is saved, so a rejected edit
+    never lands partially. On success the upstream is retested,
+    same as on add."""
+    d = _read_body_json(environ)
+    with _store_lock:
+        store = _load_store()
+        up = store["upstreams"].get(name)
+        if up is None:
+            return "404 Not Found", {"ok": False, "error": "上游不存在"}
+        new_name = (d.get("new_name") or "").strip()
+        renamed = bool(new_name) and new_name != name
+        if renamed:
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$",
+                            new_name):
+                return "400 Bad Request", {
+                    "ok": False,
+                    "error": "名称只允许字母数字与 _- (1-40 字符)"}
+            if new_name in store["upstreams"]:
+                return "400 Bad Request", {
+                    "ok": False,
+                    "error": "同名上游已存在: " + new_name}
+        raw_base = d.get("base_url")
+        base = up.get("base_url", "")
+        normalized = False
+        if raw_base is not None and str(raw_base).strip():
+            nb = _normalize_base(str(raw_base))
+            if not nb:
+                return "400 Bad Request", {
+                    "ok": False, "error": "base_url 不合法"}
+            normalized = nb != str(raw_base).strip().rstrip("/")
+            base = nb
+        key = (d.get("key") or "").strip()
+        key_changed = False
+        if key:
+            if len(key) > 500:
+                return "400 Bad Request", {
+                    "ok": False, "error": "API key 过长"}
+            key_changed = True
+        new_up = dict(up)
+        new_up["base_url"] = base
+        if key_changed:
+            new_up["key"] = key
+        eff = new_name if renamed else name
+        if renamed:
+            del store["upstreams"][name]
+            if store.get("default_upstream") == name:
+                store["default_upstream"] = eff
+        store["upstreams"][eff] = new_up
+        _save_store(store)
+    if renamed:
+        with _csv_lock:
+            last = _load_last()
+            if name in last:
+                last[eff] = last.pop(name)
+                tmp = LAST_TESTS + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(last, fh, ensure_ascii=False)
+                os.replace(tmp, LAST_TESTS)
+    _spawn_tests(eff)
+    return "200 OK", {"ok": True, "name": eff, "renamed": renamed,
+                      "base_url": base, "api_base": _api_base(base),
+                      "normalized": normalized,
+                      "key_changed": key_changed, "testing": True}
 
 
 def _test_all_worker():
@@ -907,6 +1253,19 @@ _PAGE_CSS = (
     ".warn{color:#b45309}"
     "code{background:#f3f4f6;padding:1px 5px;border-radius:5px;font-size:12px}"
     "a{color:#2563eb;text-decoration:none}"
+    "pre{background:#0f172a;color:#e2e8f0;border-radius:8px;padding:10px;"
+    "font-size:12px;overflow-x:auto;white-space:pre-wrap;"
+    "word-break:break-all;margin:8px 0 0}"
+    # 窄屏防越位: 表格关进横滚容器, 长串 (URL/模型名/IPv6/归属文案)
+    # 在单元格内任意断行, flex 子项允许收缩, 页面整体不许横滚。
+    ".tblwrap{overflow-x:auto;-webkit-overflow-scrolling:touch;"
+    "max-width:100%}"
+    ".tbl td{overflow-wrap:anywhere}"
+    "code{overflow-wrap:anywhere}"
+    ".row>*,.card>.hd>*{min-width:0}"
+    ".inp{min-width:0}"
+    ".editbox{border-top:1px dashed #d1d5db;margin-top:10px;"
+    "padding-top:10px}"
 )
 
 PAGE_HOME = """<!DOCTYPE html>
@@ -917,19 +1276,29 @@ PAGE_HOME = """<!DOCTYPE html>
 <h1>API 中转检测</h1>
 <div class="mut">AI API 集中转发 + 上游检测: 每 key 最多测两个模型 (最新 Opus / 最新 Sol), 比对 token 用量、延迟与对端 IP 归属。</div>
 
+<div class="sec"><h2>直接可用 (标准 OpenAI 客户端)</h2>
+<div class="mut" style="margin-bottom:8px">任何 OpenAI 兼容客户端只填两项: base_url 用主地址 (连不上换备用), api_key 填本页「透明转发」区设置的<b>转发令牌</b>。不需要 cookie, 不需要直连码。model 写 &lt;上游名&gt;/&lt;模型名&gt; 选上游, 不带前缀走默认上游。点地址或示例右侧按钮即复制。</div>
+<div class="row"><span class="mut">主 base_url</span><code id="cpBase1">https://debi.su7.dpdns.org/apirelay-api/v1</code><button class="btn sm ghost" data-copy="cpBase1">复制</button><span class="mut ok" data-copied></span></div>
+<div class="row" style="margin-top:6px"><span class="mut">备用 base_url</span><code id="cpBase2">https://debi4.su7.dpdns.org/apirelay-api/v1</code><button class="btn sm ghost" data-copy="cpBase2">复制</button><span class="mut ok" data-copied></span></div>
+<div class="row" style="margin-top:10px"><span class="mut">curl 示例</span><button class="btn sm ghost" data-copy="cpCurl">复制</button><span class="mut ok" data-copied></span></div>
+<pre id="cpCurl">加载中…</pre>
+<div class="row" style="margin-top:10px"><span class="mut">模型目录范围</span><b id="scopeState">…</b><button class="btn sm ghost" id="scopeBtn">切换</button></div>
+<div class="mut" style="margin-top:6px">聚合 <code>GET /v1/models</code> 默认只列 Sol / Opus 两系, 客户端模型列表更干净; 切到「全部模型」立即生效并保持。单次请求可用 <code>?all=1</code> / <code>?all=0</code> 临时覆盖。此开关只影响聚合目录, 每家上游的自动检测仍读其完整模型列表。</div>
+</div>
+
 <div class="sec"><h2>透明转发</h2>
 <div class="row">
 <input class="inp" id="tok" type="password" placeholder="设置转发令牌 (至少 8 位, 只写不回显)" autocomplete="off">
 <button class="btn" id="tokBtn">设置令牌</button>
 <span class="mut" id="tokState"></span>
 </div>
-<div class="mut" style="margin-top:8px">调用格式: <code id="relayHint"></code> 请求头带 <code>Authorization: Bearer &lt;转发令牌&gt;</code>, 服务端自动注入对应上游的 key, 请求与响应 (含流式) 原样透传。</div>
+<div class="mut" style="margin-top:8px">统一入口: <code id="relayHint"></code> 请求头带 <code>Authorization: Bearer &lt;转发令牌&gt;</code>。model 写 <code>&lt;上游名&gt;/&lt;模型名&gt;</code> (如 <code>aileader/gpt-6.1-sol</code>): 前缀恰为已登记上游名时剥离前缀转发到该上游; 不带前缀走默认上游 (当前: <span id="defState">未设置</span>, 在上游卡片上可设)。<code>GET /v1/models</code> (带令牌) 聚合全部上游模型, id 统一为 <code>&lt;上游名&gt;/&lt;模型名&gt;</code>。服务端自动注入对应上游 key, 请求与响应 (含流式) 原样透传。旧格式 <code>/r/&lt;上游名&gt;/v1/...</code> 仍可用。</div>
 </div>
 
 <div class="sec"><h2>添加上游</h2>
 <div class="row">
 <input class="inp" id="fName" placeholder="名称 (如 星尘)" autocomplete="off">
-<input class="inp" id="fBase" placeholder="base_url (如 https://api.example.com)" autocomplete="off">
+<input class="inp" id="fBase" placeholder="base_url (裸域名 / …/v1 / 完整 …/chat/completions 地址都可, 自动归一化)" autocomplete="off">
 <input class="inp" id="fKey" type="password" placeholder="API key (只写不回显)" autocomplete="off">
 <button class="btn" id="addBtn">添加并检测</button>
 </div>
@@ -943,6 +1312,7 @@ PAGE_HOME = """<!DOCTYPE html>
 <a class="btn ghost" style="display:inline-block" href="__PFX__/api/tests.csv">下载 tests.csv</a>
 <a class="btn ghost" style="display:inline-block" href="__PFX__/logs">转发日志</a>
 </div>
+<div class="mut" id="editMsg" style="margin-top:6px"></div>
 <div id="ups"></div>
 </div>
 
@@ -955,7 +1325,48 @@ var P = __PREFIX__;
 function esc(s){ s = String(s == null ? '' : s); return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function api(path, opts){ return fetch(P + path, opts).then(function(r){ return r.json(); }); }
 function post(path, obj){ return api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(obj || {})}); }
-document.getElementById('relayHint').textContent = location.origin + P + '/r/<上游名>/v1/chat/completions';
+document.getElementById('relayHint').textContent = location.origin + P + '/v1/chat/completions';
+function copyText(txt, btn){
+  function done(){
+    var s = btn.parentElement.querySelector('[data-copied]');
+    if (s){ s.textContent = '已复制'; setTimeout(function(){ s.textContent = ''; }, 2000); }
+  }
+  function fallback(){
+    var ta = document.createElement('textarea');
+    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta); done();
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(done).catch(fallback);
+  } else { fallback(); }
+}
+var copyBtns = document.querySelectorAll('[data-copy]');
+for (var ci = 0; ci < copyBtns.length; ci++){
+  copyBtns[ci].addEventListener('click', function(){
+    var el = document.getElementById(this.getAttribute('data-copy'));
+    copyText(el ? el.textContent : '', this);
+  });
+}
+function buildCurl(d){
+  var name = '<上游名>';
+  var model = '';
+  if (d.upstreams && d.upstreams.length){
+    name = d.upstreams[0].name;
+    var last = d.upstreams[0].last || [];
+    for (var i = 0; i < last.length; i++){
+      if (last[i].http_status === 200 && last[i].model){ model = last[i].model; break; }
+    }
+  }
+  var full = model ? (name + '/' + model) : (name + '/<模型名>');
+  var Q = String.fromCharCode(39);
+  var payload = '{"model":"' + full + '","messages":[{"role":"user","content":"你好"}],"max_tokens":64}';
+  document.getElementById('cpCurl').textContent =
+    'curl https://debi.su7.dpdns.org/apirelay-api/v1/chat/completions -H ' + Q +
+    'Authorization: Bearer <转发令牌>' + Q + ' -H ' + Q +
+    'Content-Type: application/json' + Q + ' -d ' + Q + payload + Q;
+}
 function flagHtml(r){
   if (r.token_flag === '异常') return '<span class="bad">异常</span>';
   if (r.token_flag === '正常') return '<span class="ok">正常</span>';
@@ -975,23 +1386,48 @@ function rowHtml(r){
     '<td>' + esc(r.peer_ip) + (geo ? ('<br>' + esc(geo)) : '') + '</td>' +
     '<td>' + esc(r.machine_guess) + (r.fraud_score !== '' && r.fraud_score != null ? ('<br>欺诈分 ' + esc(r.fraud_score)) : '') + '</td></tr>';
 }
+var editOpen = {};
+var editVals = {};
+var lastD = null;
+function escA(s){ return esc(s).replace(/"/g, '&quot;'); }
+function editBoxHtml(u){
+  var v = editVals[u.name] || {name: u.name, base: u.base_url, key: '', msg: ''};
+  return '<div class="editbox" data-editbox="' + escA(u.name) + '">' +
+    '<div class="row"><input class="inp" data-ef="name" value="' + escA(v.name) + '" placeholder="名称" autocomplete="off">' +
+    '<input class="inp" data-ef="base" value="' + escA(v.base) + '" placeholder="base_url" autocomplete="off"></div>' +
+    '<div class="row" style="margin-top:6px"><input class="inp" type="password" data-ef="key" value="' + escA(v.key) + '" placeholder="新 key (留空 = 保持原 key 不变)" autocomplete="new-password"></div>' +
+    '<div class="mut" style="margin-top:6px">改名后转发 model 前缀随之变为新名, 旧名前缀随即失效; 历史检测记录 (tests.csv) 保留旧名不迁。保存后自动重测。</div>' +
+    '<div class="row" style="margin-top:6px"><button class="btn sm" data-act="saveedit" data-name="' + escA(u.name) + '">保存并重测</button>' +
+    '<button class="btn sm ghost" data-act="canceledit" data-name="' + escA(u.name) + '">取消</button>' +
+    (v.msg ? '<span class="bad">' + esc(v.msg) + '</span>' : '') + '</div></div>';
+}
 function render(d){
+  lastD = d;
+  buildCurl(d);
   document.getElementById('tokState').textContent = d.relay_token_set ? '已设置' : '未设置 (转发不可用)';
+  document.getElementById('defState').textContent = d.default_upstream || '未设置';
+  var scAll = d.models_scope === 'all';
+  document.getElementById('scopeState').textContent = scAll ? '全部模型' : '仅 Sol / Opus';
+  document.getElementById('scopeBtn').textContent = scAll ? '切回仅 Sol / Opus' : '显示全部模型';
   document.getElementById('estm').textContent = d.est_method === 'tiktoken-cl100k' ? 'tiktoken cl100k' : '字符比例 (中文约 0.67/字, 其他约 0.25/字)';
   var box = document.getElementById('ups');
   if (!d.upstreams.length){ box.innerHTML = '<div class="mut" style="margin-top:8px">暂无上游</div>'; return; }
   var h = '';
   d.upstreams.forEach(function(u){
     h += '<div class="card"><div class="hd"><b>' + esc(u.name) + '</b><code>' + esc(u.base_url) + '</code>' +
+      (u.api_base && u.api_base !== u.base_url ? '<span class="mut">生效基址 ' + esc(u.api_base) + '</span>' : '') +
       '<span class="mut">key ' + (u.key_set ? '已配置' : '未配置') + '</span>' +
       (u.testing ? '<span class="warn">检测中…</span>' : '') +
       '<span style="flex:1"></span>' +
+      (d.default_upstream === u.name ? '<span class="ok">默认上游</span>' : '<button class="btn sm ghost" data-act="default" data-name="' + esc(u.name) + '">设为默认</button>') +
+      '<button class="btn sm ghost" data-act="edit" data-name="' + esc(u.name) + '">编辑</button>' +
       '<button class="btn sm ghost" data-act="test" data-name="' + esc(u.name) + '">重测</button>' +
       '<button class="btn sm danger" data-act="delete" data-name="' + esc(u.name) + '">删除</button></div>';
+    if (editOpen[u.name]){ h += editBoxHtml(u); }
     if (u.last && u.last.length){
-      h += '<table class="tbl"><tr><th>模型</th><th>状态</th><th>token 比值</th><th>延迟</th><th>对方 IP / 归属</th><th>机器特点</th></tr>';
+      h += '<div class="tblwrap"><table class="tbl"><tr><th>模型</th><th>状态</th><th>token 比值</th><th>延迟</th><th>对方 IP / 归属</th><th>机器特点</th></tr>';
       u.last.forEach(function(r){ h += rowHtml(r); });
-      h += '</table><div class="mut">最近检测: ' + esc(u.last_ts) + ' UTC</div>';
+      h += '</table></div><div class="mut">最近检测: ' + esc(u.last_ts) + ' UTC</div>';
     } else {
       h += '<div class="mut" style="margin-top:6px">暂无检测结果</div>';
     }
@@ -1004,14 +1440,57 @@ document.getElementById('ups').addEventListener('click', function(e){
   var b = e.target.closest('button[data-act]');
   if (!b) return;
   var name = b.getAttribute('data-name');
-  if (b.getAttribute('data-act') === 'delete' && !confirm('删除上游 ' + name + ' ? (历史 CSV 行保留)')) return;
-  post('/api/upstreams/' + encodeURIComponent(name) + '/' + b.getAttribute('data-act')).then(refresh);
+  var act = b.getAttribute('data-act');
+  if (act === 'delete' && !confirm('删除上游 ' + name + ' ? (历史 CSV 行保留)')) return;
+  if (act === 'default'){ post('/api/default-upstream', {name: name}).then(refresh); return; }
+  if (act === 'edit'){
+    editOpen[name] = true;
+    if (!editVals[name] && lastD){
+      for (var i = 0; i < lastD.upstreams.length; i++){
+        if (lastD.upstreams[i].name === name){ editVals[name] = {name: name, base: lastD.upstreams[i].base_url, key: '', msg: ''}; break; }
+      }
+    }
+    if (lastD) render(lastD);
+    return;
+  }
+  if (act === 'canceledit'){
+    editOpen[name] = false;
+    delete editVals[name];
+    if (lastD) render(lastD);
+    return;
+  }
+  if (act === 'saveedit'){
+    var v = editVals[name] || {name: name, base: '', key: '', msg: ''};
+    post('/api/upstreams/' + encodeURIComponent(name) + '/edit', {new_name: v.name, base_url: v.base, key: v.key}).then(function(d){
+      if (d.ok){
+        delete editOpen[name];
+        delete editVals[name];
+        var em = document.getElementById('editMsg');
+        if (em){ em.textContent = '已保存' + (d.renamed ? (' 并改名为 ' + d.name) : '') + (d.normalized ? ('; base_url 已归一化为 ' + d.base_url + ', 生效基址 ' + d.api_base) : '') + (d.key_changed ? '; key 已更新' : '; key 未变') + ', 正在自动重测…'; }
+      } else {
+        if (!editVals[name]) editVals[name] = v;
+        editVals[name].msg = '失败: ' + (d.error || '未知');
+      }
+      refresh();
+    });
+    return;
+  }
+  post('/api/upstreams/' + encodeURIComponent(name) + '/' + act).then(refresh);
+});
+document.getElementById('ups').addEventListener('input', function(e){
+  var t = e.target;
+  if (!t.getAttribute || !t.getAttribute('data-ef')) return;
+  var box = t.closest('[data-editbox]');
+  if (!box) return;
+  var nm = box.getAttribute('data-editbox');
+  if (!editVals[nm]) editVals[nm] = {name: nm, base: '', key: '', msg: ''};
+  editVals[nm][t.getAttribute('data-ef')] = t.value;
 });
 document.getElementById('addBtn').addEventListener('click', function(){
   var msg = document.getElementById('addMsg');
   var body = {name: document.getElementById('fName').value, base_url: document.getElementById('fBase').value, key: document.getElementById('fKey').value};
   post('/api/upstreams', body).then(function(d){
-    if (d.ok){ msg.textContent = '已添加, 正在自动检测…'; document.getElementById('fKey').value = ''; }
+    if (d.ok){ msg.textContent = '已添加, 正在自动检测…' + (d.normalized ? (' (base_url 已归一化为 ' + d.base_url + ', 请求基址 ' + d.api_base + ')') : ''); document.getElementById('fKey').value = ''; }
     else { msg.textContent = '失败: ' + (d.error || '未知'); }
     refresh();
   });
@@ -1023,6 +1502,10 @@ document.getElementById('tokBtn').addEventListener('click', function(){
     if (d.ok) document.getElementById('tok').value = '';
     refresh();
   });
+});
+document.getElementById('scopeBtn').addEventListener('click', function(){
+  var cur = (lastD && lastD.models_scope) || 'core';
+  post('/api/models-scope', {scope: cur === 'core' ? 'all' : 'core'}).then(refresh);
 });
 document.getElementById('allBtn').addEventListener('click', function(){ post('/api/test-all').then(refresh); });
 document.getElementById('refBtn').addEventListener('click', refresh);
@@ -1051,12 +1534,12 @@ function load(){
   fetch(P + '/api/logs?limit=100').then(function(r){ return r.json(); }).then(function(d){
     var box = document.getElementById('logs');
     if (!d.logs || !d.logs.length){ box.innerHTML = '<span class="mut">暂无转发记录</span>'; return; }
-    var h = '<table class="tbl"><tr><th>时间 (UTC)</th><th>上游</th><th>模型</th><th>状态</th><th>耗时</th><th>usage (入/出/总)</th><th>错误</th></tr>';
+    var h = '<div class="tblwrap"><table class="tbl"><tr><th>时间 (UTC)</th><th>上游</th><th>模型</th><th>状态</th><th>耗时</th><th>usage (入/出/总)</th><th>错误</th></tr>';
     d.logs.forEach(function(r){
-      h += '<tr><td>' + esc(r.ts) + '</td><td>' + esc(r.upstream) + '</td><td>' + esc(r.model) + '</td><td>' + esc(r.status) + '</td><td>' + esc(r.latency_ms) + ' ms</td><td>' +
+      h += '<tr><td>' + esc(r.ts) + '</td><td>' + esc(r.upstream) + '</td><td>' + esc(r.model) + (r.req_model && r.req_model !== r.model ? '<br><span class="mut">原文 ' + esc(r.req_model) + '</span>' : '') + '</td><td>' + esc(r.status) + '</td><td>' + esc(r.latency_ms) + ' ms</td><td>' +
         esc(r.prompt_tokens) + ' / ' + esc(r.completion_tokens) + ' / ' + esc(r.total_tokens) + '</td><td>' + esc(r.error) + '</td></tr>';
     });
-    box.innerHTML = h + '</table>';
+    box.innerHTML = h + '</table></div>';
   });
 }
 document.getElementById('refBtn').addEventListener('click', load);
@@ -1076,6 +1559,22 @@ def app(environ, start_response):
     method = environ.get("REQUEST_METHOD", "GET")
     prefix = environ.get("HTTP_X_FORWARDED_PREFIX", "") or ""
     try:
+        # 路径变体归一: 客户端拼写差异不该成为故障——双写 /v1、尾
+        # 斜杠、把 /v1 漏在 base 之外 (只打 /models、/chat/...)。
+        while path.startswith("/v1/v1/"):
+            path = path[3:]
+        if path in ("/v1", "/v1/", "/models", "/v1/models/"):
+            path = "/v1/models"
+        elif path.startswith("/chat/"):
+            path = "/v1" + path
+        # CORS 预检不带令牌, 必须在任何鉴权之前回答 (见 _preflight)。
+        if method == "OPTIONS" and (path.startswith("/v1/")
+                                    or path.startswith("/r/")):
+            return _preflight(environ, start_response)
+        # 转发面的全部响应 (含流式与错误) 都带 CORS 头。
+        relay_sr = start_response
+        if path.startswith("/v1/") or path.startswith("/r/"):
+            relay_sr = _CorsResp(start_response, environ)
         if path == "/api/session":
             return _json(start_response, "200 OK",
                          {"authenticated": True, "via": "platform"})
@@ -1091,9 +1590,13 @@ def app(environ, start_response):
         if path == "/api/upstreams" and method == "POST":
             st, obj = _api_add(environ)
             return _json(start_response, st, obj)
-        m = re.match(r"^/api/upstreams/([^/]+)/(delete|test)$", path)
+        m = re.match(r"^/api/upstreams/([^/]+)/(delete|test|edit)$",
+                     path)
         if m and method == "POST":
             name = urllib.parse.unquote(m.group(1))
+            if m.group(2) == "edit":
+                st, obj = _api_edit(name, environ)
+                return _json(start_response, st, obj)
             if m.group(2) == "delete":
                 st, obj = _api_delete(name)
                 return _json(start_response, st, obj)
@@ -1140,13 +1643,42 @@ def app(environ, start_response):
             return _download(start_response, "relay_logs.csv",
                              _logs_csv_text().encode("utf-8"),
                              "text/csv; charset=utf-8")
+        if path == "/api/default-upstream" and method == "POST":
+            d = _read_body_json(environ)
+            nm = (d.get("name") or "").strip()
+            with _store_lock:
+                store = _load_store()
+                if nm and nm not in store["upstreams"]:
+                    return _json(start_response, "400 Bad Request",
+                                 {"ok": False, "error": "上游不存在"})
+                store["default_upstream"] = nm
+                _save_store(store)
+            return _json(start_response, "200 OK", {"ok": True})
+        if path == "/api/models-scope" and method == "POST":
+            d = _read_body_json(environ)
+            scope = (d.get("scope") or "").strip()
+            if scope not in ("core", "all"):
+                return _json(start_response, "400 Bad Request",
+                             {"ok": False,
+                              "error": "scope 只能是 core 或 all"})
+            with _store_lock:
+                store = _load_store()
+                store["models_scope"] = scope
+                _save_store(store)
+            return _json(start_response, "200 OK",
+                         {"ok": True, "models_scope": scope})
+        if path == "/v1/models" and method == "GET":
+            return _handle_models_agg(environ, relay_sr)
+        if path.startswith("/v1/") and len(path) > 4:
+            return _handle_relay_unified(environ, relay_sr,
+                                         path[4:])
         if path.startswith("/r/"):
             seg = path[3:].split("/")
             if len(seg) >= 3 and seg[0] and seg[1] == "v1":
-                return _handle_relay(environ, start_response,
+                return _handle_relay(environ, relay_sr,
                                      urllib.parse.unquote(seg[0]),
                                      "/".join(seg[2:]))
-            return _json(start_response, "404 Not Found",
+            return _json(relay_sr, "404 Not Found",
                          {"ok": False, "error": "转发路径格式: /r/<上游名>/v1/<path>"})
         if method in ("GET", "HEAD") and not path.startswith("/api/"):
             # 人类路径打错/被拼坏时直接回网页首页, 不给裸 JSON (也不发重定向:

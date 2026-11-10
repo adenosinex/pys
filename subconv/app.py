@@ -140,6 +140,7 @@ def _public_source(src):
         "gone": sum(1 for e in nodes.values() if e.get("status") == "gone"),
         "updated": src.get("updated"),
         "last_error": src.get("last_error"),
+        "anomaly": _public_anomaly(src),
         "last_added": src.get("last_added", 0),
         "last_gone": src.get("last_gone", 0),
         "dropped_info": src.get("dropped_info", 0),
@@ -693,10 +694,12 @@ def _probe_204(url, timeout=15):
     return "000", None
 
 
-def test_node(mihomo, node):
+def test_node(mihomo, node, light=False):
     """Run one node through a throwaway mihomo instance and measure
     egress / latency / speed. Returns a result dict (ok flag plus
-    fields); never raises."""
+    fields); never raises. In light mode the multi-MB speed download
+    is skipped (connectivity, latency and egress identity only) and
+    the caller keeps the previous full-run speed on record."""
     result = {"ok": False, "tested_at": time.time()}
     os.makedirs(SCRATCH_DIR, exist_ok=True)
     try:
@@ -768,19 +771,24 @@ def test_node(mihomo, node):
         result["latency_ms"] = round(min(times) * 1000) if times else None
         code, _secs = _probe_204("https://www.youtube.com/generate_204")
         result["youtube"] = (code == "204")
-        out = _curl(["-o", "/dev/null", "-w", "%{size_download} %{time_total}",
-                     "--max-time", "8", "-x", "http://127.0.0.1:%d" % TEST_PORT,
-                     "https://speed.cloudflare.com/__down?bytes=6000000"],
-                    timeout=12)
-        parts = out.split()
-        if len(parts) == 2:
-            try:
-                size, secs = float(parts[0]), float(parts[1])
-                result["dl_bytes"] = int(size)
-                if size >= 200000 and secs > 0:
-                    result["speed_mbps"] = round(size * 8 / secs / 1_000_000, 2)
-            except ValueError:
-                pass
+        if light:
+            # The speed download is the one expensive step of a full
+            # test (a multi-MB file per node); light rounds skip it.
+            result["light"] = True
+        else:
+            out = _curl(["-o", "/dev/null", "-w", "%{size_download} %{time_total}",
+                         "--max-time", "8", "-x", "http://127.0.0.1:%d" % TEST_PORT,
+                         "https://speed.cloudflare.com/__down?bytes=6000000"],
+                        timeout=12)
+            parts = out.split()
+            if len(parts) == 2:
+                try:
+                    size, secs = float(parts[0]), float(parts[1])
+                    result["dl_bytes"] = int(size)
+                    if size >= 200000 and secs > 0:
+                        result["speed_mbps"] = round(size * 8 / secs / 1_000_000, 2)
+                except ValueError:
+                    pass
         result.setdefault("speed_mbps", None)
         result["ok"] = True
         return result
@@ -833,11 +841,78 @@ def _recent_runs(limit=8):
     return out
 
 
-def _run_source_tests(source_id, force):
+ANOMALY_KINDS = {"fetch_failed": "拉取失败", "empty": "空源",
+                 "parse_failed": "解析失败"}
+
+
+def _classify_fetch_error(exc):
+    if isinstance(exc, ValueError) and "无法解析" in str(exc):
+        return "parse_failed"
+    return "fetch_failed"
+
+
+def _mark_anomaly(source_id, kind, detail):
+    """Record (or extend) a source-level anomaly: the subscription
+    itself could not be fetched, could not be parsed, or yielded
+    zero usable nodes. Callers return before any output rebuild, so
+    the converted file keeps serving the last good version; the
+    source is then paused from scheduled test rounds and only gets
+    a bare liveness probe per round until it recovers."""
+    now = time.time()
+    with _lock:
+        store = _load_store()
+        src = _find_source(store, source_id)
+        if src is None:
+            return None
+        cur = src.get("anomaly") or {}
+        anomaly = {"kind": kind, "detail": detail,
+                   "since": cur.get("since") or now,
+                   "rounds": (cur.get("rounds") or 0) + 1,
+                   "last_at": now}
+        src["anomaly"] = anomaly
+        label = src.get("label") or src.get("host") or ""
+        _save_store(store)
+    _record_run({"event": "source_anomaly", "source_id": source_id,
+                 "label": label, "kind": kind, "detail": detail,
+                 "rounds": anomaly["rounds"], "at": now})
+    return anomaly
+
+
+def _clear_anomaly(source_id):
+    """Drop the anomaly record after a successful fetch. Returns
+    True when an anomaly had been active (i.e. this is a recovery)."""
+    with _lock:
+        store = _load_store()
+        src = _find_source(store, source_id)
+        if src is None or not src.get("anomaly"):
+            return False
+        label = src.get("label") or src.get("host") or ""
+        src["anomaly"] = None
+        _save_store(store)
+    _record_run({"event": "source_recovered", "source_id": source_id,
+                 "label": label, "at": time.time()})
+    return True
+
+
+def _public_anomaly(src):
+    anomaly = src.get("anomaly") or {}
+    if not anomaly:
+        return None
+    return {"kind": anomaly.get("kind"),
+            "kind_label": ANOMALY_KINDS.get(anomaly.get("kind"),
+                                            anomaly.get("kind")),
+            "since": anomaly.get("since"),
+            "rounds": anomaly.get("rounds") or 0}
+
+
+def _run_source_tests(source_id, force=False, mode="full"):
     """Run the whole test pipeline for one source (per-node probes,
     Scamalytics backfill, output rebuild) and return a run summary.
     The caller (_chain_worker) owns the running flag and the run log,
-    so this function must not touch them."""
+    so this function must not touch them. mode="light" probes every
+    registered node for connectivity / latency / egress identity but
+    skips the speed downloads, and preserves each node's last
+    full-run speed figure."""
     summary = {"planned": 0, "tested": 0, "ok": 0, "traffic_bytes": 0,
                "label": "", "message": ""}
     try:
@@ -855,20 +930,37 @@ def _run_source_tests(source_id, force):
     try:
         proxies, _headers = fetch_subscription(src["url"])
     except Exception as exc:
-        summary["message"] = "拉取订阅失败：%s" % str(exc)[:120]
+        kind = _classify_fetch_error(exc)
+        _mark_anomaly(source_id, kind, str(exc)[:120])
+        summary["message"] = "源异常（%s）：%s" % (
+            ANOMALY_KINDS.get(kind, kind), str(exc)[:120])
+        summary["anomaly"] = kind
         return summary
     kept, _info, _di, _dd = filter_nodes(proxies)
+    if not kept:
+        _mark_anomaly(source_id, "empty", "拉回节点数为 0")
+        summary["message"] = "源异常（空源）：拉回节点数为 0。"
+        summary["anomaly"] = "empty"
+        return summary
+    if _clear_anomaly(source_id):
+        summary["recovered"] = True
     node_by_fp = dict(kept)
     with _lock:
         store = _load_store()
         src_now = _find_source(store, source_id)
         registry = (src_now or {}).get("nodes") or {}
-    work = [fp for fp in node_by_fp if _needs_test(registry.get(fp) or {}, force)]
+    if mode == "light":
+        # Light round: probe every registered node once — latency
+        # and availability drift daily, speed is refreshed weekly.
+        work = [fp for fp in node_by_fp
+                if (registry.get(fp) or {}).get("status") == "kept"]
+    else:
+        work = [fp for fp in node_by_fp if _needs_test(registry.get(fp) or {}, force)]
     _test_state.update({"total": len(work), "done": 0})
     summary["planned"] = len(work)
     for fp in work:
         node = node_by_fp[fp]
-        res = test_node(mihomo, node)
+        res = test_node(mihomo, node, light=(mode == "light"))
         summary["traffic_bytes"] += res.pop("dl_bytes", 0) or 0
         summary["tested"] += 1
         if res.get("ok"):
@@ -881,15 +973,20 @@ def _run_source_tests(source_id, force):
             entry = (src_now.get("nodes") or {}).get(fp)
             if entry is None:
                 continue
+            old_test = entry.get("test") or {}
+            had_test = bool(old_test)
+            if mode == "light":
+                # A light round never overwrites the speed measured
+                # by the last full run: node names keep showing it.
+                res["speed_mbps"] = old_test.get("speed_mbps")
             entry["test"] = res
-            had_test = bool(entry.get("test"))
             prev_attempts = entry.get("attempts")
             if prev_attempts is None:
                 prev_attempts = 1 if had_test else 0
             entry["attempts"] = prev_attempts + 1
             prev_successes = entry.get("successes")
             if prev_successes is None:
-                prev_successes = 1 if (had_test and (entry.get("test") or {}).get("ok")) else 0
+                prev_successes = 1 if (had_test and old_test.get("ok")) else 0
             entry["successes"] = prev_successes + (1 if res.get("ok") else 0)
             entry["fail_streak"] = 0 if res.get("ok") else (entry.get("fail_streak") or 0) + 1
             _save_store(store)
@@ -908,6 +1005,11 @@ def _run_source_tests(source_id, force):
                     ips.append(t["egress_ip"])
             changed = False
             for ip in ips:
+                if mode == "light":
+                    # Light rounds never fetch fresh scores: the
+                    # weekly cache is used exactly as it stands, and
+                    # a cache miss simply leaves the label scoreless.
+                    continue
                 q = cache.get(ip)
                 if not q or time.time() - (q.get("fetched_at") or 0) > QUALITY_TTL:
                     cache[ip] = {"score": fetch_fraud_score(ip),
@@ -934,8 +1036,41 @@ def _run_source_tests(source_id, force):
             except Exception as exc:
                 src_now["last_error"] = str(exc)[:200]
             _save_store(store)
-    summary["message"] = "测试完成：%d 个节点。" % summary["tested"]
+    summary["message"] = "%s完成：%d 个节点。" % (
+        "轻测" if mode == "light" else "测试", summary["tested"])
     return summary
+
+
+def _run_probe(source_id, mode):
+    """Liveness probe for an anomaly-paused source: one bare
+    subscription fetch, no node tests. Still dead -> the anomaly
+    rounds counter grows and the source stays paused; alive again ->
+    the anomaly clears inside _run_source_tests and this round's
+    regular test run executes immediately, in the same queue turn."""
+    summary = {"planned": 0, "tested": 0, "ok": 0, "traffic_bytes": 0,
+               "label": "", "message": ""}
+    with _lock:
+        store = _load_store()
+        src = _find_source(store, source_id)
+    if src is None:
+        summary["message"] = "订阅源不存在。"
+        return summary
+    summary["label"] = src.get("label") or src.get("host") or ""
+    try:
+        proxies, _headers = fetch_subscription(src["url"])
+    except Exception as exc:
+        kind = _classify_fetch_error(exc)
+        _mark_anomaly(source_id, kind, str(exc)[:120])
+        summary["message"] = "存活探测失败（%s），继续暂停。" % ANOMALY_KINDS.get(kind, kind)
+        summary["anomaly"] = kind
+        return summary
+    kept, _info, _di, _dd = filter_nodes(proxies)
+    if not kept:
+        _mark_anomaly(source_id, "empty", "拉回节点数为 0")
+        summary["message"] = "存活探测失败（空源），继续暂停。"
+        summary["anomaly"] = "empty"
+        return summary
+    return _run_source_tests(source_id, force=(mode == "full"), mode=mode)
 
 
 def _chain_worker():
@@ -955,13 +1090,19 @@ def _chain_worker():
                                 "queued": len(_test_queue)})
         started = time.time()
         try:
-            summary = _run_source_tests(job["source_id"], job["force"])
+            if job.get("kind") == "probe":
+                summary = _run_probe(job["source_id"], job.get("mode") or "light")
+            else:
+                summary = _run_source_tests(job["source_id"], job["force"],
+                                            job.get("mode") or "full")
         except Exception as exc:  # a broken run must never wedge the queue
             summary = {"planned": 0, "tested": 0, "ok": 0,
                        "traffic_bytes": 0, "label": "",
                        "message": "测试异常：%s" % str(exc)[:120]}
         finished = time.time()
         _record_run({"trigger": job["trigger"],
+                     "mode": job.get("mode") or "full",
+                     "kind": job.get("kind") or "test",
                      "source_id": job["source_id"],
                      "label": summary.get("label") or "",
                      "started_at": started, "finished_at": finished,
@@ -969,6 +1110,8 @@ def _chain_worker():
                      "planned": summary["planned"],
                      "tested": summary["tested"], "ok": summary["ok"],
                      "est_bytes": summary["traffic_bytes"],
+                     "anomaly": summary.get("anomaly"),
+                     "recovered": bool(summary.get("recovered")),
                      "message": summary["message"]})
         with _test_lock:
             _test_state.update({
@@ -983,12 +1126,15 @@ def _chain_worker():
                              "finished_at": finished}})
 
 
-def start_tests(source_id, force=False, trigger="manual"):
+def start_tests(source_id, force=False, trigger="manual", mode="full",
+                kind="test"):
     """Enqueue one source's test run. Triggers: the page button
-    ("manual"), a freshly added source ("auto-add") and the daily
-    timer ("daily"). A source that is already running or queued is
-    folded into the existing job; the returned state says so via
-    "enqueued": False."""
+    ("manual"), a freshly added source ("auto-add"), the daily
+    timer ("daily", light mode) and the weekly timer ("weekly",
+    full mode). kind="probe" enqueues a bare liveness fetch for an
+    anomaly-paused source instead of a node-test run. A source that
+    is already running or queued is folded into the existing job;
+    the returned state says so via "enqueued": False."""
     with _test_lock:
         busy = (_test_state.get("running")
                 and _test_state.get("source_id") == source_id)
@@ -999,7 +1145,7 @@ def start_tests(source_id, force=False, trigger="manual"):
             state["queued"] = len(_test_queue)
             return state
         _test_queue.append({"source_id": source_id, "force": bool(force),
-                            "trigger": trigger})
+                            "trigger": trigger, "kind": kind, "mode": mode})
         spawn = not _test_state.get("running")
         if spawn:
             _test_state.update({"running": True, "source_id": source_id,
@@ -1016,6 +1162,33 @@ def start_tests(source_id, force=False, trigger="manual"):
         thread.start()
     return state
 
+
+def start_probe(source_id, mode="light", trigger="daily"):
+    """Enqueue a liveness probe for an anomaly-paused source, with
+    the same one-job-per-source dedupe as start_tests."""
+    return start_tests(source_id, force=False, trigger=trigger,
+                       mode=mode, kind="probe")
+
+
+def _sweep(mode, trigger):
+    """One scheduled round over every source. Healthy sources get a
+    test job in the sweep's mode; anomaly-paused sources get a bare
+    liveness probe instead (a single subscription fetch, no node
+    tests), so a dead source stops costing test traffic until it
+    comes back on its own. Returns (enqueued_ids, probed_ids)."""
+    with _lock:
+        store = _load_store()
+        plan = [(s["id"], bool(s.get("anomaly"))) for s in store["sources"]]
+    enqueued, probed = [], []
+    for sid, paused in plan:
+        if paused:
+            state = start_probe(sid, mode=mode, trigger=trigger)
+        else:
+            state = start_tests(sid, force=(mode == "full"),
+                                trigger=trigger, mode=mode)
+        if state.get("enqueued"):
+            (probed if paused else enqueued).append(sid)
+    return enqueued, probed
 
 
 def _register_source(store, url, label):
@@ -1296,25 +1469,37 @@ def application(environ, start_response):
                      {"ok": False, "error": "not_found", "message": "接口不存在。"})
 
     if path == "/internal/daily-tests" and method == "POST":
-        # Box-local trigger for the systemd timer: full re-test of
-        # every registered source, through the same queue/pipeline as
-        # the page button. Loopback-only (see _is_loopback_direct);
-        # the platform gate keeps this path unreachable from outside.
+        # Box-local trigger for the daily systemd timer: a light
+        # round (connectivity / latency / egress identity, no speed
+        # downloads; speed figures carry over from the weekly full
+        # round) over every registered source, through the same
+        # queue/pipeline as the page button. Anomaly-paused sources
+        # get a bare liveness probe instead. Loopback-only (see
+        # _is_loopback_direct); the platform gate keeps this path
+        # unreachable from outside.
         if not _is_loopback_direct(environ):
             return _json(start_response, "403 Forbidden",
                          {"ok": False, "error": "forbidden",
                           "message": "仅限盒上回环直连调用。"})
-        with _lock:
-            store = _load_store()
-            ids = [s["id"] for s in store["sources"]]
-        enqueued = []
-        for sid in ids:
-            state = start_tests(sid, force=True, trigger="daily")
-            if state.get("enqueued"):
-                enqueued.append(sid)
+        enqueued, probed = _sweep("light", "daily")
         return _json(start_response, "200 OK",
-                     {"ok": True, "sources": len(ids),
-                      "enqueued": enqueued,
+                     {"ok": True, "mode": "light",
+                      "enqueued": enqueued, "probed": probed,
+                      "test_state": dict(_test_state)})
+
+    if path == "/internal/weekly-tests" and method == "POST":
+        # Box-local trigger for the weekly systemd timer: the full
+        # round (with speed downloads) that refreshes the speed
+        # figures the daily light rounds preserve. Same loopback-only
+        # admission as the daily endpoint.
+        if not _is_loopback_direct(environ):
+            return _json(start_response, "403 Forbidden",
+                         {"ok": False, "error": "forbidden",
+                          "message": "仅限盒上回环直连调用。"})
+        enqueued, probed = _sweep("full", "weekly")
+        return _json(start_response, "200 OK",
+                     {"ok": True, "mode": "full",
+                      "enqueued": enqueued, "probed": probed,
                       "test_state": dict(_test_state)})
 
     return _json(start_response, "404 Not Found",
@@ -1468,6 +1653,7 @@ function render(sources) {
     else if (s.test_state && s.test_state.queued) meta += `<br>测试已排队，等待自动开始…`;
     else if (s.test_state && s.test_state.message) meta += `<br>${s.test_state.message}`;
     if (s.last_error) meta += `<br><span class="err">最近一次拉取失败：${s.last_error}</span>`;
+    if (s.anomaly) meta += `<br><span class="err">源异常：${esc(s.anomaly.kind_label || s.anomaly.kind)}（自 ${fmtTime(s.anomaly.since)} 起，连续 ${s.anomaly.rounds} 轮）· 已暂停自动测试，源恢复后自动继续；上方链接仍是最后一次成功版本</span>`;
     card.innerHTML = `
       <div class="title"></div>
       <div class="meta">${meta}</div>
@@ -1532,7 +1718,7 @@ async function load() {
     render(d.sources);
     const lr = (d.recent_runs || []).slice(-1)[0];
     if (lr) {
-      const trig = {daily: "每日自动", "auto-add": "新源自动", manual: "手动"}[lr.trigger] || lr.trigger;
+      const trig = {daily: "每日轻测", weekly: "每周全量", "auto-add": "新源自动", manual: "手动"}[lr.trigger] || lr.trigger;
       $("runs-line").textContent = `最近一轮测试（${trig}）：${lr.label || lr.source_id} · 测 ${lr.tested} 个，正常 ${lr.ok} 个 · 用时 ${lr.duration_s}s · 测速流量约 ${(lr.est_bytes / 1e6).toFixed(1)} MB · ${fmtTime(lr.finished_at)}`;
     }
     const running = d.sources.some((x) => x.test_state && (x.test_state.running || x.test_state.queued));

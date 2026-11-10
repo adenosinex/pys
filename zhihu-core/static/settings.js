@@ -242,10 +242,49 @@ window.siteSettingsUI = (() => {
     } finally { reader.releaseLock(); }
   }
 
+  async function pollTask(taskId, signal) {
+    // The built-in YouTube pipeline runs server-side and can take
+    // minutes; poll its task record, forwarding each snapshot to the
+    // page's progress hook. Brief outages (service restarts) are
+    // tolerated; the task itself keeps running server-side.
+    let failures = 0;
+    try {
+      for (;;) {
+        if (signal?.aborted) { const aborted = new Error('已取消'); aborted.name = 'AbortError'; throw aborted; }
+        let data;
+        try {
+          data = await api('/api/yt-task/' + encodeURIComponent(taskId), undefined, signal);
+          failures = 0;
+        } catch (error) {
+          if (error.name === 'AbortError' || signal?.aborted) throw error;
+          failures += 1;
+          if (failures > 10) throw error;
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          continue;
+        }
+        const task = data.task || {};
+        if (window.onYtTaskProgress) window.onYtTaskProgress(task);
+        if (task.state === 'done' && task.result) return task.result;
+        if (task.state === 'error') {
+          const failure = new Error(task.error?.message || '处理失败，请重试。');
+          failure.code = task.error?.code;
+          throw failure;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    } finally {
+      if (window.onYtTaskProgress) window.onYtTaskProgress(null);
+    }
+  }
+
   async function extract(url, format, options, signal) {
     const parsed = new URL(url);
     const rule = routeFor(parsed.hostname.toLowerCase().replace(/\.$/, ''));
-    if (!rule || rule.transport === 'server') return api('/api/extract', {url, format, ...options}, signal);
+    if (!rule || rule.transport === 'server') {
+      const data = await api('/api/extract', {url, format, ...options}, signal);
+      if (data && data.async && data.task_id) return pollTask(data.task_id, signal);
+      return data;
+    }
     if (url.length > 8000) throw new Error('链接过长，请使用原始网址或短链接。');
     const controller = new AbortController();
     const abort = () => controller.abort();

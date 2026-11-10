@@ -113,6 +113,7 @@ PAGE_HTML = r'''<!doctype html>
       <button id="addHostBtn" type="button" class="button primary">添加主机</button>
       <button id="exportHosts" type="button" class="button light">导出 hosts</button>
       <button id="refresh" type="button" class="button light">刷新状态</button>
+      <button id="hostedBtn" type="button" class="button light">托管设置</button>
     </div>
   </header>
   <section class="stats" aria-label="状态概览">
@@ -152,6 +153,18 @@ PAGE_HTML = r'''<!doctype html>
       <button id="closeExport" type="button" class="button light">关闭</button>
     </div>
     <p class="sub" style="margin:8px 0 0;">把以上内容粘贴到某台机器的 hosts 文件，即可在那台机器上临时指向，不改动 DNS。</p>
+  </div>
+  <div id="hostedPanel" class="table-card" style="display:none; padding:14px 16px; margin-bottom:14px;">
+    <h3 style="margin:2px 0 8px;">zin7.de 托管分册（Cloudflare 控制面）</h3>
+    <p class="sub" style="margin:0 0 10px;">提供商令牌只保存在服务器、只写不回显；智能体经 /dm-api 令牌通道仅可新增 / 修正 zin7.de 的 A / AAAA 记录，删除与 NS 变更不开放。</p>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+      <input id="cfToken" type="password" placeholder="粘贴新的 CF API Token（留空不改）" size="44" autocomplete="off">
+      <button id="cfSave" type="button" class="button primary">保存令牌</button>
+      <button id="cfClear" type="button" class="button light">清除令牌</button>
+      <span id="credState" class="sub">凭据状态加载中…</span>
+    </div>
+    <div id="hostedList" class="sub" style="margin-bottom:10px;">托管记录加载中…</div>
+    <div id="auditList" class="sub">审计加载中…</div>
   </div>
   <div class="footer">
     <div class="legend">
@@ -440,6 +453,57 @@ PAGE_HTML = r'''<!doctype html>
     ta.select();
     try { await navigator.clipboard.writeText(ta.value); notify('hosts 内容已复制'); }
     catch (_) { document.execCommand('copy'); notify('hosts 内容已复制'); }
+  });
+
+
+  const hostedPanel = document.getElementById('hostedPanel');
+  async function loadHosted() {
+    try {
+      const cred = await api('/dns/api/credentials');
+      document.getElementById('credState').textContent =
+        'CF 令牌：' + (cred.cf_token_configured ? '已配置' : '未配置') +
+        ' · 通道令牌：' + (cred.dm_token_configured ? '已配置' : '未配置') +
+        ' · zone：' + cred.zone;
+      const hosted = await api('/dns/api/hosted');
+      const hl = document.getElementById('hostedList');
+      if (!hosted.records.length) { hl.textContent = '托管记录：暂无'; }
+      else {
+        hl.innerHTML = '托管记录（' + hosted.zone + '）：<br>' + hosted.records.map(r =>
+          r.name + ' ' + r.type + ' → ' + r.value + '（实测 ' +
+          (r.resolved && r.resolved.length ? r.resolved.join(', ') : '无解析') +
+          ' · ' + (r.ok ? '一致' : '未生效/不一致') + '）').join('<br>');
+      }
+      const aud = await api('/dns/api/audit');
+      const al = document.getElementById('auditList');
+      const rows = (aud.audit || []).slice(-8).reverse();
+      al.innerHTML = rows.length
+        ? '最近审计：<br>' + rows.map(a => a.ts + ' ' + a.action + ' ' + a.name + ' ' + a.type +
+            ' ' + (a.old || '∅') + ' → ' + (a.new || '∅') + ' · ' + a.result).join('<br>')
+        : '最近审计：暂无';
+    } catch (error) { notify('托管信息加载失败：' + error.message, true); }
+  }
+  document.getElementById('hostedBtn').addEventListener('click', () => {
+    const show = hostedPanel.style.display === 'none';
+    hostedPanel.style.display = show ? '' : 'none';
+    if (show) void loadHosted();
+  });
+  document.getElementById('cfSave').addEventListener('click', async () => {
+    const v = document.getElementById('cfToken').value.trim();
+    if (!v) { notify('请先粘贴令牌', true); return; }
+    try {
+      await api('/dns/api/credentials', { method: 'POST', data: { cf_api_token: v } });
+      document.getElementById('cfToken').value = '';
+      notify('CF 令牌已保存（不回显）');
+      await loadHosted();
+    } catch (error) { notify('保存失败：' + error.message, true); }
+  });
+  document.getElementById('cfClear').addEventListener('click', async () => {
+    if (!window.confirm('清除已保存的 CF 令牌？清除后自动通道将停止工作。')) return;
+    try {
+      await api('/dns/api/credentials', { method: 'POST', data: { cf_api_token: '' } });
+      notify('CF 令牌已清除');
+      await loadHosted();
+    } catch (error) { notify('清除失败：' + error.message, true); }
   });
 
   refreshButton.addEventListener('click', load);
