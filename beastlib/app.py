@@ -905,7 +905,9 @@ def _row(r, hit_label=None, views=None, pub_date=None, rank=None):
     _full_kw = (r["keywords"] or "").strip()
     _full_orig = (r["title_original"] or "").strip()
     excerpt = _full_kw or _full_orig
+    _tip = ""
     if len(excerpt) > 60:
+        _tip = ' title="%s"' % _html.escape(excerpt)
         excerpt = excerpt[:60] + "…"
     vh = _views_html(views, rank)
     if vh:
@@ -916,8 +918,8 @@ def _row(r, hit_label=None, views=None, pub_date=None, rank=None):
         "<div class=\"row\">"
         f"<a class=\"seq\" href=\"{U('/r/%d' % r['seq'])}\">#{r['seq']:03d}</a>"
         "<div class=\"main\">"
-        f"<a class=\"t\" href=\"{U('/r/%d' % r['seq'])}\" title=\"{_html.escape(_full_orig)}\">{_html.escape(r['title_zh'])}</a>"
-        f"<div class=\"kw\" title=\"{_html.escape(_full_kw)}\">{_html.escape(excerpt)}</div>"
+        f"<a class=\"t\" href=\"{U('/r/%d' % r['seq'])}\">{_html.escape(r['title_zh'])}</a>"
+        f"<div class=\"kw\"{_tip}>{_html.escape(excerpt)}</div>"
         f"<div class=\"links\">{links}</div>"
         "</div>" + _badges(r, hit_label) + "</div>")
 
