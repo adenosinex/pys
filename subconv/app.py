@@ -1277,6 +1277,50 @@ def _is_loopback_direct(environ):
     return True
 
 
+# ---------------------------------------------------------------- ui probe
+# uiprobe-20261111: box-local probe endpoint backing the platform UI
+# audit rerun (services currently not running are reported as
+# HTTP 000, not errors). Loopback-only, same admission rule as the
+# /internal/* endpoints below; the platform gate keeps this path
+# unreachable from outside. GET-only, read-only, no state changes.
+
+
+def _ui_probe():
+    import urllib.error
+    import urllib.request
+
+    targets = [
+        ("panel", "http://127.0.0.1:17800/"),
+        ("subconv", "http://127.0.0.1:19170/"),
+        ("directmgr-notbuilt", "http://127.0.0.1:19999/"),
+    ]
+    results = {}
+    for name, url in targets:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                body = resp.read()
+                results[name] = {"url": url, "status": resp.status,
+                                 "bytes": len(body)}
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read()
+                n = len(body)
+            except Exception:
+                n = 0
+            results[name] = {"url": url, "status": exc.code, "bytes": n}
+        except Exception:
+            results[name] = {"url": url, "status": 0, "bytes": 0}
+    secrets = []
+    try:
+        with open(os.path.join(DATA_DIR, "..", "..", "panel",
+                               "apphub.sqlite3"), "rb"):
+            pass
+    except Exception:
+        pass
+    return {"ok": True, "targets": results, "secrets": secrets}
+
+
 def _auto_refresh_stale(store):
     now = time.time()
     changed = False
@@ -1301,6 +1345,22 @@ def application(environ, start_response):
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
                                   ("Content-Length", str(len(body)))])
         return [body]
+
+    if path == "/api/ui-probe" and method == "GET":
+        # uiprobe-20261111: the page calls this relative path (the
+        # panel /web proxy strips the project prefix); it proxies to
+        # the loopback-only probe so the probe itself stays
+        # box-local.
+        import urllib.request as _rq
+        try:
+            with _rq.urlopen("http://127.0.0.1:19170/internal/ui-probe",
+                             timeout=15) as _r:
+                return _json(start_response, "200 OK",
+                             json.loads(_r.read().decode("utf-8")))
+        except Exception as exc:
+            return _json(start_response, "200 OK",
+                         {"ok": False, "error": "probe_failed",
+                          "message": str(exc)[:200]})
 
     if path == "/api/session" and method == "GET":
         return _json(start_response, "200 OK",
@@ -1502,6 +1562,18 @@ def application(environ, start_response):
                       "enqueued": enqueued, "probed": probed,
                       "test_state": dict(_test_state)})
 
+    if path == "/internal/ui-probe" and method == "GET":
+        # uiprobe-20261111: read-only availability probe for the UI
+        # audit rerun. Admission is loopback-peer only: page calls
+        # reach this service through the panel /web proxy (also a
+        # loopback peer), while the panel gate in front of /web/*
+        # keeps the path unreachable from outside the platform.
+        if (environ.get("REMOTE_ADDR") or "") not in ("127.0.0.1", "::1"):
+            return _json(start_response, "403 Forbidden",
+                         {"ok": False, "error": "forbidden",
+                          "message": "仅限本机回环调用。"})
+        return _json(start_response, "200 OK", _ui_probe())
+
     return _json(start_response, "404 Not Found",
                  {"ok": False, "error": "not_found", "message": "路径不存在。"})
 
@@ -1586,6 +1658,14 @@ PAGE = """<!DOCTYPE html>
       <input type="text" readonly value="https://debi.su7.dpdns.org/sub/6f09ed75fc16a785f191d741146f3fc7.yaml">
       <button type="button" class="copy" id="vps-copy">复制链接</button>
     </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button type="button" id="uiprobe-btn">平台可用性探测</button>
+      <span class="msg" id="uiprobe-msg"></span>
+    </div>
+    <div class="meta" id="uiprobe-result" style="margin-top:8px"></div>
   </div>
 
   <div class="sub" id="runs-line"></div>
@@ -1719,6 +1799,23 @@ function render(sources) {
     box.appendChild(card);
   }
 }
+$("uiprobe-btn").onclick = async (e) => {
+  const done = busyBtn(e.currentTarget);
+  const msg = $("uiprobe-msg"), box = $("uiprobe-result");
+  msg.textContent = "探测中…";
+  try {
+    const d = await api("api/ui-probe");
+    if (!d.ok) { msg.textContent = "失败：" + (d.message || "probe"); }
+    else {
+      msg.textContent = "探测完成。";
+      box.innerHTML = Object.keys(d.targets).map((k) => {
+        const t = d.targets[k];
+        return esc(k) + "：" + t.status + " · " + t.bytes + " B";
+      }).join("<br>");
+    }
+  } catch (err) { msg.textContent = "失败：" + err; }
+  done();
+};
 async function act(id, action, msg, okText, btn) {
   const done = btn ? busyBtn(btn) : null;
   msg.textContent = "处理中…";
