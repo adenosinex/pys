@@ -509,15 +509,17 @@ def handle_projects_create(environ, start_response, kind):
 
 os.makedirs(RUNTIME, exist_ok=True)
 
-# ---------------------------------------------------------------- page
+# ---------------------------------------------------------------- shared CSS
+# Main stylesheet shared by all three page variants (home / html / py).
+# Edit _CSS_HEAD / _CSS_TAIL once and all three pages pick it up; only
+# the middle block differs per variant: _CSS_MID_HOME is the home page
+# zone/chip block, _CSS_MID_CAT is the category-nav / collapsible-section
+# block shared by the html and py pages. Publish-form styles: _CSS_PUB
+# is common, _CSS_PUB_HTML_EXTRA adds the upload-row rules that only
+# the html publish form uses. Merged 2026-11-11 (was three near-copies
+# of ~6.5 KB that had to be edited in three places).
 
-PAGE_HOME = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>微书签</title>
-<style>
+_CSS_HEAD = """
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
   body { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -543,7 +545,8 @@ PAGE_HOME = """<!DOCTYPE html>
   h2.cat { font-size: 14px; margin: 20px 2px 10px; opacity: .75; font-weight: 600;
            display: flex; align-items: baseline; gap: 8px; }
   h2.cat .n { font-size: 12px; opacity: .6; font-weight: 400; }
-  .zones { display: grid; gap: 10px; margin-top: 4px; }
+"""
+_CSS_MID_HOME = """  .zones { display: grid; gap: 10px; margin-top: 4px; }
   .zone { border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
           background: color-mix(in srgb, currentColor 4%, transparent);
           border-radius: 16px; padding: 12px 12px 10px; }
@@ -556,7 +559,17 @@ PAGE_HOME = """<!DOCTYPE html>
           border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
           font-size: 13px; color: inherit; text-decoration: none; }
   .chip .n { font-size: 11px; opacity: .55; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px 8px; }
+"""
+_CSS_MID_CAT = """  .catnav { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 2px 0; }
+  .catnav .chip { display: inline-flex; align-items: baseline; gap: 5px; padding: 6px 11px; border-radius: 999px;
+          border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+          background: transparent; color: inherit; font-size: 13px; cursor: pointer; font-family: inherit; }
+  .catnav .chip .n { font-size: 11px; opacity: .55; }
+  h2.cat.sec { cursor: pointer; user-select: none; }
+  h2.cat.sec .tog { margin-left: auto; font-size: 12px; opacity: .6; font-weight: 400; }
+  .secgrid.off { display: none; }
+"""
+_CSS_TAIL = """  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px 8px; }
   @media (max-width: 560px) { .grid { grid-template-columns: repeat(4, 1fr); } }
   .card { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0;
           padding: 12px 4px 10px; border-radius: 16px;
@@ -612,7 +625,39 @@ PAGE_HOME = """<!DOCTYPE html>
   .msg { min-height: 18px; font-size: 13px; margin-top: 8px; }
   .err { color: #dc2626; }
   #gate-note { display: none; padding: 40px 6px; font-size: 15px; opacity: .75; }
-</style>
+"""
+_CSS_MAIN_HOME = _CSS_HEAD + _CSS_MID_HOME + _CSS_TAIL
+_CSS_MAIN_CAT = _CSS_HEAD + _CSS_MID_CAT + _CSS_TAIL
+_CSS_PUB = """
+  #pubwrap { margin-top: 6px; }
+  .pubform label { display: block; font-size: 13px; margin: 12px 0 4px; opacity: .8; }
+  .pubform input { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 15px;
+           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+           background: transparent; color: inherit; outline: none; }
+  .pubform input:focus { border-color: #2f6fd0; }
+  .pubform textarea { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 13px;
+           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+           background: transparent; color: inherit; outline: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .pubform textarea:focus { border-color: #2f6fd0; }
+"""
+_CSS_PUB_HTML_EXTRA = """  .uprow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .uprow .tbtn { display: inline-block; margin: 0; padding: 8px 14px; border-radius: 999px;
+          border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+          background: transparent; color: inherit; font-size: 14px; cursor: pointer; white-space: nowrap; }
+  .fnote { font-size: 12px; opacity: .7; }
+  #pf-fhint { margin: 6px 0 0; }
+"""
+_CSS_PUB_HTML = _CSS_PUB + _CSS_PUB_HTML_EXTRA
+
+# ---------------------------------------------------------------- page
+
+PAGE_HOME = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>微书签</title>
+<style>""" + _CSS_MAIN_HOME + """</style>
 </head>
 <body>
 <header>
@@ -907,97 +952,7 @@ PAGE_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>微书签</title>
-<style>
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-         margin: 0 auto; max-width: 880px; padding: 0 14px 56px; line-height: 1.5;
-         -webkit-tap-highlight-color: transparent; }
-  header { position: sticky; top: 0; z-index: 20; display: flex; gap: 8px; align-items: center;
-           padding: 12px 2px 10px;
-           background: color-mix(in srgb, Canvas 88%, transparent);
-           backdrop-filter: blur(8px); }
-  header h1 { font-size: 19px; margin: 0; white-space: nowrap; }
-  #q { flex: 1; min-width: 0; padding: 9px 12px; border-radius: 999px; font-size: 15px;
-       border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
-       background: transparent; color: inherit; outline: none; }
-  #q:focus { border-color: #2f6fd0; }
-  .tbtn { padding: 8px 14px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
-          background: transparent; color: inherit; font-size: 14px; cursor: pointer; white-space: nowrap; }
-  .tbtn.on { background: #2f6fd0; border-color: #2f6fd0; color: #fff; }
-  .hintbar { display: none; font-size: 13px; opacity: .65; padding: 2px 2px 8px; }
-  body.editing .hintbar { display: block; }
-  .editbar { display: none; gap: 8px; align-items: center; padding: 0 2px 10px; flex-wrap: wrap; }
-  body.editing .editbar { display: flex; }
-  #impMsg { font-size: 12px; opacity: .75; }
-  h2.cat { font-size: 14px; margin: 20px 2px 10px; opacity: .75; font-weight: 600;
-           display: flex; align-items: baseline; gap: 8px; }
-  h2.cat .n { font-size: 12px; opacity: .6; font-weight: 400; }
-  .catnav { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 2px 0; }
-  .catnav .chip { display: inline-flex; align-items: baseline; gap: 5px; padding: 6px 11px; border-radius: 999px;
-          border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
-          background: transparent; color: inherit; font-size: 13px; cursor: pointer; font-family: inherit; }
-  .catnav .chip .n { font-size: 11px; opacity: .55; }
-  h2.cat.sec { cursor: pointer; user-select: none; }
-  h2.cat.sec .tog { margin-left: auto; font-size: 12px; opacity: .6; font-weight: 400; }
-  .secgrid.off { display: none; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px 8px; }
-  @media (max-width: 560px) { .grid { grid-template-columns: repeat(4, 1fr); } }
-  .card { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0;
-          padding: 12px 4px 10px; border-radius: 16px;
-          border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
-          background: color-mix(in srgb, currentColor 4%, transparent);
-          text-decoration: none; color: inherit; position: relative;
-          transition: transform .05s ease; }
-  .card:active { transform: scale(.97); }
-  .tile { flex: 0 0 auto; width: 52px; height: 52px; border-radius: 14px; color: #fff;
-          display: flex; align-items: center; justify-content: center; overflow: hidden;
-          font-size: 22px; font-weight: 700; background: hsl(var(--h, 210) 52% 44%); }
-  .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .meta { width: 100%; min-width: 0; text-align: center; }
-  .name { display: block; min-width: 0; font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sub2 { display: block; font-size: 11px; height: 15px; line-height: 15px; opacity: .55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .date2 { display: block; font-size: 10px; height: 13px; line-height: 13px; opacity: .45; }
-  body.editing .card { border-style: dashed; cursor: pointer; }
-  body.editing .card::after { content: "编辑"; position: absolute; top: 6px; right: 8px;
-          font-size: 11px; opacity: .55; }
-  .addcard { display: none; flex-direction: column; align-items: center; justify-content: center; gap: 6px; min-height: 118px;
-          border-radius: 16px; border: 1.5px dashed color-mix(in srgb, currentColor 30%, transparent);
-          font-size: 14px; opacity: .75; cursor: pointer; background: transparent; color: inherit; }
-  body.editing .addcard { display: flex; }
-  .empty { opacity: .55; font-size: 14px; padding: 26px 2px; }
-  .sheet textarea { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 13px;
-           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
-           background: transparent; color: inherit; outline: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
-  .sheet textarea:focus { border-color: #2f6fd0; }
-  .crumb { font-size: 13px; padding: 2px 2px 0; }
-  .crumb a { color: #2f6fd0; text-decoration: none; }
-  .intro { font-size: 13px; opacity: .65; padding: 4px 2px 0; }
-  body:not(.editing) .delcard { display: none !important; }
-  footer { margin-top: 30px; font-size: 12px; opacity: .45; padding: 0 2px; }
-  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.48); z-index: 50;
-             display: none; align-items: flex-end; justify-content: center; }
-  .overlay.show { display: flex; }
-  .sheet { background: Canvas; color: CanvasText; width: 100%; max-width: 520px;
-           border-radius: 18px 18px 0 0; padding: 18px 18px 22px; }
-  @media (min-width: 640px) { .overlay { align-items: center; } .sheet { border-radius: 18px; } }
-  .sheet h3 { margin: 0 0 6px; font-size: 16px; }
-  .sheet label { display: block; font-size: 13px; margin: 12px 0 4px; opacity: .8; }
-  .sheet input { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 15px;
-           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
-           background: transparent; color: inherit; outline: none; }
-  .sheet input:focus { border-color: #2f6fd0; }
-  .srow { display: flex; gap: 8px; margin-top: 18px; align-items: center; }
-  .sbtn { padding: 10px 18px; border-radius: 10px; border: 0; background: #2f6fd0; color: #fff;
-          font-size: 14px; cursor: pointer; }
-  .sbtn.ghost { background: transparent; color: inherit;
-          border: 1px solid color-mix(in srgb, currentColor 28%, transparent); }
-  .sbtn.danger { background: transparent; color: #dc2626;
-          border: 1px solid color-mix(in srgb, #dc2626 45%, transparent); }
-  .msg { min-height: 18px; font-size: 13px; margin-top: 8px; }
-  .err { color: #dc2626; }
-  #gate-note { display: none; padding: 40px 6px; font-size: 15px; opacity: .75; }
-</style>
+<style>""" + _CSS_MAIN_CAT + """</style>
 </head>
 <body>
 <header>
@@ -1013,24 +968,7 @@ PAGE_HTML = """<!DOCTYPE html>
   <span id="impMsg"></span>
 </div>
 <main id="board"></main>
-<style>
-  #pubwrap { margin-top: 6px; }
-  .pubform label { display: block; font-size: 13px; margin: 12px 0 4px; opacity: .8; }
-  .pubform input { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 15px;
-           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
-           background: transparent; color: inherit; outline: none; }
-  .pubform input:focus { border-color: #2f6fd0; }
-  .pubform textarea { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 13px;
-           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
-           background: transparent; color: inherit; outline: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
-  .pubform textarea:focus { border-color: #2f6fd0; }
-  .uprow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .uprow .tbtn { display: inline-block; margin: 0; padding: 8px 14px; border-radius: 999px;
-          border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
-          background: transparent; color: inherit; font-size: 14px; cursor: pointer; white-space: nowrap; }
-  .fnote { font-size: 12px; opacity: .7; }
-  #pf-fhint { margin: 6px 0 0; }
-</style>
+<style>""" + _CSS_PUB_HTML + """</style>
 <section id="pubwrap" hidden>
   <h2 class="cat" style="font-size:17px;opacity:1;">发布 HTML 项目</h2>
   <form id="pubform" class="pubform">
@@ -1430,97 +1368,7 @@ PAGE_PY = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>微书签</title>
-<style>
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-         margin: 0 auto; max-width: 880px; padding: 0 14px 56px; line-height: 1.5;
-         -webkit-tap-highlight-color: transparent; }
-  header { position: sticky; top: 0; z-index: 20; display: flex; gap: 8px; align-items: center;
-           padding: 12px 2px 10px;
-           background: color-mix(in srgb, Canvas 88%, transparent);
-           backdrop-filter: blur(8px); }
-  header h1 { font-size: 19px; margin: 0; white-space: nowrap; }
-  #q { flex: 1; min-width: 0; padding: 9px 12px; border-radius: 999px; font-size: 15px;
-       border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
-       background: transparent; color: inherit; outline: none; }
-  #q:focus { border-color: #2f6fd0; }
-  .tbtn { padding: 8px 14px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
-          background: transparent; color: inherit; font-size: 14px; cursor: pointer; white-space: nowrap; }
-  .tbtn.on { background: #2f6fd0; border-color: #2f6fd0; color: #fff; }
-  .hintbar { display: none; font-size: 13px; opacity: .65; padding: 2px 2px 8px; }
-  body.editing .hintbar { display: block; }
-  .editbar { display: none; gap: 8px; align-items: center; padding: 0 2px 10px; flex-wrap: wrap; }
-  body.editing .editbar { display: flex; }
-  #impMsg { font-size: 12px; opacity: .75; }
-  h2.cat { font-size: 14px; margin: 20px 2px 10px; opacity: .75; font-weight: 600;
-           display: flex; align-items: baseline; gap: 8px; }
-  h2.cat .n { font-size: 12px; opacity: .6; font-weight: 400; }
-  .catnav { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 2px 0; }
-  .catnav .chip { display: inline-flex; align-items: baseline; gap: 5px; padding: 6px 11px; border-radius: 999px;
-          border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
-          background: transparent; color: inherit; font-size: 13px; cursor: pointer; font-family: inherit; }
-  .catnav .chip .n { font-size: 11px; opacity: .55; }
-  h2.cat.sec { cursor: pointer; user-select: none; }
-  h2.cat.sec .tog { margin-left: auto; font-size: 12px; opacity: .6; font-weight: 400; }
-  .secgrid.off { display: none; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px 8px; }
-  @media (max-width: 560px) { .grid { grid-template-columns: repeat(4, 1fr); } }
-  .card { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0;
-          padding: 12px 4px 10px; border-radius: 16px;
-          border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
-          background: color-mix(in srgb, currentColor 4%, transparent);
-          text-decoration: none; color: inherit; position: relative;
-          transition: transform .05s ease; }
-  .card:active { transform: scale(.97); }
-  .tile { flex: 0 0 auto; width: 52px; height: 52px; border-radius: 14px; color: #fff;
-          display: flex; align-items: center; justify-content: center; overflow: hidden;
-          font-size: 22px; font-weight: 700; background: hsl(var(--h, 210) 52% 44%); }
-  .tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .meta { width: 100%; min-width: 0; text-align: center; }
-  .name { display: block; min-width: 0; font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sub2 { display: block; font-size: 11px; height: 15px; line-height: 15px; opacity: .55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .date2 { display: block; font-size: 10px; height: 13px; line-height: 13px; opacity: .45; }
-  body.editing .card { border-style: dashed; cursor: pointer; }
-  body.editing .card::after { content: "编辑"; position: absolute; top: 6px; right: 8px;
-          font-size: 11px; opacity: .55; }
-  .addcard { display: none; flex-direction: column; align-items: center; justify-content: center; gap: 6px; min-height: 118px;
-          border-radius: 16px; border: 1.5px dashed color-mix(in srgb, currentColor 30%, transparent);
-          font-size: 14px; opacity: .75; cursor: pointer; background: transparent; color: inherit; }
-  body.editing .addcard { display: flex; }
-  .empty { opacity: .55; font-size: 14px; padding: 26px 2px; }
-  .sheet textarea { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 13px;
-           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
-           background: transparent; color: inherit; outline: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
-  .sheet textarea:focus { border-color: #2f6fd0; }
-  .crumb { font-size: 13px; padding: 2px 2px 0; }
-  .crumb a { color: #2f6fd0; text-decoration: none; }
-  .intro { font-size: 13px; opacity: .65; padding: 4px 2px 0; }
-  body:not(.editing) .delcard { display: none !important; }
-  footer { margin-top: 30px; font-size: 12px; opacity: .45; padding: 0 2px; }
-  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.48); z-index: 50;
-             display: none; align-items: flex-end; justify-content: center; }
-  .overlay.show { display: flex; }
-  .sheet { background: Canvas; color: CanvasText; width: 100%; max-width: 520px;
-           border-radius: 18px 18px 0 0; padding: 18px 18px 22px; }
-  @media (min-width: 640px) { .overlay { align-items: center; } .sheet { border-radius: 18px; } }
-  .sheet h3 { margin: 0 0 6px; font-size: 16px; }
-  .sheet label { display: block; font-size: 13px; margin: 12px 0 4px; opacity: .8; }
-  .sheet input { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 15px;
-           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
-           background: transparent; color: inherit; outline: none; }
-  .sheet input:focus { border-color: #2f6fd0; }
-  .srow { display: flex; gap: 8px; margin-top: 18px; align-items: center; }
-  .sbtn { padding: 10px 18px; border-radius: 10px; border: 0; background: #2f6fd0; color: #fff;
-          font-size: 14px; cursor: pointer; }
-  .sbtn.ghost { background: transparent; color: inherit;
-          border: 1px solid color-mix(in srgb, currentColor 28%, transparent); }
-  .sbtn.danger { background: transparent; color: #dc2626;
-          border: 1px solid color-mix(in srgb, #dc2626 45%, transparent); }
-  .msg { min-height: 18px; font-size: 13px; margin-top: 8px; }
-  .err { color: #dc2626; }
-  #gate-note { display: none; padding: 40px 6px; font-size: 15px; opacity: .75; }
-</style>
+<style>""" + _CSS_MAIN_CAT + """</style>
 </head>
 <body>
 <header>
@@ -1536,18 +1384,7 @@ PAGE_PY = """<!DOCTYPE html>
   <span id="impMsg"></span>
 </div>
 <main id="board"></main>
-<style>
-  #pubwrap { margin-top: 6px; }
-  .pubform label { display: block; font-size: 13px; margin: 12px 0 4px; opacity: .8; }
-  .pubform input { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 15px;
-           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
-           background: transparent; color: inherit; outline: none; }
-  .pubform input:focus { border-color: #2f6fd0; }
-  .pubform textarea { width: 100%; padding: 10px 12px; border-radius: 10px; font-size: 13px;
-           border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
-           background: transparent; color: inherit; outline: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
-  .pubform textarea:focus { border-color: #2f6fd0; }
-</style>
+<style>""" + _CSS_PUB + """</style>
 <section id="pubwrap" hidden>
   <h2 class="cat" style="font-size:17px;opacity:1;">发布 PY 项目</h2>
   <form id="pubform" class="pubform">

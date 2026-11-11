@@ -35,15 +35,24 @@ PAGES = {
   #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
+<style>
+  /* hub-topnav: unified page header (UI batch4, option C) - same skeleton as the gen-4 sticky topnav */
+  .hub-topnav{position:sticky;top:0;z-index:40;background:#fff;border-bottom:1px solid #e5e7eb;box-shadow:0 1px 2px rgba(16,24,40,.05);padding:14px 16px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+  .hub-topnav-in{max-width:68rem;margin:0 auto;display:flex;align-items:center;gap:12px}
+  .hub-topnav h1,.hub-topnav .hub-title{font-size:20px;font-weight:700;color:#1f2937;letter-spacing:-.01em;margin:0;flex:0 0 auto;line-height:1.25}
+  .hub-topnav .hub-actions{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  @media (max-width:767px){.hub-topnav{padding:12px}.hub-topnav h1,.hub-topnav .hub-title{font-size:18px}}
+</style>
 </head>
 <body class="bg-gray-50 min-h-screen">
 <div id="app" class="mx-auto w-full max-w-xl px-3 py-4 sm:px-6 sm:py-8">
     <div class="rounded-2xl bg-white p-4 shadow-sm sm:p-6">
 
         <!-- 顶部：标题 + 导入导出 -->
-        <div class="mb-4 flex items-center justify-between gap-3">
-            <h1 class="text-xl font-bold text-blue-700 sm:text-2xl">日常项目统计</h1>
-            <div class="flex shrink-0 gap-1.5">
+        <header class="hub-topnav" style="margin:-16px -16px 16px;border-radius:16px 16px 0 0">
+          <div class="hub-topnav-in" style="max-width:none">
+            <h1>日常项目统计</h1>
+            <div class="hub-actions flex shrink-0 gap-1.5">
                 <button @click="exportCSV"
                         class="rounded-lg bg-green-500 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-green-600 active:scale-95 sm:text-sm">
                     导出
@@ -54,7 +63,8 @@ PAGES = {
                     导入
                 </button>
             </div>
-        </div>
+          </div>
+        </header>
 
         <!-- 项目切换（移动端横向滚动） -->
         <div class="no-scrollbar -mx-4 mb-4 flex gap-2 overflow-x-auto border-b border-gray-100 px-4 pb-3 sm:mx-0 sm:px-0">
@@ -656,17 +666,13 @@ createApp({
 <head>
 <script>window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");</script>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>油耗统计</title>
     <script src="static/cdn/vue3.5.global.prod.js"></script>
     <script src="static/cdn/axios1.1.min.js"></script>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="static/cdn/tailwindcss3.4.17.js"></script>
     <script src="static/cdn/chart.min.3.9.1.js"></script>
     <script src="static/cdn/chartjs-plugin-datalabels@2.js"></script>
-    <!-- <script src="https://unpkg.com/vue@3.5.13/dist/vue.global.js"></script>
-    <script src="https://unpkg.com/axios@1.1.3/dist/axios.min.js"></script>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/chart.js@3.9.1/dist/chart.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2"></script> -->
 
 <style>
   #authGate{position:fixed;inset:0;z-index:9999;background:rgba(10,12,16,.93);display:none;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
@@ -686,9 +692,18 @@ createApp({
 </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
-<div id="app" class="max-w-6xl mx-auto mt-8 p-6 bg-white rounded-lg shadow">
+<style>
+  /* hub-topnav: unified page header (UI batch4, option C) - same skeleton as the gen-4 sticky topnav */
+  .hub-topnav{position:sticky;top:0;z-index:40;background:#fff;border-bottom:1px solid #e5e7eb;box-shadow:0 1px 2px rgba(16,24,40,.05);padding:14px 16px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+  .hub-topnav-in{max-width:68rem;margin:0 auto;display:flex;align-items:center;gap:12px}
+  .hub-topnav h1,.hub-topnav .hub-title{font-size:20px;font-weight:700;color:#1f2937;letter-spacing:-.01em;margin:0;flex:0 0 auto;line-height:1.25}
+  .hub-topnav .hub-actions{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  @media (max-width:767px){.hub-topnav{padding:12px}.hub-topnav h1,.hub-topnav .hub-title{font-size:18px}}
+</style>
+<header class="hub-topnav"><div class="hub-topnav-in"><h1>油耗统计</h1></div></header>
+<div id="app" class="max-w-[68rem] mx-auto mt-8 p-6 bg-white rounded-lg shadow">
     <div class="flex justify-between items-center mb-4">
-        <h2 class="text-2xl font-bold text-blue-700">油耗统计</h2>
+
        
     </div>
     
@@ -1165,8 +1180,8 @@ createApp({
 </style>
 </head>
 <body class="bg-gray-50 min-h-screen font-sans">
-    <nav class="bg-white shadow-sm border-b border-gray-200 px-4 md:px-6 py-4 sticky top-0 z-40">
-        <div class="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center justify-between">
+    <nav class="hub-topnav-gen bg-white shadow-sm border-b border-gray-200 px-4 md:px-6 py-4 sticky top-0 z-40">
+        <div class="max-w-[68rem] mx-auto flex flex-col md:flex-row md:items-center justify-between">
             <div class="flex items-center justify-between flex-1">
                 <h1 class="text-xl font-bold text-gray-800 tracking-tight mr-6 whitespace-nowrap shrink-0">⏳ 时光记录</h1>
                 <button onclick="UI.toggleModal('uploadModal', true)" class="bg-black hover:bg-gray-800 text-white text-sm font-bold py-2 px-4 rounded-full shrink-0 md:order-last ml-auto md:ml-0">
@@ -1177,7 +1192,7 @@ createApp({
         </div>
     </nav>
 
-    <div class="max-w-7xl mx-auto px-4 md:px-6 pt-6">
+    <div class="max-w-[68rem] mx-auto px-4 md:px-6 pt-6">
         <div class="flex items-center justify-between mb-3 w-full overflow-hidden">
             <h2 class="text-xs font-bold text-gray-400 uppercase tracking-widest whitespace-nowrap overflow-hidden overflow-ellipsis min-w-0 flex-1 pr-2">近期活跃事件 (Top 8)</h2>
             <button onclick="Utils.$('searchInput').value='';UI.renderGallery(true)" class="text-[10px] text-blue-500 hover:underline shrink-0 whitespace-nowrap">查看全部</button>
@@ -1185,7 +1200,7 @@ createApp({
         <div id="eventStatsDashboard" class="flex space-x-3 overflow-x-auto no-scrollbar pb-3 snap-x"></div>
     </div>
 
-    <main class="max-w-7xl mx-auto px-4 md:px-6 py-4">
+    <main class="max-w-[68rem] mx-auto px-4 md:px-6 py-4">
         <div id="gallery" class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 md:gap-6"></div>
         <div id="lazyLoadTrigger" class="w-full text-center text-xs text-gray-400 py-6 font-bold tracking-widest"></div>
     </main>
@@ -1243,8 +1258,8 @@ createApp({
     </div>
 
     <script src="static/cdn/marked.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/exif-js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/viewerjs/1.11.3/viewer.min.js"></script>
+    <script src="static/cdn/exif.js"></script>
+    <script src="static/cdn/viewer.min.js"></script>
     <script>
         // ================= 1. 配置与状态 =================
         const API_BASE = location.pathname.replace(/\/[^/]*$/, "");
@@ -1566,7 +1581,7 @@ createApp({
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600;700&family=DM+Mono:wght@400;500&family=Noto+Sans+SC:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <script src="static/cdn/tailwindcss3.4.17.js"></script>
-    <script src="https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js"></script>
+    <script src="static/cdn/wavesurfer.min.js"></script>
     <script>
         tailwind.config={theme:{extend:{colors:{ink:{50:'#f8f6f2',100:'#f0ece4',200:'#e2dbd0',300:'#c9bfb0',400:'#a89a86',500:'#8a7b68',600:'#6b5e4e',700:'#50463a',800:'#362f28',900:'#1c1814'},tea:{50:'#effcf9',100:'#d7f7ef',200:'#b3efe0',300:'#7ae2cc',400:'#2dd4bf',500:'#14b8a6',600:'#0d9488',700:'#0f766e'}}}}}
     </script>
@@ -1625,7 +1640,7 @@ createApp({
 <body class="text-ink-900 pb-safe">
 
 <!-- ─── Nav ─── -->
-<nav class="sticky top-0 z-40 bg-ink-900/[0.97] backdrop-blur-md shadow-lg shadow-ink-900/20">
+<nav class="hub-topnav-gen sticky top-0 z-40 bg-ink-900/[0.97] backdrop-blur-md shadow-lg shadow-ink-900/20">
     <div class="max-w-3xl mx-auto flex items-center gap-3 px-4 py-3">
         <div class="shrink-0 flex items-center gap-2.5">
             <div class="w-8 h-8 bg-tea-500 rounded-lg flex items-center justify-center">
@@ -2733,10 +2748,19 @@ loadData();
   #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
+<style>
+  /* hub-topnav: unified page header (UI batch4, option C) - same skeleton as the gen-4 sticky topnav */
+  .hub-topnav{position:sticky;top:0;z-index:40;background:#fff;border-bottom:1px solid #e5e7eb;box-shadow:0 1px 2px rgba(16,24,40,.05);padding:14px 16px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+  .hub-topnav-in{max-width:68rem;margin:0 auto;display:flex;align-items:center;gap:12px}
+  .hub-topnav h1,.hub-topnav .hub-title{font-size:20px;font-weight:700;color:#1f2937;letter-spacing:-.01em;margin:0;flex:0 0 auto;line-height:1.25}
+  .hub-topnav .hub-actions{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  @media (max-width:767px){.hub-topnav{padding:12px}.hub-topnav h1,.hub-topnav .hub-title{font-size:18px}}
+</style>
 </head>
 <body class="bg-gray-100 text-gray-800 p-4 md:p-6 font-sans">
     <div id="app" class="mx-auto" style="max-width: 800px;" v-cloak>
-        <header class="flex flex-col md:flex-row justify-between items-center mb-6 gap-4">
+        <header class="hub-topnav" style="border-radius:12px;margin-bottom:24px">
+          <div class="hub-topnav-in" style="max-width:none">
             <h2 class="text-2xl font-bold flex items-center gap-2">📈 数据变化追踪</h2>
             <div class="flex gap-2">
                 <button @click="exportCSV" class="px-4 py-2 bg-gray-200 hover:bg-gray-300 rounded shadow-sm text-sm">导出 CSV</button>
@@ -2744,6 +2768,7 @@ loadData();
                 <input type="file" ref="fileInput" accept=".csv" class="hidden" @change="importCSV">
                 <button @click="openItemModal()" class="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded shadow-sm text-sm">+ 新建追踪项</button>
             </div>
+          </div>
         </header>
 
         <div v-if="items.length === 0" class="text-center text-gray-500 py-10">暂无数据追踪项目，请点击右上角新建。</div>
@@ -3353,11 +3378,19 @@ loadData();
   #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
+<style>
+  /* hub-topnav: unified page header (UI batch4, option C) - same skeleton as the gen-4 sticky topnav */
+  .hub-topnav{position:sticky;top:0;z-index:40;background:#fff;border-bottom:1px solid #e5e7eb;box-shadow:0 1px 2px rgba(16,24,40,.05);padding:14px 16px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+  .hub-topnav-in{max-width:68rem;margin:0 auto;display:flex;align-items:center;gap:12px}
+  .hub-topnav h1,.hub-topnav .hub-title{font-size:20px;font-weight:700;color:#1f2937;letter-spacing:-.01em;margin:0;flex:0 0 auto;line-height:1.25}
+  .hub-topnav .hub-actions{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  @media (max-width:767px){.hub-topnav{padding:12px}.hub-topnav h1,.hub-topnav .hub-title{font-size:18px}}
+</style>
 </head>
 <body>
 
  
-        <div class="header">
+    <div class="header hub-topnav" style="border-radius:12px;padding:14px 16px;max-width:800px">
     <h2>📦 用品消耗看板</h2>
     <div style="display: flex; gap: 8px;">
         <button class="btn btn-cancel" onclick="exportToCSV()" title="备份数据">导出</button>
@@ -3812,10 +3845,19 @@ loadData();
   #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
+<style>
+  /* hub-topnav: unified page header (UI batch4, option C) - same skeleton as the gen-4 sticky topnav */
+  .hub-topnav{position:sticky;top:0;z-index:40;background:#fff;border-bottom:1px solid #e5e7eb;box-shadow:0 1px 2px rgba(16,24,40,.05);padding:14px 16px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+  .hub-topnav-in{max-width:68rem;margin:0 auto;display:flex;align-items:center;gap:12px}
+  .hub-topnav h1,.hub-topnav .hub-title{font-size:20px;font-weight:700;color:#1f2937;letter-spacing:-.01em;margin:0;flex:0 0 auto;line-height:1.25}
+  .hub-topnav .hub-actions{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  @media (max-width:767px){.hub-topnav{padding:12px}.hub-topnav h1,.hub-topnav .hub-title{font-size:18px}}
+</style>
 </head>
 <body class="bg-slate-100 text-slate-800 p-4 md:p-6 font-sans">
     <div id="app" class="mx-auto" style="max-width: 1000px;" v-cloak>
-        <header class="flex flex-col md:flex-row justify-between items-center mb-4 gap-4">
+        <header class="hub-topnav" style="border-radius:12px;margin-bottom:24px">
+          <div class="hub-topnav-in" style="max-width:none">
             <h2 class="text-2xl font-bold flex items-center gap-2">资产与生命周期管理中枢</h2>
             <div class="flex gap-2 flex-wrap justify-end">
                 <button @click="exportCSVView" class="px-4 py-2 bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 rounded shadow-sm text-sm transition-colors">📊 导出 CSV 报表</button>
@@ -3826,6 +3868,7 @@ loadData();
                 <div class="w-px bg-slate-300 mx-1"></div>
                 <button @click="openItemModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-900 text-white rounded shadow-sm text-sm">+ 录入新资产</button>
             </div>
+          </div>
         </header>
 
         <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
@@ -4937,14 +4980,24 @@ loadData();
   #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
+<style>
+  /* hub-topnav: unified page header (UI batch4, option C) - same skeleton as the gen-4 sticky topnav */
+  .hub-topnav{position:sticky;top:0;z-index:40;background:#fff;border-bottom:1px solid #e5e7eb;box-shadow:0 1px 2px rgba(16,24,40,.05);padding:14px 16px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+  .hub-topnav-in{max-width:68rem;margin:0 auto;display:flex;align-items:center;gap:12px}
+  .hub-topnav h1,.hub-topnav .hub-title{font-size:20px;font-weight:700;color:#1f2937;letter-spacing:-.01em;margin:0;flex:0 0 auto;line-height:1.25}
+  .hub-topnav .hub-actions{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  @media (max-width:767px){.hub-topnav{padding:12px}.hub-topnav h1,.hub-topnav .hub-title{font-size:18px}}
+</style>
 </head>
 <body class="bg-gray-50 text-gray-800 p-4 md:p-6 font-sans">
     <div id="app" class="mx-auto" style="max-width: 900px;" v-cloak>
-        <header class="flex flex-col md:flex-row justify-between items-center mb-6 gap-4">
+        <header class="hub-topnav" style="border-radius:12px;margin-bottom:24px">
+          <div class="hub-topnav-in" style="max-width:none">
             <h2 class="text-2xl font-bold flex items-center gap-2">🔄 订阅与虚拟资产看板</h2>
             <div class="flex gap-2">
                 <button @click="openItemModal()" class="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white font-bold rounded-lg shadow-sm text-sm">+ 新建资产项</button>
             </div>
+          </div>
         </header>
 
         <div v-if="items.length === 0" class="text-center text-gray-400 py-16 border-2 border-dashed border-gray-200 rounded-xl">
@@ -5847,10 +5900,18 @@ loadData();
   #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
+<style>
+  /* hub-topnav: unified page header (UI batch4, option C) - same skeleton as the gen-4 sticky topnav */
+  .hub-topnav{position:sticky;top:0;z-index:40;background:#fff;border-bottom:1px solid #e5e7eb;box-shadow:0 1px 2px rgba(16,24,40,.05);padding:14px 16px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+  .hub-topnav-in{max-width:68rem;margin:0 auto;display:flex;align-items:center;gap:12px}
+  .hub-topnav h1,.hub-topnav .hub-title{font-size:20px;font-weight:700;color:#1f2937;letter-spacing:-.01em;margin:0;flex:0 0 auto;line-height:1.25}
+  .hub-topnav .hub-actions{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  @media (max-width:767px){.hub-topnav{padding:12px}.hub-topnav h1,.hub-topnav .hub-title{font-size:18px}}
+</style>
 </head>
 <body>
   <div class="app-container" id="app">
-    <h1>自重与功能性训练记录</h1>
+  <header class="hub-topnav" style="border-radius:12px;margin-bottom:16px"><div class="hub-topnav-in" style="max-width:none"><h1>自重与功能性训练记录</h1></div></header>
 
     <div class="knowledge-card">
       <div class="knowledge-header">
@@ -6780,10 +6841,18 @@ const PLANS = {
   #authGate #chGo{background:#2f6fd0;color:#fff;border:0;border-radius:10px;padding:10px;font:inherit;cursor:pointer}
   #authGate .err{color:#ff8b8b;font-size:12px;min-height:15px}
 </style>
+<style>
+  /* hub-topnav: unified page header (UI batch4, option C) - same skeleton as the gen-4 sticky topnav */
+  .hub-topnav{position:sticky;top:0;z-index:40;background:#fff;border-bottom:1px solid #e5e7eb;box-shadow:0 1px 2px rgba(16,24,40,.05);padding:14px 16px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+  .hub-topnav-in{max-width:68rem;margin:0 auto;display:flex;align-items:center;gap:12px}
+  .hub-topnav h1,.hub-topnav .hub-title{font-size:20px;font-weight:700;color:#1f2937;letter-spacing:-.01em;margin:0;flex:0 0 auto;line-height:1.25}
+  .hub-topnav .hub-actions{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  @media (max-width:767px){.hub-topnav{padding:12px}.hub-topnav h1,.hub-topnav .hub-title{font-size:18px}}
+</style>
 </head>
 <body>
   <div class="app-container" id="app">
-    <h1>长线负荷与恢复评估模型</h1>
+  <header class="hub-topnav" style="border-radius:12px;margin-bottom:16px"><div class="hub-topnav-in" style="max-width:none"><h1>长线负荷与恢复评估模型</h1></div></header>
 
     <div class="alert-box">
       <div class="alert-title">核心结论</div>
@@ -7038,7 +7107,7 @@ const PLANS = {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>智能说明书智库 限制分类</title>
-    <script src="static/cdn/tailwindcss3.4.js"></script>
+    <script src="static/cdn/tailwindcss3.4.17.js"></script>
     <script src="static/cdn/marked.min.js"></script>
     <link rel="stylesheet" href="static/cdn/viewer.min.css">
     <style>
@@ -7087,8 +7156,8 @@ const PLANS = {
 </head>
 <body class="bg-gray-50 min-h-screen font-sans">
 
-    <nav class="bg-white shadow-sm border-b border-gray-200 px-4 md:px-6 py-4 sticky top-0 z-40">
-        <div class="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center gap-4 justify-between">
+    <nav class="hub-topnav-gen bg-white shadow-sm border-b border-gray-200 px-4 md:px-6 py-4 sticky top-0 z-40">
+        <div class="max-w-[68rem] mx-auto flex flex-col md:flex-row md:items-center gap-4 justify-between">
             <div class="flex items-center justify-between flex-1">
                 <h1 class="text-xl font-bold text-gray-800 tracking-tight flex-shrink-0 mr-6">📚 智能说明书</h1>
                 <button onclick="UploadCtrl.open()" class="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-2 px-4 rounded-full shadow-md transition-all flex items-center gap-1 shrink-0 md:order-last">
@@ -7102,10 +7171,10 @@ const PLANS = {
                 <input type="text" id="searchMobile" class="w-full bg-gray-100 border-transparent focus:bg-white focus:border-blue-500 rounded-xl px-4 py-2.5 text-sm transition-all shadow-sm outline-none" placeholder="🔍 搜索全文或文件名..." oninput="handleSearch(this.value)">
             </div>
         </div>
-        <div class="max-w-7xl mx-auto mt-4 flex gap-2 items-center flex-wrap" id="tagFilterContainer"></div>
+        <div class="max-w-[68rem] mx-auto mt-4 flex gap-2 items-center flex-wrap" id="tagFilterContainer"></div>
     </nav>
 
-    <main class="max-w-7xl mx-auto px-4 md:px-6 py-6">
+    <main class="max-w-[68rem] mx-auto px-4 md:px-6 py-6">
         <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-4 md:p-5 mb-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
             <div class="flex items-center gap-3">
                 <div class="bg-blue-50 p-2.5 rounded-xl text-blue-600 hidden sm:block">
@@ -7187,7 +7256,7 @@ const PLANS = {
         </div>
     </div>
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/viewerjs/1.11.3/viewer.min.js"></script>
+    <script src="static/cdn/viewer.min.js"></script>
     <script>
         // ================= 1. 状态与工具库 =================
         const $ = id => document.getElementById(id);

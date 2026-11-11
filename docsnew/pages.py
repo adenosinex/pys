@@ -3189,7 +3189,6 @@ app.mount('#app');
     <script src="static/cdn/vue3.5.global.prod.js"></script>
     <link rel="stylesheet" href="static/cdn/element-plus2.14.3.css">
     <script src="static/cdn/element-plus2.14.3.js"></script>
-    <script src="static/cdn/element.vue.js"></script>
 
     <style>
         * { box-sizing: border-box; }
@@ -3579,6 +3578,7 @@ app.mount('#app');
         .reader-body table {
             border-collapse: collapse; margin: 14px 0;
             font-size: 13px; width: 100%;
+            display: block; overflow-x: auto; max-width: 100%;
         }
         .reader-body th,
         .reader-body td { border: 1px solid #e2e8f0; padding: 7px 10px; }
