@@ -1141,6 +1141,11 @@ code{background:#0d1117;border:1px solid var(--line);border-radius:6px;padding:1
 pre{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;white-space:pre-wrap;word-break:break-all}
 #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#21262d;border:1px solid var(--line);color:var(--txt);padding:8px 16px;border-radius:20px;display:none;z-index:9}
 .samples{color:var(--dim);font-size:12px;max-width:300px;word-break:break-all}
+.tblwrap{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}
+td{overflow-wrap:anywhere}
+pre{max-width:100%}
+/* ui2-c2-20261111 mobile */
+@media (max-width:640px){table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}pre{overflow-x:auto}img{max-width:100%;height:auto}input,select,textarea{max-width:100%;box-sizing:border-box}.samples{max-width:100%}}
 </style>
 </head>
 <body>

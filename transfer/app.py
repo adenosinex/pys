@@ -522,6 +522,9 @@ a.dl{color:#58a6ff;text-decoration:none;font-weight:600;white-space:nowrap}
 .msg.ok{color:#3fb950}
 .gtitle{font-size:17px;margin:30px 0 4px}
 .gsub{color:#8b949e;font-size:13px;margin-bottom:12px}
+.tscroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+/* ui2-20261111 */
+@media (max-width:640px){ .tscroll{overflow-x:auto;-webkit-overflow-scrolling:touch} .tscroll table{min-width:520px} pre{overflow-x:auto} img{max-width:100%;height:auto} input,select,textarea{max-width:100%;box-sizing:border-box} }
 </style>
 </head>
 <body>
@@ -535,10 +538,10 @@ a.dl{color:#58a6ff;text-decoration:none;font-weight:600;white-space:nowrap}
   <input type="file" id="picker" multiple hidden>
   <div class="queue" id="queue"></div>
   <div class="msg" id="msg"></div>
-  <table>
+  <div class="tscroll"><table>
     <thead><tr><th>文件</th><th>大小</th><th>时间</th><th></th><th></th></tr></thead>
     <tbody id="rows"></tbody>
-  </table>
+  </table></div>
   <div class="meta" id="meta"></div>
   <h2 class="gtitle">谷歌硬盘</h2>
   <div class="gsub">直传到谷歌硬盘里的新文件夹「文件中转站」，不占服务器磁盘；文件先经服务器中转，大文件转存要多等一会儿。</div>
@@ -549,10 +552,10 @@ a.dl{color:#58a6ff;text-decoration:none;font-weight:600;white-space:nowrap}
   <input type="file" id="gpicker" multiple hidden>
   <div class="queue" id="gqueue"></div>
   <div class="msg" id="gmsg"></div>
-  <table>
+  <div class="tscroll"><table>
     <thead><tr><th>文件</th><th>大小</th><th>时间</th><th></th><th></th></tr></thead>
     <tbody id="grows"></tbody>
-  </table>
+  </table></div>
   <div class="meta" id="gmeta"></div>
 </div>
 <script>

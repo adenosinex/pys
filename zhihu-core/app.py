@@ -151,7 +151,7 @@ def create_app(*, extract_fn=None, max_concurrency=None,
     def application(environ, start_response):
         path, method = environ.get('PATH_INFO', ''), environ.get('REQUEST_METHOD', 'GET')
         if path in {'/health', '/api/health'} and method == 'GET':
-            return response(start_response, 200, {'ok': True, 'service': 'zhihu-core', 'version': '1.5.0'})
+            return response(start_response, 200, {'ok': True, 'service': 'zhihu-core', 'version': '1.5.1'})
         if path in assets and method == 'GET':
             if path == '/':
                 origins = []
@@ -172,7 +172,9 @@ def create_app(*, extract_fn=None, max_concurrency=None,
                    '/api/bili-cookie/remove': ('POST',),
                    '/api/bili-cookie/test': ('POST',),
                    '/api/mac-code': ('GET', 'POST'),
-                   '/api/mac-code/remove': ('POST',)}
+                   '/api/mac-code/remove': ('POST',),
+                   '/api/youtube-cookie': ('GET', 'POST'),
+                   '/api/youtube-cookie/remove': ('POST',)}
         if path == '/api/video/stream' and method == 'GET':
             query = parse_qs(environ.get('QUERY_STRING', ''))
             try:
@@ -260,6 +262,37 @@ def create_app(*, extract_fn=None, max_concurrency=None,
                 return error(start_response, 400, '访问码无效（应为非空文本）。', 'invalid_request')
             except OSError:
                 return error(start_response, 503, '无法保存访问码，请稍后重试。', 'store_unavailable')
+        if path in {'/api/youtube-cookie', '/api/youtube-cookie/remove'}:
+            # Write-only store for THIS project's own YouTube cookie
+            # (used by the built-in subtitle pipeline; since the
+            # 2026-11-10 remediation zhihu-core no longer borrows
+            # yt-audio's cookie file). Same discipline as the Mac
+            # code above: stored server-side, never read back.
+            if environ.get('QUERY_STRING'):
+                return error(start_response, 400, '参数请放在 JSON 请求体中。', 'invalid_request')
+            try:
+                if method == 'GET':
+                    return response(start_response, 200,
+                                    {'ok': True, 'configured': yt_text.youtube_cookie_configured()})
+                data = read_json(environ, limit=600 * 1024)
+                if path == '/api/youtube-cookie/remove':
+                    if set(data):
+                        raise ZhihuError('请求参数无效。', 'invalid_request', 400)
+                    return response(start_response, 200,
+                                    {'ok': True, 'configured': yt_text.remove_youtube_cookie()})
+                if set(data) - {'cookie'}:
+                    raise ZhihuError('请求参数无效。', 'invalid_request', 400)
+                cookie = data.get('cookie')
+                if not isinstance(cookie, str):
+                    raise ValueError('invalid youtube cookie')
+                yt_text.save_youtube_cookie(cookie)
+                return response(start_response, 200, {'ok': True, 'configured': True})
+            except ZhihuError as exc:
+                return error(start_response, exc.status, str(exc), exc.code)
+            except ValueError:
+                return error(start_response, 400, 'Cookie 无效（应为 youtube.com 的 cookies.txt 内容或浏览器 Cookie 整行，且含登录关键字段）。', 'invalid_request')
+            except OSError:
+                return error(start_response, 503, '无法保存 Cookie，请稍后重试。', 'store_unavailable')
         if path in {'/api/cookie', '/api/cookie/test', '/api/cookie/remove'}:
             if environ.get('QUERY_STRING'):
                 return error(start_response, 400, 'Cookie 和测试参数请放在 JSON 请求体中。', 'invalid_request')

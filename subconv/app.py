@@ -60,7 +60,7 @@ PUBLIC_BASE = "https://debi.su7.dpdns.org"
 STALE_SECONDS = 12 * 3600
 MAX_SUB_BYTES = 8 * 1024 * 1024
 
-RULESET = json.loads(r"""{"rule-providers": {"reject": {"type": "http", "behavior": "domain", "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/reject.txt", "path": "./ruleset/reject.yaml", "interval": 86400, "proxy": "节点选择"}, "cn-domain": {"type": "http", "behavior": "classical", "url": "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ChinaDomain.list", "path": "./ruleset/cn-domain.yaml", "interval": 86400, "proxy": "节点选择"}, "proxy-domains": {"type": "http", "behavior": "domain", "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt", "path": "./ruleset/proxy-domains.yaml", "interval": 86400, "proxy": "节点选择"}, "claude": {"type": "http", "behavior": "classical", "url": "https://gh-proxy.com/raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/Claude/Claude.list", "path": "./ruleset/claude.yaml", "interval": 86400, "proxy": "节点选择"}, "gemini": {"type": "http", "behavior": "classical", "url": "https://gh-proxy.com/raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/Gemini/Gemini.list", "path": "./ruleset/gemini.yaml", "interval": 86400, "proxy": "节点选择"}}, "rules": ["DOMAIN-SUFFIX,local,DIRECT", "DOMAIN-SUFFIX,localhost,DIRECT", "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve", "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve", "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve", "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve", "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve", "IP-CIDR,224.0.0.0/4,DIRECT,no-resolve", "IP-CIDR6,::1/128,DIRECT,no-resolve", "IP-CIDR6,fc00::/7,DIRECT,no-resolve", "IP-CIDR6,fe80::/10,DIRECT,no-resolve", "DOMAIN-SUFFIX,su7.dpdns.org,DIRECT", "RULE-SET,reject,REJECT", "GEOSITE,category-ads-all,REJECT", "GEOSITE,openai,AI", "DOMAIN-SUFFIX,openai.com,AI", "RULE-SET,claude,AI", "DOMAIN-SUFFIX,anthropic.com,AI", "DOMAIN-SUFFIX,claude.ai,AI", "RULE-SET,gemini,AI", "DOMAIN-SUFFIX,gemini.google.com,AI", "DOMAIN-SUFFIX,aistudio.google.com,AI", "DOMAIN-SUFFIX,generativelanguage.googleapis.com,AI", "DOMAIN-SUFFIX,grok.com,AI", "DOMAIN-SUFFIX,x.ai,AI", "DOMAIN-SUFFIX,perplexity.ai,AI", "DOMAIN-SUFFIX,deepseek.com,AI", "DOMAIN-SUFFIX,copilot.microsoft.com,AI", "DOMAIN-SUFFIX,githubcopilot.com,AI", "GEOSITE,netflix,流媒体", "GEOSITE,disney,流媒体", "GEOSITE,youtube,流媒体", "GEOSITE,spotify,流媒体", "GEOSITE,tiktok,流媒体", "DOMAIN-SUFFIX,tiktokv.com,流媒体", "DOMAIN-SUFFIX,tiktokcdn.com,流媒体", "GEOSITE,telegram,Telegram", "IP-CIDR,91.108.4.0/22,Telegram,no-resolve", "IP-CIDR,91.108.8.0/21,Telegram,no-resolve", "IP-CIDR,91.108.16.0/22,Telegram,no-resolve", "IP-CIDR,91.108.56.0/22,Telegram,no-resolve", "IP-CIDR,149.154.160.0/20,Telegram,no-resolve", "IP-CIDR6,2001:67c:4e8::/48,Telegram,no-resolve", "IP-CIDR6,2001:b28:f23d::/48,Telegram,no-resolve", "IP-CIDR6,2001:b28:f23f::/48,Telegram,no-resolve", "GEOSITE,twitter,社交", "GEOSITE,instagram,社交", "GEOSITE,facebook,社交", "DOMAIN-SUFFIX,whatsapp.com,社交", "DOMAIN-SUFFIX,whatsapp.net,社交", "DOMAIN-SUFFIX,services.googleapis.cn,DIRECT", "DOMAIN-SUFFIX,google.cn,DIRECT", "DOMAIN-SUFFIX,apple.com.cn,DIRECT", "DOMAIN-SUFFIX,icloud.com.cn,DIRECT", "GEOSITE,github,开发", "GEOSITE,google,节点选择", "GEOSITE,microsoft,节点选择", "GEOSITE,apple,节点选择", "GEOSITE,cloudflare,节点选择", "GEOSITE,steam,节点选择", "DOMAIN-SUFFIX,speedtest.net,节点选择", "PROCESS-NAME,qBittorrent,DIRECT", "PROCESS-NAME,Transmission,DIRECT", "PROCESS-NAME,aria2c,DIRECT", "PROCESS-NAME,Thunder,DIRECT", "GEOSITE,cn,DIRECT", "RULE-SET,cn-domain,DIRECT", "DOMAIN-SUFFIX,cn,DIRECT", "GEOIP,CN,DIRECT,no-resolve", "RULE-SET,proxy-domains,节点选择", "GEOSITE,category-porn,REJECT", "MATCH,节点选择"], "geox-url": {"geoip": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb", "geosite": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.metadb"}}""")
+RULESET = json.loads(r"""{"rule-providers": {"reject": {"type": "http", "behavior": "domain", "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/reject.txt", "path": "./ruleset/reject.yaml", "interval": 86400, "proxy": "节点选择"}, "cn-domain": {"type": "http", "behavior": "classical", "url": "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ChinaDomain.list", "path": "./ruleset/cn-domain.yaml", "interval": 86400, "proxy": "节点选择"}, "proxy-domains": {"type": "http", "behavior": "domain", "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt", "path": "./ruleset/proxy-domains.yaml", "interval": 86400, "proxy": "节点选择"}, "claude": {"type": "http", "behavior": "classical", "url": "https://gh-proxy.com/raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/Claude/Claude.list", "path": "./ruleset/claude.yaml", "interval": 86400, "proxy": "节点选择"}, "gemini": {"type": "http", "behavior": "classical", "url": "https://gh-proxy.com/raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/Gemini/Gemini.list", "path": "./ruleset/gemini.yaml", "interval": 86400, "proxy": "节点选择"}}, "rules": ["DOMAIN-SUFFIX,local,DIRECT", "DOMAIN-SUFFIX,localhost,DIRECT", "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve", "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve", "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve", "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve", "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve", "IP-CIDR,224.0.0.0/4,DIRECT,no-resolve", "IP-CIDR6,::1/128,DIRECT,no-resolve", "IP-CIDR6,fc00::/7,DIRECT,no-resolve", "IP-CIDR6,fe80::/10,DIRECT,no-resolve", "DOMAIN-SUFFIX,su7.dpdns.org,DIRECT", "DOMAIN-SUFFIX,zin7.de,DIRECT", "RULE-SET,reject,REJECT", "GEOSITE,category-ads-all,REJECT", "GEOSITE,openai,AI", "DOMAIN-SUFFIX,openai.com,AI", "RULE-SET,claude,AI", "DOMAIN-SUFFIX,anthropic.com,AI", "DOMAIN-SUFFIX,claude.ai,AI", "RULE-SET,gemini,AI", "DOMAIN-SUFFIX,gemini.google.com,AI", "DOMAIN-SUFFIX,aistudio.google.com,AI", "DOMAIN-SUFFIX,generativelanguage.googleapis.com,AI", "DOMAIN-SUFFIX,grok.com,AI", "DOMAIN-SUFFIX,x.ai,AI", "DOMAIN-SUFFIX,perplexity.ai,AI", "DOMAIN-SUFFIX,deepseek.com,AI", "DOMAIN-SUFFIX,copilot.microsoft.com,AI", "DOMAIN-SUFFIX,githubcopilot.com,AI", "GEOSITE,netflix,流媒体", "GEOSITE,disney,流媒体", "GEOSITE,youtube,流媒体", "GEOSITE,spotify,流媒体", "GEOSITE,tiktok,流媒体", "DOMAIN-SUFFIX,tiktokv.com,流媒体", "DOMAIN-SUFFIX,tiktokcdn.com,流媒体", "GEOSITE,telegram,Telegram", "IP-CIDR,91.108.4.0/22,Telegram,no-resolve", "IP-CIDR,91.108.8.0/21,Telegram,no-resolve", "IP-CIDR,91.108.16.0/22,Telegram,no-resolve", "IP-CIDR,91.108.56.0/22,Telegram,no-resolve", "IP-CIDR,149.154.160.0/20,Telegram,no-resolve", "IP-CIDR6,2001:67c:4e8::/48,Telegram,no-resolve", "IP-CIDR6,2001:b28:f23d::/48,Telegram,no-resolve", "IP-CIDR6,2001:b28:f23f::/48,Telegram,no-resolve", "GEOSITE,twitter,社交", "GEOSITE,instagram,社交", "GEOSITE,facebook,社交", "DOMAIN-SUFFIX,whatsapp.com,社交", "DOMAIN-SUFFIX,whatsapp.net,社交", "DOMAIN-SUFFIX,services.googleapis.cn,DIRECT", "DOMAIN-SUFFIX,google.cn,DIRECT", "DOMAIN-SUFFIX,apple.com.cn,DIRECT", "DOMAIN-SUFFIX,icloud.com.cn,DIRECT", "GEOSITE,github,开发", "GEOSITE,google,节点选择", "GEOSITE,microsoft,节点选择", "GEOSITE,apple,节点选择", "GEOSITE,cloudflare,节点选择", "GEOSITE,steam,节点选择", "DOMAIN-SUFFIX,speedtest.net,节点选择", "PROCESS-NAME,qBittorrent,DIRECT", "PROCESS-NAME,Transmission,DIRECT", "PROCESS-NAME,aria2c,DIRECT", "PROCESS-NAME,Thunder,DIRECT", "GEOSITE,cn,DIRECT", "RULE-SET,cn-domain,DIRECT", "DOMAIN-SUFFIX,cn,DIRECT", "GEOIP,CN,DIRECT,no-resolve", "RULE-SET,proxy-domains,节点选择", "GEOSITE,category-porn,REJECT", "MATCH,节点选择"], "geox-url": {"geoip": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb", "geosite": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.metadb"}}""")
 
 INFO_RE = re.compile(
     r"剩余|到期|流量|网址|官网|自动更新|套餐|重置|防失联|永久地址|公众号|公告|通知")
@@ -1545,6 +1545,12 @@ PAGE = """<!DOCTYPE html>
   .detailbox th { color: #68707f; font-weight: 600; }
   .detailbox .orig { color: #8a93a5; font-size: 11px; }
   .st-ok { color: #2c7a3f; } .st-bad { color: #b3372f; } .st-wait { color: #a86a12; }
+  /* ui2-20261111: long names / URLs wrap; mobile breakpoint */
+  .meta, .title { overflow-wrap: anywhere; }
+  .linkbox { flex-wrap: wrap; }
+  .linkbox input { min-width: 0; overflow-wrap: anywhere; }
+  button:disabled { opacity: .55; cursor: default; }
+  @media (max-width:640px){ .detailbox{overflow-x:auto;-webkit-overflow-scrolling:touch} .detailbox table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch} pre{overflow-x:auto} img{max-width:100%;height:auto} input,select,textarea{max-width:100%;box-sizing:border-box} }
 </style>
 </head>
 <body>
@@ -1587,6 +1593,11 @@ PAGE = """<!DOCTYPE html>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
+function busyBtn(b) { /* ui2-20261111 */
+  if (!b || b.disabled) return () => {};
+  const t = b.textContent; b.disabled = true; b.textContent = "\u8fdb\u884c\u4e2d\u2026";
+  return () => { b.disabled = false; b.textContent = t; };
+}
 $("vps-copy").onclick = async () => {
   const input = $("vps-copy").parentElement.querySelector("input");
   try { await navigator.clipboard.writeText(input.value); $("vps-copy").textContent = "已复制"; }
@@ -1683,32 +1694,38 @@ function render(sources) {
     const dbox = card.querySelector(".detailbox");
     dbox.innerHTML = detailTable(s.nodes_detail);
     card.querySelector(".detail").onclick = () => { dbox.hidden = !dbox.hidden; };
-    card.querySelector(".refresh").onclick = () => act(s.id, "refresh", msg, "已刷新。");
-    card.querySelector(".test").onclick = async () => {
+    card.querySelector(".refresh").onclick = (e) => act(s.id, "refresh", msg, "已刷新。", e.currentTarget);
+    card.querySelector(".test").onclick = async (e) => {
+      const done = busyBtn(e.currentTarget);
       msg.textContent = "测试已开始，进度会自动刷新…";
       await api(`api/sources/${s.id}/test`, "POST", {});
+      done();
       poll();
     };
-    card.querySelector(".retest").onclick = async () => {
+    card.querySelector(".retest").onclick = async (e) => {
       if (!confirm("强制重测会重新测试该源全部节点（消耗机场流量），确定？")) return;
+      const done = busyBtn(e.currentTarget);
       msg.textContent = "重测已开始，进度会自动刷新…";
       await api(`api/sources/${s.id}/test`, "POST", {force: true});
+      done();
       poll();
     };
-    card.querySelector(".force").onclick = () => {
-      if (confirm("强制重新处理会清空该源的节点登记表并重建，确定？")) act(s.id, "force", msg, "已重新处理。");
+    card.querySelector(".force").onclick = (e) => {
+      if (confirm("强制重新处理会清空该源的节点登记表并重建，确定？")) act(s.id, "force", msg, "已重新处理。", e.currentTarget);
     };
-    card.querySelector(".del").onclick = () => {
-      if (confirm("删除这个订阅源和它生成的新链接？")) act(s.id, "delete", msg, "");
+    card.querySelector(".del").onclick = (e) => {
+      if (confirm("删除这个订阅源和它生成的新链接？")) act(s.id, "delete", msg, "", e.currentTarget);
     };
     box.appendChild(card);
   }
 }
-async function act(id, action, msg, okText) {
+async function act(id, action, msg, okText, btn) {
+  const done = btn ? busyBtn(btn) : null;
   msg.textContent = "处理中…";
   const d = await api(`api/sources/${id}/${action}`, "POST", {});
-  if (!d.ok) { msg.textContent = "失败：" + (d.message || action); return; }
+  if (!d.ok) { msg.textContent = "失败：" + (d.message || action); if (done) done(); return; }
   if (okText) msg.textContent = okText;
+  if (done) done();
   load();
 }
 let pollTimer = null;
@@ -1751,30 +1768,34 @@ function renderImport(d) {
     };
   });
 }
-$("f-import").onclick = async () => {
+$("f-import").onclick = async (e) => {
   const msg = $("f-import-msg");
   const file = $("f-file").files[0];
   if (!file) { msg.textContent = "先选择一个文本文件。"; return; }
   if (file.size > 2 * 1024 * 1024) { msg.textContent = "文件超过 2 MB 上限。"; return; }
   msg.textContent = "正在导入…";
+  const done = busyBtn(e.currentTarget);
   const bytes = new Uint8Array(await file.arrayBuffer());
   let bin = "";
   for (let i = 0; i < bytes.length; i += 32768) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 32768));
   const d = await api("api/sources/import", "POST", {content_b64: btoa(bin)});
-  if (!d.ok) { msg.textContent = "失败：" + (d.message || ""); return; }
+  if (!d.ok) { msg.textContent = "失败：" + (d.message || ""); done(); return; }
   msg.textContent = "导入完成，转化链接见下方汇总。";
+  done();
   renderImport(d);
   load();
   poll();
 };
-$("f-add").onclick = async () => {
+$("f-add").onclick = async (e) => {
   const url = $("f-url").value.trim();
   if (!url) { $("f-msg").textContent = "先粘贴订阅链接。"; return; }
   $("f-msg").textContent = "正在拉取并生成…";
+  const done = busyBtn(e.currentTarget);
   const d = await api("api/sources", "POST", {label: $("f-label").value.trim(), url});
-  if (!d.ok) { $("f-msg").textContent = "失败：" + (d.message || ""); return; }
+  if (!d.ok) { $("f-msg").textContent = "失败：" + (d.message || ""); done(); return; }
   $("f-url").value = ""; $("f-label").value = "";
   $("f-msg").textContent = d.source.last_error ? ("已保存，但首次拉取失败：" + d.source.last_error) : (d.test_state ? "已生成，新源已自动开始测试，进度见下方卡片。" : "已生成，去下面复制新链接。");
+  done();
   if (d.test_state) poll(); else load();
 };
 load();

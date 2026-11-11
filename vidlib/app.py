@@ -6557,10 +6557,33 @@ def page_reader(entry, base_href=""):
     return _page(entry["title"], body, base_href=base_href)
 
 
+_FILES_PER_PAGE = 20  # UI2-20261111: files paging, same size as novels
+
+_FILES_CSS = (
+    "<style>"
+    ".pager{display:flex;gap:8px;align-items:center;"
+    "flex-wrap:wrap;margin-top:14px}"
+    ".pager a{background:#232a3a;border-radius:8px;"
+    "padding:7px 12px;text-decoration:none;font-size:13.5px}"
+    ".pgcur{background:#2f6fd0;color:#fff;border-radius:8px;"
+    "padding:7px 12px;font-size:13.5px}"
+    "</style>")
+
+
 def page_files(params, base_href=""):
     cat = (params.get("cat") or "").strip()
     q = (params.get("q") or "").strip()
     cats = _file_categories()
+    try:
+        page = int(params.get("p") or params.get("page") or 1)
+    except Exception:
+        page = 1
+    try:
+        off = int(params.get("offset") or 0)
+    except Exception:
+        off = 0
+    if off > 0:
+        page = off // _FILES_PER_PAGE + 1
     with _db() as conn:
         counts = {}
         for r in conn.execute(
@@ -6577,9 +6600,18 @@ def page_files(params, base_href=""):
             where.append("(e.title LIKE ? OR e.tags LIKE ?)")
             like = "%" + q + "%"
             args += [like, like]
+        total = conn.execute(
+            "SELECT COUNT(*) c FROM entries e "
+            "JOIN files f ON f.hash = e.hash WHERE "
+            + " AND ".join(where), args).fetchone()["c"]
+        pages = max(1, (total + _FILES_PER_PAGE - 1)
+                    // _FILES_PER_PAGE)
+        page = min(max(1, page), pages)
         rows = conn.execute(
             _ENTRY_COLS + " WHERE " + " AND ".join(where)
-            + " ORDER BY e.id DESC LIMIT 300", args).fetchall()
+            + " ORDER BY e.id DESC LIMIT ? OFFSET ?",
+            args + [_FILES_PER_PAGE,
+                    (page - 1) * _FILES_PER_PAGE]).fetchall()
     total_all = sum(counts.values())
     chips = ['<a class="tag" href="files">全部（%d）</a>' % total_all]
     for c in cats:
@@ -6614,6 +6646,39 @@ def page_files(params, base_href=""):
           'if(j.ok){location.reload();}'
           'else{alert(j.message||"改类失败");location.reload();}});});'
           '</script>')
+    def _flink(n, label):
+        u = "files?p=%d" % n
+        if cat:
+            u += "&cat=" + urllib.parse.quote(cat)
+        if q:
+            u += "&q=" + urllib.parse.quote(q)
+        return '<a href="%s">%s</a>' % (u, label)
+
+    info = ('<div class="muted" style="margin-bottom:10px">'
+            '共 %d 项，本页显示 %d 项</div>' % (total, len(rows)))
+    pager = ""
+    if pages > 1:
+        nav = []
+        if page > 1:
+            nav.append(_flink(page - 1, "← 上一页"))
+        nums = sorted(set(
+            [1, pages] + [n for n in range(page - 2, page + 3)
+                          if 1 <= n <= pages]))
+        last = 0
+        for n in nums:
+            if n - last > 1:
+                nav.append('<span class="muted">…</span>')
+            if n == page:
+                nav.append('<span class="pgcur">%d</span>' % n)
+            else:
+                nav.append(_flink(n, "%d" % n))
+            last = n
+        if page < pages:
+            nav.append(_flink(page + 1, "下一页 →"))
+        pager = ('<div class="pager">%s</div>'
+                 '<div class="muted" style="margin-top:6px">'
+                 '第 %d / %d 页 · 共 %d 项</div>'
+                 % (" ".join(nav), page, pages, total))
     body = (
         '<div class="topbar"><h1>文件</h1>'
         '<form class="search" method="get">'
@@ -6622,10 +6687,12 @@ def page_files(params, base_href=""):
         '<a class="btn ghost" href="./">← 资源库</a>'
         '<a class="btn ghost" href="upload">上传</a></div>'
         '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'
-        '%s</div>%s%s'
-        % (_esc(q), "".join(chips),
-           "".join(lines) or '<div class="muted">暂无文件。</div>', js))
-    return _page("文件", body, base_href)
+        '%s</div>%s%s%s'
+        % (_esc(q), "".join(chips), info,
+           "".join(lines) or '<div class="muted">暂无文件。</div>',
+           pager + js))
+    return _page("文件", body, extra_head=_FILES_CSS,
+                 base_href=base_href)
 
 
 def page_wall(params, base_href=""):

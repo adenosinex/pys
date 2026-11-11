@@ -5,16 +5,37 @@ rule is configured for it: the request returns immediately with a task
 id and this module runs the pipeline on one background worker thread.
 
 Pipeline (subtitles first, ASR as fallback):
-  1. subtitles: yt-dlp (the yt-audio project's binary/deno/cookies)
-     reads the video info, picks a subtitle track (language priority
-     zh -> en -> any; manual before auto within one language) and
-     downloads it; the raw captions are cleaned (timestamps stripped,
-     YouTube's rolling duplicate lines merged) into paragraph text.
+  1. subtitles: this project's OWN yt-dlp/deno, self-bootstrapped
+     into this project's own .runtime/bin from the official GitHub
+     releases, plus this project's OWN YouTube cookie (the
+     credentials.json key "youtube_cookie", write-only like the Mac
+     code below). yt-dlp reads the video info; the subtitle text
+     itself is fetched straight from the video's timedtext
+     endpoint (the yt-dlp subtitle-file download is rate-limited
+     separately by YouTube -- HTTP 429 from datacenter IPs -- so
+     it is kept only as a second try), language priority
+     zh -> en -> any, manual before auto within one language;
+     the raw captions are cleaned (timestamps stripped, YouTube's
+     rolling duplicate lines merged) into paragraph text.
   2. audio fallback (only when subtitles are unavailable): the audio
-     is fetched through the yt-audio loopback API (same yt-dlp recipe
-     and cookies as that project), uploaded to mac-compute
+     is fetched through the yt-audio loopback API (contract:
+     POST /api/fetch {"url"} -> {"job_id"}; GET /api/jobs/<id> ->
+     job status/file_id; GET /files/<file_id> -> audio bytes;
+     DELETE /api/files/<file_id> cleanup), uploaded to mac-compute
      (https://apple.su7.dpdns.org:5850, job type "asr") and the
      resulting text is collected from the job's result zip.
+
+Dependency note (2026-11-10 remediation): this module must not read
+any other project's files -- no sibling project directories, no
+other project's .runtime binaries, no other project's cookie
+files. The subtitle stage originally (v1.5.0) borrowed yt-audio's
+.runtime yt-dlp/deno and its data-dir youtube-cookies.txt because
+yt-audio's API exposes only audio-download jobs (there is no
+video-info or subtitle endpoint to call); the dependency audit
+flagged that shortcut and it was removed the same day: the
+binaries are self-bootstrapped now and the cookie is this
+project's own credential. The only remaining contact with
+yt-audio is the loopback HTTP API in step 2.
 
 Every stage writes its progress into the task record (JSON on disk in
 the platform data directory), so the page can poll and render a live
@@ -383,35 +404,186 @@ def _finish(task, text, origin, fetched_bytes):
 
 
 # ------------------------------------------------------------ yt-dlp side
+#
+# Self-contained tooling (2026-11-10 remediation): yt-dlp + deno are
+# bootstrapped into THIS project's own .runtime/bin from the official
+# GitHub releases -- the same self-bootstrap pattern yt-audio uses
+# for itself, re-implemented here so that no project reads another
+# project's files. The YouTube cookie is this project's own
+# credential (credentials.json key "youtube_cookie", write-only,
+# mirroring the mac-compute code store above); it is materialized
+# into the task's tmp folder at use time and deleted with the task.
 
-def _yt_audio_home():
-    """Locate the yt-audio project (for its yt-dlp, deno and cookies)."""
-    env = os.environ.get("YT_AUDIO_HOME")
+_YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+_DENO_URL = ("https://github.com/denoland/deno/releases/latest/download/"
+             "deno-x86_64-unknown-linux-gnu.zip")
+_YTDLP_MAX_AGE = 14 * 24 * 3600
+_DENO_MAX_AGE = 30 * 24 * 3600
+YT_COOKIE_KEY = "youtube_cookie"
+_COOKIE_KEY_FIELDS = ("SAPISID", "HSID", "SID", "SSID", "APISID",
+                      "__Secure-1PSID", "__Secure-3PSID")
+_COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+
+_bootstrap_lock = threading.Lock()
+
+
+def _own_bin_dir():
+    return Path(__file__).parent / ".runtime" / "bin"
+
+
+def _ensure_ytdlp():
+    """This project's own yt-dlp path, downloaded on first use (and
+    refreshed when stale); "" when it cannot be obtained."""
+    env = os.environ.get("YTDLP_BIN", "")
     if env:
-        return Path(env)
-    sibling = Path(__file__).parent.parent / "yt-audio"
-    if sibling.is_dir():
-        return sibling
-    return None
+        return env
+    path = _own_bin_dir() / "yt-dlp"
+    with _bootstrap_lock:
+        try:
+            if path.exists() \
+                    and time.time() - path.stat().st_mtime < _YTDLP_MAX_AGE:
+                return str(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            req = urllib.request.Request(
+                _YTDLP_URL, headers={"User-Agent": "zhihu-core/yt-text"})
+            with urllib.request.urlopen(req, timeout=180) as resp, \
+                    open(tmp, "wb") as out:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            tmp.chmod(0o755)
+            tmp.replace(path)
+            return str(path)
+        except (OSError, urllib.error.URLError):
+            return str(path) if path.exists() else ""
 
 
-def _ytdlp_assets():
-    binary = os.environ.get("YTDLP_BIN", "")
-    deno = ""
-    cookie = ""
-    home = _yt_audio_home()
-    if home is not None:
-        cand = home / ".runtime" / "bin" / "yt-dlp"
-        if cand.exists():
-            binary = str(cand)
-        cand = home / ".runtime" / "bin" / "deno"
-        if cand.exists():
-            deno = str(cand)
-    data = _data_dir()
-    cand = data.parent / "yt-audio" / "youtube-cookies.txt"
-    if cand.exists() and cand.stat().st_size > 32:
-        cookie = str(cand)
-    return binary, deno, cookie
+def _ensure_deno():
+    """Best-effort: this project's own deno path, or "" (deno is
+    yt-dlp's JS runtime; many subtitle fetches also work without)."""
+    path = _own_bin_dir() / "deno"
+    with _bootstrap_lock:
+        try:
+            if path.exists() \
+                    and time.time() - path.stat().st_mtime < _DENO_MAX_AGE:
+                return str(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            req = urllib.request.Request(
+                _DENO_URL, headers={"User-Agent": "zhihu-core/yt-text"})
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                payload = resp.read()
+            with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                data = zf.read("deno")
+            tmp = path.with_name(path.name + ".tmp")
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            tmp.chmod(0o755)
+            tmp.replace(path)
+            return str(path)
+        except Exception:  # noqa: BLE001 -- best effort by design
+            return str(path) if path.exists() else ""
+
+
+def _header_cookie_to_netscape(text):
+    """Convert a raw Cookie header string ("a=b; c=d", as copied from
+    a browser's devtools) into Netscape cookies.txt lines for
+    .youtube.com. Returns None when the input does not parse as a
+    logged-in YouTube cookie header."""
+    body = (text or "").strip()
+    if body.lower().startswith("cookie:"):
+        body = body.split(":", 1)[1]
+    pairs = {}
+    for chunk in re.split(r"[;\n]", body):
+        chunk = chunk.strip()
+        if "=" not in chunk:
+            continue
+        name, value = chunk.split("=", 1)
+        name, value = name.strip(), value.strip()
+        if value and _COOKIE_NAME_RE.match(name):
+            pairs[name] = value
+    if len(pairs) < 3:
+        return None
+    if not any(k in pairs for k in _COOKIE_KEY_FIELDS):
+        return None
+    lines = ["# Netscape HTTP Cookie File",
+             "# converted from a raw Cookie header string"]
+    for name in sorted(pairs):
+        lines.append(".youtube.com\tTRUE\t/\tTRUE\t1893456000\t%s\t%s"
+                     % (name, pairs[name]))
+    return "\n".join(lines) + "\n"
+
+
+def _youtube_cookie_text():
+    return str(_read_credentials().get(YT_COOKIE_KEY) or "").strip()
+
+
+def youtube_cookie_configured():
+    return bool(_youtube_cookie_text())
+
+
+def save_youtube_cookie(value):
+    """Write-only store for this project's own YouTube cookie: accepts
+    a Netscape cookies.txt or a raw Cookie header string; the value is
+    never read back through the API (only "configured" is reported)."""
+    value = (value or "").strip()
+    if len(value) < 20 or len(value) > 512 * 1024:
+        raise ValueError("invalid youtube cookie")
+    looks = ("\t" in value and "youtube.com" in value
+             and any(k in value for k in _COOKIE_KEY_FIELDS)) \
+        or _header_cookie_to_netscape(value) is not None
+    if not looks:
+        raise ValueError("invalid youtube cookie")
+    path = _credentials_path()
+    data = _read_credentials()
+    data[YT_COOKIE_KEY] = value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(path)
+
+
+def remove_youtube_cookie():
+    path = _credentials_path()
+    data = _read_credentials()
+    if YT_COOKIE_KEY in data:
+        del data[YT_COOKIE_KEY]
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.chmod(0o600)
+        tmp.replace(path)
+    return youtube_cookie_configured()
+
+
+def _youtube_cookie_path(folder):
+    """Materialize this project's own YouTube cookie as a Netscape
+    cookies.txt inside the task tmp folder; "" when none is stored or
+    the stored value does not validate."""
+    raw = _youtube_cookie_text()
+    if not raw:
+        return ""
+    if "\t" in raw and "youtube.com" in raw:
+        text = raw if raw.endswith("\n") else raw + "\n"
+    else:
+        text = _header_cookie_to_netscape(raw)
+        if text is None:
+            return ""
+    path = Path(folder) / "youtube-cookies.txt"
+    try:
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o600)
+    except OSError:
+        return ""
+    return str(path)
+
+
+def _ytdlp_assets(folder):
+    """(yt-dlp, deno, cookie-file) -- every asset owned by THIS
+    project; the cookie is materialized inside the task tmp folder."""
+    return _ensure_ytdlp(), _ensure_deno(), _youtube_cookie_path(folder)
 
 
 def _run_cmd(cmd, timeout):
@@ -421,11 +593,111 @@ def _run_cmd(cmd, timeout):
         proc.stderr.decode("utf-8", "replace")
 
 
-def _ytdlp_attempts(url, extra, want_json=False):
-    """Run yt-dlp with yt-audio's proven attempt pattern; return stdout."""
-    binary, deno, cookie = _ytdlp_assets()
+_SUB_LANGS = ("zh-Hans", "zh-Hant", "zh", "en", "en-US", "en-GB")
+
+
+def _subtitle_langs(info):
+    """Language candidates for a direct timedtext fetch, best first.
+    Priority follows _choose_track (zh -> en -> any); languages that
+    have manual subtitles rank before auto-caption-only ones."""
+    manual = list((info.get("subtitles") or {}).keys())
+    auto = [k for k in (info.get("automatic_captions") or {}).keys()
+            if k not in manual]
+    prefs = list(_SUB_LANGS) + manual + auto
+    seen, out = set(), []
+    for lang in prefs:
+        if lang not in seen and (lang in manual or lang in auto):
+            seen.add(lang)
+            out.append(lang)
+    return out
+
+
+def _timedtext_fetch(url, info, folder):
+    """Best-effort direct subtitle fetch; returns (text, lang,
+    is_auto) or None.
+
+    Route: yt-dlp --print with a filter program re-extracts FRESH
+    timedtext URLs (the ones in _video_info's dump go stale), then a
+    plain HTTPS GET downloads the json3 track. This bypasses the
+    yt-dlp subtitle-file download, which YouTube rate-limits
+    separately (HTTP 429 from datacenter IPs, with or without a
+    cookie). Any failure returns None; the caller then tries the
+    classic file download."""
+    binary, deno, cookie = _ytdlp_assets(folder)
     if not binary:
-        raise TaskFail("subtitle", "服务器缺少 yt-dlp（yt-audio 项目未就绪）。")
+        return None
+    langs = _subtitle_langs(info)
+    if not langs:
+        return None
+    base = [binary, "--no-playlist", "--no-warnings",
+            "--socket-timeout", "30", "--retries", "2"]
+    rt = ["--js-runtimes", "deno:" + deno] if deno else []
+    attempts = []
+    if cookie:
+        attempts.append(["--cookies", cookie])
+    attempts.append([])
+    attempts.append(["--extractor-args",
+                     "youtube:player_client=android_vr"])
+    chosen = None
+    for extra in attempts:
+        cmd = base + rt + extra + ["-j", url]
+        try:
+            rc, out, _err = _run_cmd(cmd, 180)
+        except subprocess.TimeoutExpired:
+            continue
+        if rc != 0 or not out.strip():
+            continue
+        fresh = None
+        for line in reversed(out.strip().splitlines()):
+            try:
+                data = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(data, dict):
+                fresh = data
+                break
+        if fresh is None:
+            continue
+        for key, is_auto in (("subtitles", False),
+                             ("automatic_captions", True)):
+            tracks = fresh.get(key) or {}
+            hit = None
+            for lang in langs:
+                for t in tracks.get(lang) or []:
+                    if t.get("ext") == "json3" and t.get("url"):
+                        hit = (lang, is_auto, t["url"])
+                        break
+                if hit:
+                    break
+            if hit:
+                chosen = hit
+                break
+        if chosen:
+            break
+    if not chosen:
+        return None
+    lang, is_auto, tt_url = chosen
+    try:
+        req = urllib.request.Request(
+            tt_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+    except (urllib.error.URLError, OSError):
+        return None
+    if not raw:
+        return None
+    text = clean_subtitle(raw, "json3")
+    if len(text) < 20:
+        return None
+    return text, lang, is_auto
+
+
+def _ytdlp_attempts(url, extra, folder):
+    """Run yt-dlp with the proven three-attempt pattern (own cookie,
+    no cookie, android_vr player client); return stdout."""
+    binary, deno, cookie = _ytdlp_assets(folder)
+    if not binary:
+        raise TaskFail("subtitle", "服务器缺少 yt-dlp（本站工具自举失败）。")
     base = [binary, "--no-playlist", "--no-warnings",
             "--socket-timeout", "30", "--retries", "2"]
     rt = ["--js-runtimes", "deno:" + deno] if deno else []
@@ -454,8 +726,8 @@ def _ytdlp_attempts(url, extra, want_json=False):
     raise TaskFail("subtitle", "无法读取视频信息：" + (tail or "yt-dlp 失败"))
 
 
-def _video_info(url):
-    out = _ytdlp_attempts(url, ["-j"])
+def _video_info(url, folder):
+    out = _ytdlp_attempts(url, ["-j"], folder)
     for line in reversed(out.strip().splitlines()):
         try:
             data = json.loads(line)
@@ -505,7 +777,9 @@ def _choose_track(info):
 
 
 def _download_subtitle(url, lang, ext, is_auto, folder):
-    binary, deno, cookie = _ytdlp_assets()
+    binary, deno, cookie = _ytdlp_assets(folder)
+    if not binary:
+        return None
     base = [binary, "--no-playlist", "--no-warnings", "--socket-timeout", "30",
             "--retries", "2", "--skip-download",
             "--write-auto-subs" if is_auto else "--write-subs",
@@ -683,22 +957,29 @@ def clean_subtitle(raw_bytes, ext):
 def _subtitle_path(task):
     """Returns (text, origin, fetched_bytes) or (None, '', 0) to fall back."""
     _set_stage(task, "subtitle", "正在读取视频信息…")
+    folder = _root() / "tmp" / task["id"]
+    folder.mkdir(parents=True, exist_ok=True)
     try:
-        info = _video_info(task["url"])
+        info = _video_info(task["url"], folder)
     except TaskFail:
         return None, "", 0
     task["_video_id"] = str(info.get("id") or "")
     if info.get("title"):
         task["title"] = str(info["title"])[:300]
     _save(task)
+    _set_stage(task, "subtitle", "正在获取字幕文本…")
+    direct = _timedtext_fetch(task["url"], info, folder)
+    if direct is not None:
+        text, lang, is_auto = direct
+        kind = "自动字幕" if is_auto else "人工字幕"
+        _set_stage(task, "assemble", "正在清洗字幕文本…")
+        return text, "字幕直取（%s · %s）" % (kind, lang), 0
     track = _choose_track(info)
     if track is None:
         return None, "", 0
     lang, ext, is_auto = track
     kind = "自动字幕" if is_auto else "人工字幕"
     _set_stage(task, "subtitle", "正在下载字幕：%s（%s）…" % (lang, kind))
-    folder = _root() / "tmp" / task["id"]
-    folder.mkdir(parents=True, exist_ok=True)
     raw = _download_subtitle(task["url"], lang, ext, is_auto, folder)
     if not raw:
         return None, "", 0
@@ -710,6 +991,17 @@ def _subtitle_path(task):
 
 
 # --------------------------------------------------------- yt-audio client
+#
+# The ONLY contact with the yt-audio project: its loopback HTTP API.
+# Contract (yt-audio serves on the local port, which the platform
+# trusts; identity verification lives at the platform layer):
+#   POST   /api/fetch           {"url": ...} -> {"job_id": ...}
+#   GET    /api/jobs/<id>                    -> {"job": {"status",
+#                                  "position", "progress", "file_id",
+#                                  "message"}}
+#   GET    /files/<file_id>                  -> audio bytes (streamed)
+#   DELETE /api/files/<file_id>              -> removes our download
+# zhihu-core never reads yt-audio's files, binaries or cookies.
 
 def _http_json(method, url, payload=None, timeout=30):
     data = None

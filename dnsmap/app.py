@@ -243,10 +243,13 @@ _load_state()
 # ---------------------------------------------------------------- status (public DNS view)
 
 def _resolve(name, family):
+    # family None means "any address family" (used for CNAME targets):
+    # getaddrinfo itself wants AF_UNSPEC (0), not None.
+    fam = socket.AF_UNSPEC if family is None else family
     try:
-        rows = socket.getaddrinfo(name, None, family, socket.SOCK_STREAM)
+        rows = socket.getaddrinfo(name, None, fam, socket.SOCK_STREAM)
         return sorted({str(ipaddress.ip_address(row[4][0])) for row in rows})
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         return []
 
 
@@ -550,11 +553,25 @@ _load_hosted()
 def _hosted_view():
     with _hosted_lock:
         rows = copy.deepcopy(HOSTED["records"])
+        notes = copy.deepcopy(HOSTED.get("notes") or [])
     for row in rows:
-        fam = socket.AF_INET if row["type"] == "A" else socket.AF_INET6
-        row["resolved"] = _resolve(row["name"], fam)
-        row["ok"] = row["value"] in row["resolved"]
-    return {"zone": ALLOWED_ZONE, "provider": "cloudflare", "records": rows}
+        rtype = row["type"]
+        if rtype == "A":
+            row["resolved"] = _resolve(row["name"], socket.AF_INET)
+        elif rtype == "AAAA":
+            row["resolved"] = _resolve(row["name"], socket.AF_INET6)
+        elif rtype == "CNAME":
+            # A CNAME's value is a target hostname, not an address: the
+            # address-family check cannot apply (it would flag every
+            # healthy alias as mismatched). Ledger-only, like MX/TXT.
+            row["resolved"] = []
+        else:
+            # MX / TXT have no address-family resolution: ledger-only rows,
+            # verified against the zone when they were registered.
+            row["resolved"] = []
+        row["ok"] = row["value"] in row["resolved"] if row["resolved"] else None
+    return {"zone": ALLOWED_ZONE, "provider": "cloudflare",
+            "records": rows, "notes": notes}
 
 # ---------------------------------------------------------------- dm-api handlers
 

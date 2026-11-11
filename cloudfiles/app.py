@@ -69,6 +69,10 @@ PAGE = r"""<!DOCTYPE html>
     .prog .track { height: 8px; background: #232c44; border-radius: 4px; margin-top: 6px; overflow: hidden; }
     .prog .fill { height: 100%; background: #2f6fd0; width: 0%; }
     .empty { padding: 26px; text-align: center; color: #8b93a7; }
+    .tscroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .fname { overflow-wrap: anywhere; word-break: break-all; }
+    /* ui2-20261111 */
+    @media (max-width:640px){ .tscroll{overflow-x:auto;-webkit-overflow-scrolling:touch} .tscroll table{min-width:560px} pre{overflow-x:auto} img{max-width:100%;height:auto} input,select,textarea{max-width:100%;box-sizing:border-box} }
 </style>
 </head>
 <body>
@@ -84,10 +88,10 @@ PAGE = r"""<!DOCTYPE html>
     <div id="drop">把文件拖到这里上传到当前文件夹</div>
     <div class="prog" id="prog"><span id="progText"></span><div class="track"><div class="fill" id="progFill"></div></div></div>
     <div class="crumbs" id="crumbs"></div>
-    <table>
+    <div class="tscroll"><table>
         <thead><tr><th>名称</th><th style="width:110px">大小</th><th style="width:170px">修改时间</th><th style="width:210px"></th></tr></thead>
         <tbody id="rows"></tbody>
-    </table>
+    </table></div>
 </div>
 <script>
 const BASE = location.pathname.replace(/\/?$/, "/");

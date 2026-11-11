@@ -36,6 +36,7 @@ function showAccount(username) {
   loadCookieState();
   loadBiliCookieState();
   loadMacCodeState();
+  loadYtCookieState();
 }
 
 function cookieMessage(message, kind = '') {
@@ -368,6 +369,63 @@ $('remove-mac').addEventListener('click', async () => {
     macMessage('已删除保存的访问码。');
   } catch (error) { macMessage(error.message, 'warning'); }
   finally { macCodeBusy = false; renderMacCodeState(macCodeState || {configured: false}); }
+});
+
+// This project's own YouTube cookie (write-only): used by the
+// built-in subtitle pipeline; stored server-side in this project
+// only and never read back.
+let ytCookieState = null;
+let ytCookieBusy = false;
+
+function ytCookieMessage(message, kind = '') {
+  $('yt-cookie-message').textContent = message;
+  $('yt-cookie-message').className = 'message' + (kind ? ' ' + kind : '');
+}
+
+function renderYtCookieState(data) {
+  ytCookieState = data;
+  $('yt-cookie-badge').textContent = data.configured ? '已保存' : '未配置';
+  $('yt-cookie-badge').dataset.state = data.configured ? 'valid' : 'unchecked';
+  $('save-yt-cookie').disabled = ytCookieBusy;
+  $('remove-yt-cookie').disabled = ytCookieBusy || !data.configured;
+}
+
+async function loadYtCookieState() {
+  try {
+    const data = await api('/api/youtube-cookie');
+    if (!activeUsername) return;
+    renderYtCookieState(data);
+    ytCookieMessage(data.configured ? '已保存 Cookie，取字幕时会带上它。'
+      : '尚未配置：多数视频可直接取字幕；遇到需要登录的视频时会取不到。');
+  } catch (error) { ytCookieMessage(error.message, 'warning'); }
+}
+
+$('yt-cookie-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (ytCookieBusy || !activeUsername) return;
+  const value = $('yt-cookie-input').value.trim();
+  if (!value) { ytCookieMessage('请先粘贴 Cookie。', 'warning'); return; }
+  ytCookieBusy = true;
+  renderYtCookieState(ytCookieState || {configured: false});
+  try {
+    const data = await api('/api/youtube-cookie', {cookie: value});
+    $('yt-cookie-input').value = '';
+    renderYtCookieState(data);
+    ytCookieMessage('Cookie 已保存到服务器。', 'success');
+  } catch (error) { ytCookieMessage(error.message, 'warning'); }
+  finally { ytCookieBusy = false; renderYtCookieState(ytCookieState || {configured: false}); }
+});
+
+$('remove-yt-cookie').addEventListener('click', async () => {
+  if (ytCookieBusy || !activeUsername) return;
+  ytCookieBusy = true;
+  renderYtCookieState(ytCookieState || {configured: false});
+  try {
+    const data = await api('/api/youtube-cookie/remove', {});
+    renderYtCookieState(data);
+    ytCookieMessage('已删除保存的 Cookie。');
+  } catch (error) { ytCookieMessage(error.message, 'warning'); }
+  finally { ytCookieBusy = false; renderYtCookieState(ytCookieState || {configured: false}); }
 });
 
 // Live progress for the built-in YouTube pipeline. settings.js polls

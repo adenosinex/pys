@@ -810,6 +810,9 @@ PAGE = """<!DOCTYPE html>
   a { color: #8ab4f8; }
   .hidden { display: none; }
   details summary { cursor: pointer; font-size: 14px; }
+  /* ui2-c2-20261111 minimal mobile guard */
+  a { overflow-wrap: anywhere; }
+  @media (max-width: 640px) { pre { overflow-x: auto; } img { max-width: 100%; height: auto; } input, select, textarea { max-width: 100%; box-sizing: border-box; } }
 </style>
 </head>
 <body>

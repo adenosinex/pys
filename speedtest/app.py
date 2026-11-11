@@ -773,7 +773,7 @@ select, input { background: #12161f; color: #e6e9f0; border: 1px solid #2b3448;
 .progress { height: 8px; background: #232a3a; border-radius: 5px; overflow: hidden; }
 .progress i { display: block; height: 100%; width: 0; background: #4f7cff; }
 .tag { color: #7ea4e8; }
-.tblwrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.tblwrap { overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
 .score { font-size: 30px; font-weight: 700; }
 .modal { position: fixed; inset: 0; background: rgba(4,6,10,.62);
   display: none; z-index: 60; padding: 5vh 10px 12px; }

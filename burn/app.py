@@ -59,6 +59,10 @@ PAGE = r"""<!DOCTYPE html>
     .code-display { font-size: 24px; font-weight: bold; color: #d63384; text-align: center; letter-spacing: 2px; margin: 10px 0; }
     .hint { font-size: 13px; color: #888; margin: 4px 0 10px; }
     .burned { color: #d63384; font-weight: bold; }
+    /* ui2-c2-20261111 minimal mobile guard */
+    button:disabled { opacity: .55; cursor: default; }
+    .code-display { overflow-wrap: anywhere; }
+    @media (max-width: 640px) { pre { overflow-x: auto; } img { max-width: 100%; height: auto; } input, select, textarea { max-width: 100%; } }
 </style>
 </head>
 <body>
@@ -98,7 +102,7 @@ PAGE = r"""<!DOCTYPE html>
             <h3>📥 接收文字</h3>
             <div style="display: flex; gap: 10px;">
                 <input type="text" id="receiveCode" placeholder="输入提取码..." style="flex: 2; font-size: 18px; text-align: center;">
-                <button onclick="fetchText()" class="btn-green" style="flex: 1;">提取</button>
+                <button id="fetchBtn" onclick="fetchText()" class="btn-green" style="flex: 1;">提取</button>
             </div>
 
             <textarea id="receiveText" placeholder="提取的内容将显示在这里..." readonly></textarea>
@@ -159,6 +163,9 @@ async function uploadText() {
 async function fetchText() {
     const code = document.getElementById('receiveCode').value.trim();
     if (!code) return alert("请输入提取码！");
+    const fbtn = document.getElementById('fetchBtn');
+    if (fbtn.disabled) return;
+    fbtn.disabled = true;
     const note = document.getElementById('burnNote');
     note.style.display = 'none';
     try {
@@ -176,6 +183,8 @@ async function fetchText() {
     } catch (err) {
         document.getElementById('receiveText').value = "";
         alert("提取失败：" + err.message);
+    } finally {
+        fbtn.disabled = false;
     }
 }
 

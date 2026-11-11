@@ -50,7 +50,7 @@ a:hover{text-decoration:underline}
 .nav a{color:var(--muted);padding:11px 13px;border-radius:9px;font-weight:600}
 .nav a:hover,.nav a.active{background:var(--bluebg);color:var(--blue);text-decoration:none}
 .side-note{margin:30px 10px;color:var(--muted);font-size:12px}
-.main{flex:1;min-width:0;max-width:1600px;margin:0 auto;padding:28px}
+.main{flex:1;min-width:0;max-width:1088px;margin:0 auto;padding:28px}
 .topbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:22px}
 h1{font-size:23px;margin:0}
 h2{font-size:17px;margin:0 0 12px}
@@ -78,7 +78,7 @@ h2{font-size:17px;margin:0 0 12px}
 .stat-note{font-size:11px;color:var(--muted)}
 .toolbar{margin-bottom:14px}
 .toolbar .input{flex:1;min-width:180px;max-width:350px}
-.table-scroll{overflow-x:auto}
+.table-scroll{overflow-x:auto;max-width:100%}
 table{border-collapse:collapse;width:100%;text-align:left}
 th{color:var(--muted);font-size:12px;font-weight:600;white-space:nowrap}
 th,td{padding:12px;border-bottom:1px solid var(--border);vertical-align:middle}

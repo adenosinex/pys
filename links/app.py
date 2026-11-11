@@ -102,7 +102,7 @@ _PROJCAT_CACHE = {"ts": 0.0, "data": None}
 # kind -> (display name, intro line, submit button label)
 PROJCAT_KINDS = {
     "html": ("HTML 项目", "平台登记的静态网页项目，点卡片在新窗口打开。", "发布 HTML 项目"),
-    "py": ("PY 项目", "平台登记的 Python 脚本项目，点卡片打开运行页（填参数执行）。", "发布 PY 项目"),
+    "py": ("PY 项目", "平台登记的 Python Web 应用项目，点卡片在新窗口打开。", "发布 PY 项目"),
 }
 
 
@@ -1215,7 +1215,7 @@ function renderCatPage(board) {
   }
   let h = `<div class="crumb"><a href="${basePath}">← 返回微书签</a></div>` +
     `<h2 class="cat" style="font-size:17px;opacity:1;margin-top:10px;">${meta.name}<span class="n">${items.length}</span></h2>` +
-    `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台的 Python 应用与脚本项目，点卡片打开。"}</div>`;
+    `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台登记的 Python Web 应用项目，点卡片在新窗口打开。"}</div>`;
   if (!editing && !searching && !focusCat) {
     const recent = [...items].filter(p => p.created_at)
       .sort((a, b) => (b.created_at - a.created_at) || ((b.id || 0) - (a.id || 0))).slice(0, 5);
@@ -1725,7 +1725,7 @@ function renderCatPage(board) {
   }
   let h = `<div class="crumb"><a href="${basePath}">← 返回微书签</a></div>` +
     `<h2 class="cat" style="font-size:17px;opacity:1;margin-top:10px;">${meta.name}<span class="n">${items.length}</span></h2>` +
-    `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台的 Python 应用与脚本项目，点卡片打开。"}</div>`;
+    `<div class="intro">${catKind === "html" ? "平台登记的静态网页项目，点卡片在新窗口打开。" : "平台登记的 Python Web 应用项目，点卡片在新窗口打开。"}</div>`;
   if (!editing && !searching && !focusCat) {
     const recent = [...items].filter(p => p.created_at)
       .sort((a, b) => b.created_at - a.created_at).slice(0, 8);

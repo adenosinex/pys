@@ -18,7 +18,7 @@ PAGE_HTML = r'''<!doctype html>
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); }
-  .container { max-width: 1540px; padding: 32px 24px 64px; margin: auto; }
+  .container { max-width: 1088px; padding: 32px 24px 64px; margin: auto; }
   header { display: flex; justify-content: space-between; align-items: flex-end; gap: 18px; flex-wrap: wrap; }
   h1 { margin: 0; font-size: 25px; letter-spacing: -.5px; }
   .sub { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
@@ -107,20 +107,45 @@ PAGE_HTML = r'''<!doctype html>
   <header>
     <div>
       <h1>DNS Control Panel</h1>
-      <p class="sub">域名与 IP 映射管理 · 公网 DNS 指向核对 · hosts 临时指向导出（映射只保存在本机记录，不会推送到任何 DNS 服务商）</p>
+      <p class="sub">zin7.de 公网 DNS 托管（Cloudflare）· 写通道 /dm-api 仅 A / AAAA · CNAME 经盒上直写 · 局域网旧台账（su7）在下方</p>
     </div>
     <div class="toolbar">
       <button id="addHostBtn" type="button" class="button primary">添加主机</button>
       <button id="exportHosts" type="button" class="button light">导出 hosts</button>
       <button id="refresh" type="button" class="button light">刷新状态</button>
-      <button id="hostedBtn" type="button" class="button light">托管设置</button>
+      <button id="hostedBtn" type="button" class="button primary">托管设置</button>
     </div>
   </header>
-  <section class="stats" aria-label="状态概览">
-    <div class="stat"><strong id="countHosts">—</strong><span>主机总数</span></div>
-    <div class="stat"><strong id="countOnline">—</strong><span>IPv6 已记录</span></div>
-    <div class="stat"><strong id="countDns">—</strong><span>IPv4 / IPv6 DNS 均正确</span></div>
+  <section class="stats" aria-label="托管概览">
+    <div class="stat"><strong id="countHosted">—</strong><span>托管记录（zin7.de）</span></div>
+    <div class="stat"><strong id="countHostedOk">—</strong><span>托管解析一致</span></div>
+    <div class="stat"><strong id="dmState">—</strong><span>/dm-api 写通道</span></div>
   </section>
+  <section class="stats" aria-label="旧台账概览">
+    <div class="stat"><strong id="countHosts">—</strong><span>旧台账主机总数</span></div>
+    <div class="stat"><strong id="countOnline">—</strong><span>旧台账 IPv6 已记录</span></div>
+    <div class="stat"><strong id="countDns">—</strong><span>旧台账 IPv4 / IPv6 DNS 均正确</span></div>
+  </section>
+  <div id="hostedPanel" class="table-card" style="padding:14px 16px; margin-bottom:14px;">
+    <h2 style="font-size:17px; margin:2px 0 8px;">zin7.de 托管账本（Cloudflare）</h2>
+    <p class="sub" style="margin:0 0 10px;">提供商令牌只保存在服务器、只写不回显；智能体经 /dm-api 令牌通道仅可新增 / 修正 zin7.de 的 A / AAAA 记录，删除与 NS 变更不开放。</p>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+      <input id="cfToken" type="password" placeholder="粘贴新的 CF API Token（留空不改）" size="44" autocomplete="off">
+      <button id="cfSave" type="button" class="button primary">保存令牌</button>
+      <button id="cfClear" type="button" class="button light">清除令牌</button>
+      <span id="credState" class="sub">凭据状态加载中…</span>
+    </div>
+    <div class="table-scroll" style="margin-bottom:10px;">
+      <table style="min-width:760px;">
+        <thead><tr><th>域名</th><th>类型</th><th>值</th><th>来源</th><th>状态</th></tr></thead>
+        <tbody id="hostedTb"><tr><td colspan="5" class="empty">托管记录加载中…</td></tr></tbody>
+      </table>
+    </div>
+    <div id="hostedNotes" class="sub" style="margin-bottom:10px;"></div>
+    <div id="auditList" class="sub">审计加载中…</div>
+  </div>
+  <h2 style="font-size:17px; margin:26px 0 10px;">局域网旧台账（su7）</h2>
+  <p class="sub" style="margin:0 0 12px;">su7.dpdns.org 局域网主机映射（2026-10 起的本机记录）· 指向检测照常 · 此表为本机记录，不推送 DNS</p>
   <div class="table-card">
     <div class="table-scroll">
       <table>
@@ -153,18 +178,6 @@ PAGE_HTML = r'''<!doctype html>
       <button id="closeExport" type="button" class="button light">关闭</button>
     </div>
     <p class="sub" style="margin:8px 0 0;">把以上内容粘贴到某台机器的 hosts 文件，即可在那台机器上临时指向，不改动 DNS。</p>
-  </div>
-  <div id="hostedPanel" class="table-card" style="display:none; padding:14px 16px; margin-bottom:14px;">
-    <h3 style="margin:2px 0 8px;">zin7.de 托管分册（Cloudflare 控制面）</h3>
-    <p class="sub" style="margin:0 0 10px;">提供商令牌只保存在服务器、只写不回显；智能体经 /dm-api 令牌通道仅可新增 / 修正 zin7.de 的 A / AAAA 记录，删除与 NS 变更不开放。</p>
-    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
-      <input id="cfToken" type="password" placeholder="粘贴新的 CF API Token（留空不改）" size="44" autocomplete="off">
-      <button id="cfSave" type="button" class="button primary">保存令牌</button>
-      <button id="cfClear" type="button" class="button light">清除令牌</button>
-      <span id="credState" class="sub">凭据状态加载中…</span>
-    </div>
-    <div id="hostedList" class="sub" style="margin-bottom:10px;">托管记录加载中…</div>
-    <div id="auditList" class="sub">审计加载中…</div>
   </div>
   <div class="footer">
     <div class="legend">
@@ -282,7 +295,6 @@ PAGE_HTML = r'''<!doctype html>
     input.value = priorValue;
     input.autocomplete = 'off';
     input.setAttribute('aria-label', `${name} 的 IPv6`);
-    autoBtn.type = 'button';
     const updateBtn = elem('button', 'small-btn update', '更新');
     updateBtn.type = 'button';
     updateBtn.addEventListener('click', () => runOne(name, host.lan_ipv4, updateBtn, false, input));
@@ -457,6 +469,12 @@ PAGE_HTML = r'''<!doctype html>
 
 
   const hostedPanel = document.getElementById('hostedPanel');
+  const hostedSrcLabel = (r) => {
+    if (r.source) return r.source;
+    if (r.created_via === 'dm-api') return 'dm-api';
+    if (r.created_via === 'box-direct') return '盒上直写';
+    return r.created_via || '—';
+  };
   async function loadHosted() {
     try {
       const cred = await api('/dns/api/credentials');
@@ -464,29 +482,63 @@ PAGE_HTML = r'''<!doctype html>
         'CF 令牌：' + (cred.cf_token_configured ? '已配置' : '未配置') +
         ' · 通道令牌：' + (cred.dm_token_configured ? '已配置' : '未配置') +
         ' · zone：' + cred.zone;
+      document.getElementById('dmState').textContent =
+        cred.dm_token_configured ? '可用' : '未配置';
       const hosted = await api('/dns/api/hosted');
-      const hl = document.getElementById('hostedList');
-      if (!hosted.records.length) { hl.textContent = '托管记录：暂无'; }
-      else {
-        hl.innerHTML = '托管记录（' + hosted.zone + '）：<br>' + hosted.records.map(r =>
-          r.name + ' ' + r.type + ' → ' + r.value + '（实测 ' +
-          (r.resolved && r.resolved.length ? r.resolved.join(', ') : '无解析') +
-          ' · ' + (r.ok ? '一致' : '未生效/不一致') + '）').join('<br>');
+      const tb2 = document.getElementById('hostedTb');
+      tb2.textContent = '';
+      let okCount = 0;
+      if (!hosted.records.length) {
+        const tr = elem('tr'); const td = elem('td', 'empty', '托管记录：暂无');
+        td.colSpan = 5; tr.appendChild(td); tb2.appendChild(tr);
       }
+      hosted.records.forEach(r => {
+        if (r.ok === true) okCount += 1;
+        const tr = elem('tr');
+        const tdName = elem('td'); tdName.appendChild(elem('span', 'host-name', r.name));
+        tr.appendChild(tdName);
+        tr.appendChild(elem('td', 'mono', r.type));
+        const tdVal = elem('td');
+        const valWrap = elem('div', 'wrap mono', r.value);
+        tdVal.appendChild(valWrap);
+        if (r.note) tdVal.appendChild(elem('div', 'detail', r.note));
+        tr.appendChild(tdVal);
+        tr.appendChild(elem('td', '', hostedSrcLabel(r)));
+        const tdOk = elem('td');
+        const wrap = elem('span', 'address');
+        const dot = elem('i', 'light ' + (r.ok === true ? 'ok' : (r.ok === false ? 'err' : '')));
+        dot.setAttribute('aria-hidden', 'true');
+        wrap.appendChild(dot);
+        wrap.appendChild(elem('span', '', r.ok === true ? '一致' :
+          (r.ok === false ? '未生效/不一致' : '账本登记（无地址解析核对）')));
+        tdOk.appendChild(wrap);
+        if (r.resolved && r.resolved.length)
+          tdOk.appendChild(elem('div', 'detail', '实测 ' + r.resolved.join(', ')));
+        tr.appendChild(tdOk);
+        tb2.appendChild(tr);
+      });
+      document.getElementById('countHosted').textContent = hosted.records.length;
+      document.getElementById('countHostedOk').textContent = okCount;
+      const notesBox = document.getElementById('hostedNotes');
+      notesBox.textContent = '';
+      (hosted.notes || []).forEach(n => {
+        notesBox.appendChild(elem('div', '',
+          '注记（' + (n.status || 'note') + '）：' + (n.name || '') + ' ' + (n.type || '') + ' — ' + (n.detail || '')));
+      });
       const aud = await api('/dns/api/audit');
       const al = document.getElementById('auditList');
-      const rows = (aud.audit || []).slice(-8).reverse();
-      al.innerHTML = rows.length
-        ? '最近审计：<br>' + rows.map(a => a.ts + ' ' + a.action + ' ' + a.name + ' ' + a.type +
+      const arows = (aud.audit || []).slice(-8).reverse();
+      al.innerHTML = arows.length
+        ? '最近审计：<br>' + arows.map(a => a.ts + ' ' + a.action + ' ' + a.name + ' ' + a.type +
             ' ' + (a.old || '∅') + ' → ' + (a.new || '∅') + ' · ' + a.result).join('<br>')
         : '最近审计：暂无';
     } catch (error) { notify('托管信息加载失败：' + error.message, true); }
   }
   document.getElementById('hostedBtn').addEventListener('click', () => {
-    const show = hostedPanel.style.display === 'none';
-    hostedPanel.style.display = show ? '' : 'none';
-    if (show) void loadHosted();
+    hostedPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    void loadHosted();
   });
+  void loadHosted();
   document.getElementById('cfSave').addEventListener('click', async () => {
     const v = document.getElementById('cfToken').value.trim();
     if (!v) { notify('请先粘贴令牌', true); return; }
@@ -508,7 +560,7 @@ PAGE_HTML = r'''<!doctype html>
 
   refreshButton.addEventListener('click', load);
   void load();
-  setInterval(() => { if (!refreshing && !working && !document.hidden) void load(); }, 60000);
+  setInterval(() => { if (!refreshing && !working && !document.hidden) { void load(); void loadHosted(); } }, 60000);
 })();
 </script>
 

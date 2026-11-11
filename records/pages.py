@@ -1242,10 +1242,7 @@ createApp({
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/exif-js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/viewerjs/1.11.3/viewer.min.js"></script>
- <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="static/cdn/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/exif-js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/viewerjs/1.11.3/viewer.min.js"></script>
     <script>
@@ -1568,7 +1565,7 @@ createApp({
     <meta name="theme-color" content="#0f172a">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600;700&family=DM+Mono:wght@400;500&family=Noto+Sans+SC:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="static/cdn/tailwindcss3.4.17.js"></script>
     <script src="https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js"></script>
     <script>
         tailwind.config={theme:{extend:{colors:{ink:{50:'#f8f6f2',100:'#f0ece4',200:'#e2dbd0',300:'#c9bfb0',400:'#a89a86',500:'#8a7b68',600:'#6b5e4e',700:'#50463a',800:'#362f28',900:'#1c1814'},tea:{50:'#effcf9',100:'#d7f7ef',200:'#b3efe0',300:'#7ae2cc',400:'#2dd4bf',500:'#14b8a6',600:'#0d9488',700:'#0f766e'}}}}}

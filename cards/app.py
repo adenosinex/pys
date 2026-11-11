@@ -57,6 +57,11 @@ PAGE = r"""<!DOCTYPE html>
         #cardGrid { grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); }
         .query-title { min-width: 0; overflow-wrap: anywhere; word-break: normal; }
         .tag-chip { max-width: 100%; overflow-wrap: anywhere; word-break: normal; }
+        @media (max-width: 640px) {
+            #cardGrid { grid-template-columns: 1fr; }
+            body.p-6 { padding: 12px; }
+            p, span, a, td, th, li, h1, h2, h3 { overflow-wrap: anywhere; }
+        }
     </style>
 </head>
 <body class="bg-gray-900 text-gray-100 font-sans min-h-screen p-6">

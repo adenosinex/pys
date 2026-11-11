@@ -65,6 +65,10 @@
         <summary><span>Mac 转写（YouTube 无字幕时兜底）</span><span id="mac-badge" class="badge" data-state="unchecked">读取状态中</span><span class="chev" aria-hidden="true">▾</span></summary>
         <div class="cookiebody"><form id="mac-form"><p class="hint">粘贴 YouTube 链接时先取字幕；没有可用字幕时，才会把音频送到你的 Mac（mac-compute）转写。这里保存它的访问码：只写入服务器、不回显，保存后其他浏览器可直接复用。</p><label class="sr-only" for="mac-input">Mac 转写访问码</label><input id="mac-input" type="password" maxlength="512" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴 mac-compute 访问码"><div class="actions"><button id="save-mac" class="btn btn-primary" type="submit">保存访问码</button><button id="remove-mac" class="btn btn-ghost" type="button" disabled>删除已保存的访问码</button></div><p id="mac-message" class="message" role="status" aria-live="polite"></p></form></div>
       </details>
+      <details id="yt-cookie-panel" class="card cookiewrap">
+        <summary><span>YouTube Cookie（取字幕用）</span><span id="yt-cookie-badge" class="badge" data-state="unchecked">读取状态中</span><span class="chev" aria-hidden="true">▾</span></summary>
+        <div class="cookiebody"><form id="yt-cookie-form"><p class="hint">粘贴 YouTube 链接取字幕时，本站用自备的 yt-dlp 读取视频信息与字幕；部分视频需要登录 Cookie 才能读到。这里保存你自己的 YouTube Cookie（本站独立保存，不再借用 yt-audio 的 Cookie 文件）：只写入服务器、不回显。可以粘贴 cookies.txt 的内容，或浏览器请求头里的 Cookie 整行。</p><label class="sr-only" for="yt-cookie-input">YouTube Cookie</label><textarea id="yt-cookie-input" rows="3" maxlength="524288" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴 YouTube Cookie（cookies.txt 内容或 Cookie 整行）"></textarea><div class="actions"><button id="save-yt-cookie" class="btn btn-primary" type="submit">保存 Cookie</button><button id="remove-yt-cookie" class="btn btn-ghost" type="button" disabled>删除已保存的 Cookie</button></div><p id="yt-cookie-message" class="message" role="status" aria-live="polite"></p></form></div>
+      </details>
       <details id="settings-panel" class="card cookiewrap">
         <summary><span>链接与分流设置</span><span class="badge" id="settings-badge">读取中</span><span class="chev" aria-hidden="true">▾</span></summary>
         <form id="settings-form" class="cookiebody">

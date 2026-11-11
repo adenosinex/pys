@@ -794,7 +794,8 @@ form.search button { padding: 9px 18px; font-size: 15px; border: 0; border-radiu
 .row a.t { color: #1c1c1e; text-decoration: none; font-size: 16px; font-weight: 600; }
 .row a.t:hover { color: #0a64d8; }
 .row .sub { color: #6b6b70; font-size: 13px; margin-top: 2px; word-break: break-word; }
-.row .kw { color: #8a8a8e; font-size: 12px; margin-top: 4px; }
+.row .kw { color: #8a8a8e; font-size: 12px; margin-top: 4px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .badges { display: flex; flex-direction: column; gap: 4px; align-items: flex-end; }
 .b { font-size: 11px; padding: 2px 8px; border-radius: 99px; white-space: nowrap; }
 .b-txt { background: #e5f4e3; color: #1d6b1d; }
@@ -854,6 +855,16 @@ button.reimp { padding: 8px 16px; border: 0; border-radius: 8px; background: #1c
 .tgl { font-size: 13.5px; margin: 2px 0 12px; }
 .tgl a { color: #0a64d8; text-decoration: none; }
 .tgl .on { font-weight: 700; color: #1c1c1e; }
+/* UI2-20261111 mobile */
+@media (max-width: 640px) {
+  .wrap { padding: 14px 10px 36px; }
+  .row { flex-wrap: wrap; }
+  .badges { flex-direction: row; flex-wrap: wrap; align-items: flex-start; }
+  table { display: block; overflow-x: auto; }
+  img { max-width: 100%; }
+  .row .sub, .links, .orig, dl.fm dd { overflow-wrap: anywhere; }
+  form.search input, form.search button, input, select, textarea { max-width: 100%; }
+}
 """
 
 
@@ -890,6 +901,12 @@ def _row(r, hit_label=None, views=None, pub_date=None, rank=None):
                   "target=\"_blank\" rel=\"noopener\">YouTube ↗</a> · ")
     links += (f"<a href=\"https://www.bilibili.com/video/{r['source_bv']}\" "
               "target=\"_blank\" rel=\"noopener\">Bilibili ↗</a>")
+    # UI2-20261111: one-line short excerpt instead of two full lines
+    _full_kw = (r["keywords"] or "").strip()
+    _full_orig = (r["title_original"] or "").strip()
+    excerpt = _full_kw or _full_orig
+    if len(excerpt) > 60:
+        excerpt = excerpt[:60] + "…"
     vh = _views_html(views, rank)
     if vh:
         links += " · " + vh
@@ -899,9 +916,8 @@ def _row(r, hit_label=None, views=None, pub_date=None, rank=None):
         "<div class=\"row\">"
         f"<a class=\"seq\" href=\"{U('/r/%d' % r['seq'])}\">#{r['seq']:03d}</a>"
         "<div class=\"main\">"
-        f"<a class=\"t\" href=\"{U('/r/%d' % r['seq'])}\">{_html.escape(r['title_zh'])}</a>"
-        f"<div class=\"sub\">{_html.escape(r['title_original'] or '')}</div>"
-        f"<div class=\"kw\">{_html.escape(r['keywords'] or '')}</div>"
+        f"<a class=\"t\" href=\"{U('/r/%d' % r['seq'])}\" title=\"{_html.escape(_full_orig)}\">{_html.escape(r['title_zh'])}</a>"
+        f"<div class=\"kw\" title=\"{_html.escape(_full_kw)}\">{_html.escape(excerpt)}</div>"
         f"<div class=\"links\">{links}</div>"
         "</div>" + _badges(r, hit_label) + "</div>")
 

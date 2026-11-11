@@ -158,6 +158,8 @@ PAGE_HTML = r'''<!doctype html>
     box-shadow: 0 6px 20px rgba(0,0,0,.4);
   }
   #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  /* ui2-20261111 */
+  @media (max-width:640px){ pre{overflow-x:auto} img{max-width:100%;height:auto} input,select,textarea{max-width:100%;box-sizing:border-box} .msg{max-width:92%} form{flex-wrap:wrap} }
 
   /* ---------------- 登录遮罩（App Hub 统一验证） ---------------- */
   #authGate {

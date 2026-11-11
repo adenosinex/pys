@@ -948,9 +948,13 @@ def _relay_forward(environ, start_response, name, up, rest, rd,
     ctype = environ.get("CONTENT_TYPE", "")
     if ctype:
         fwd["Content-Type"] = ctype
-    fwd["Authorization"] = "Bearer " + (up.get("key") or "")
-    if environ.get("HTTP_X_API_KEY"):
-        fwd["X-Api-Key"] = up.get("key") or ""
+    # Upstreams with an empty key get NO Authorization header at all
+    # (e.g. loopback internal services: platform norm 2026-11-10 says
+    # internal calls carry no auth; never send a bare "Bearer ").
+    if up.get("key"):
+        fwd["Authorization"] = "Bearer " + up["key"]
+        if environ.get("HTTP_X_API_KEY"):
+            fwd["X-Api-Key"] = up["key"]
     if body:
         fwd["Content-Length"] = str(len(body))
     parts = urllib.parse.urlsplit(url)
@@ -1266,6 +1270,10 @@ _PAGE_CSS = (
     ".inp{min-width:0}"
     ".editbox{border-top:1px dashed #d1d5db;margin-top:10px;"
     "padding-top:10px}"
+    "/*ui2-c2-20261111*/@media (max-width:640px){.wrap{padding:10px}"
+    "img{max-width:100%;height:auto}"
+    "input,select,textarea{max-width:100%;box-sizing:border-box}"
+    "pre{overflow-x:auto}.tbl td{word-break:break-word}}"
 )
 
 PAGE_HOME = """<!DOCTYPE html>
