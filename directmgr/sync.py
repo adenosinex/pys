@@ -202,14 +202,22 @@ def _read(path):
         return fh.read()
 
 
+HELPER = "/usr/local/bin/directmgr-sub-write"
+
+
 def _atomic_write(path, text):
-    tmp = path + ".tmp-directmgr"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    """Replace a root-owned subscription file via the narrow sudo
+    helper (fixed target whitelist inside the helper; the service
+    passes only the target path and pipes content on stdin)."""
+    r = subprocess.run(["sudo", "-n", HELPER, path], input=text,
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise SyncFailure("write helper failed for %s: %s"
+                          % (path, (r.stderr or r.stdout).strip()[:200]))
 
 
-def _sync_one_file(path, domains, ts, mihomo_bin, geodir):
+def _sync_one_file(path, domains, ts, mihomo_bin, geodir,
+                   work_dir=None):
     """Sync one subscription file. Returns a result dict.
     Raises SyncFailure before replacing anything on any failed check."""
     old = _read(path)
@@ -227,9 +235,13 @@ def _sync_one_file(path, domains, ts, mihomo_bin, geodir):
                           % (path, delta, len(domains) - len(old_doms)))
     if outside_segment_hash(old) != outside_segment_hash(new):
         raise SyncFailure("%s: content outside segment changed" % path)
-    bak = "%s.bak-directmgr-%s" % (path, ts)
-    shutil.copy2(path, bak)
-    tmp = path + ".check-directmgr"
+    # Backups are made by the write helper at replace time (the
+    # subscription dir is root-owned; the service runs as apphub).
+    bak = None
+    # mihomo check copy lives in the service-writable work dir
+    # (the subscription dir itself is not writable by the service).
+    tmp = os.path.join(work_dir or ".",
+                       ".check-" + str(os.getpid()) + ".yaml")
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(new)
     try:
@@ -266,7 +278,8 @@ def sync_all(domains, cfg, ts, read_remote, write_remote):
     for path in [cfg["debi_sub"]]:
         try:
             r = _sync_one_file(path, domains, ts,
-                               cfg["mihomo_bin"], cfg["geodir"])
+                               cfg["mihomo_bin"], cfg["geodir"],
+                               cfg.get("work_dir"))
             results.append(r)
         except Exception as exc:
             return results, "debi %s: %s" % (path, exc)

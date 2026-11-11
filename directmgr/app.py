@@ -22,6 +22,17 @@ normalization.
 This app contains no identity verification: the App Hub platform
 gate in front of /web/directmgr/ performs it centrally, and direct
 access on the local port is trusted.
+
+Write channel to the root-owned subscription files: the debi file
+is replaced through a narrow root helper (/usr/local/bin/
+directmgr-sub-write, reachable by user apphub via a sudoers
+NOPASSWD rule for that exact command; the helper whitelists this
+box's subscription path, backs the old file up into this project's
+data dir, then replaces atomically). The shoc files are written
+over SSH with a dedicated per-service keypair generated on debi
+for this project only (private half in this data dir's ssh/,
+public half in shoc's authorized_keys): not the operator's key,
+and it opens nothing else.
 """
 import json
 import os
@@ -112,11 +123,18 @@ def _load_config():
 # ---------------------------------------------------------------- ssh (shoc)
 
 def _ssh_base_args(cfg):
-    return ["ssh", "-i", cfg["ssh_key"], "-o", "IdentitiesOnly=yes",
+    # Direct sshd-to-sshd with a dedicated per-service keypair
+    # (generated on debi for this project only, public half in
+    # shoc's authorized_keys; it is not the operator's key and
+    # opens nothing else). ssh_proxy stays supported-but-empty.
+    args = ["ssh", "-i", cfg["ssh_key"], "-o", "IdentitiesOnly=yes",
             "-o", "BatchMode=yes", "-o", "ConnectTimeout=25",
-            "-o", "ProxyCommand=" + cfg["ssh_proxy"],
             "-o", "UserKnownHostsFile=" + cfg["ssh_known_hosts"],
-            "-o", "StrictHostKeyChecking=yes", cfg["ssh_target"]]
+            "-o", "StrictHostKeyChecking=yes"]
+    if cfg.get("ssh_proxy"):
+        args += ["-o", "ProxyCommand=" + cfg["ssh_proxy"]]
+    args.append(cfg["ssh_target"])
+    return args
 
 
 def _ssh_run(cfg, remote_cmd, stdin_text=None, timeout=60):
