@@ -370,22 +370,22 @@
                         matchedRouteDistKm = point.dist;
                     }
                     if (distToPoint <= 0.2) {
-                        nearCandidates.push({ dist: distToPoint, km: point.dist, time: point.time });
+                        nearCandidates.push({ dist: distToPoint, km: point.dist, refSpeed: gpx.avgSpeed || 0 });
                     }
                 }
             });
         });
 
         if (globalClosestDist === Infinity) return { error: "历史轨迹中没有坐标数据。请删除旧项目重传 GPX 文件！" };
-        // 环线/往返/交叉点：同一位置对应多个轨迹点时，用已耗时挑时间最接近的
-        if (hasElapsed && nearCandidates.length > 1) {
+        // 环线/往返/交叉点：同一位置对应多个轨迹点时，用速度挑——候选距离除以已耗时的隐含速度，与该基准的参照平均速度最接近的胜出
+        if (hasElapsed && elapsed >= 0.05 && nearCandidates.length > 1) {
             let best = null;
-            let bestTimeDiff = Infinity;
+            let bestScore = Infinity;
             nearCandidates.forEach(c => {
-                const t = isNaN(c.time) ? Infinity : c.time;
-                const td = Math.abs(t - elapsed);
-                if (best === null || td < bestTimeDiff || (td === bestTimeDiff && c.dist < best.dist)) {
-                    bestTimeDiff = td;
+                if (!c.refSpeed || c.refSpeed <= 0) return;
+                const s = Math.abs(c.km / elapsed - c.refSpeed);
+                if (best === null || s < bestScore || (s === bestScore && c.dist < best.dist)) {
+                    bestScore = s;
                     best = c;
                 }
             });
@@ -468,8 +468,9 @@
             const totalDist = data[data.length-1].dist;
 
             let localBest = null;
-            let localBestTimeDiff = Infinity;
+            let localBestScore = Infinity;
             let localBestDistDiff = Infinity;
+            const refSpeed = (gpx.avgSpeed && gpx.avgSpeed > 0) ? gpx.avgSpeed : 0;
             
             data.forEach(item => {
                 let distDiff = Math.abs(item.dist - currentDist);
@@ -478,11 +479,11 @@
                     distDiff = Math.min(distDiff, Math.abs(item.dist - currentDist - totalDist), Math.abs(item.dist - currentDist + totalDist));
                 }
                 if (distDiff > 0.5) return;
-                const t = isNaN(item.time) ? Infinity : item.time;
-                const timeDiff = Math.abs(t - currentTime);
-                if (localBest === null || timeDiff < localBestTimeDiff || (timeDiff === localBestTimeDiff && distDiff < localBestDistDiff)) {
+                if (item.time <= 0.01) return;
+                const score = refSpeed > 0 ? Math.abs(item.dist / currentTime - refSpeed) : Math.abs((isNaN(item.time) ? Infinity : item.time) - currentTime);
+                if (localBest === null || score < localBestScore || (score === localBestScore && distDiff < localBestDistDiff)) {
                     localBest = item;
-                    localBestTimeDiff = timeDiff;
+                    localBestScore = score;
                     localBestDistDiff = distDiff;
                 }
             });
@@ -580,7 +581,9 @@
                     }).filter(item => !isNaN(item.dist));
                     
                     kind = classifyRoute(parsedData);
-                    projectCsvDataCache.push({ name: r.original_name, data: parsedData, isLoop: kind === '环线' });
+                    const lastPt = parsedData.length > 0 ? parsedData[parsedData.length - 1] : null;
+                    const avgSpeed = (lastPt && lastPt.time > 0) ? lastPt.dist / lastPt.time : 0;
+                    projectCsvDataCache.push({ name: r.original_name, data: parsedData, isLoop: kind === '环线', avgSpeed: avgSpeed });
                 } catch (e) {
                     console.error("缓存 CSV 数据失败:", r.original_name, e);
                 }
