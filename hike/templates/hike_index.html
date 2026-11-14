@@ -92,6 +92,7 @@
                 📍 数据测算区
                 <button id="gpsBtn" onclick="autoLocate()" class="btn-action" style="width: auto;">设备自动定位</button>
             </div>
+            <div id="locStatus" style="font-size:12px;color:#8e8e93;margin-bottom:8px;"></div>
             
             <div class="flex-row" style="margin-bottom: 10px;">
                 <input type="text" id="manualGpsInput" placeholder="填入任意格式坐标文本">
@@ -100,11 +101,11 @@
 
             <div class="input-group">
                 <label>当前行进距离 (公里)</label>
-                <input type="number" id="currDist" step="0.1" min="0" placeholder="可手动或GPS自动填入" inputmode="decimal">
+                <input type="number" id="currDist" step="0.1" min="0" placeholder="可手动或GPS自动填入" inputmode="decimal" oninput="tryAutoPredict()">
             </div>
             <div class="input-group">
                 <label>当前已耗时 (小时)</label>
-                <input type="number" id="currTime" step="0.1" min="0" placeholder="上方时间助手自动计算填入" inputmode="decimal" style="background: #e5f4e7; border-color: #34c759;">
+                <input type="number" id="currTime" step="0.1" min="0" placeholder="上方时间助手自动计算填入" inputmode="decimal" style="background: #e5f4e7; border-color: #34c759;" oninput="tryAutoPredict()">
             </div>
             
             <button onclick="predictTimeLocally()">前端离线测算</button>
@@ -169,28 +170,77 @@
             if (!timeTouched && document.visibilityState === 'visible') setNowTime();
         }, 60000);
     }
-    function autoLocateOnLoad() {
-        if (!navigator.geolocation) return;
-        if (projectCsvDataCache.length > 0) { doSilentLocate(); return; }
-        let tries = 0;
-        const iv = setInterval(() => {
-            tries++;
-            if (projectCsvDataCache.length > 0 || tries > 20) {
-                clearInterval(iv);
-                if (projectCsvDataCache.length > 0) doSilentLocate();
-            }
-        }, 500);
+    let expectedCsvCount = 0;
+    let watchId = null;
+    let lastWatchUpdate = 0;
+    function hmNow() {
+        const d = new Date();
+        return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+    }
+    function setLocStatus(msg) {
+        const el = document.getElementById('locStatus');
+        if (el) el.textContent = msg;
+    }
+    function cacheReady() {
+        return expectedCsvCount > 0 && projectCsvDataCache.length >= expectedCsvCount;
+    }
+    function tryAutoPredict() {
+        if (projectCsvDataCache.length === 0) return;
+        const d = parseFloat(document.getElementById('currDist').value);
+        const t = parseFloat(document.getElementById('currTime').value);
+        if (isNaN(d) || isNaN(t) || d <= 0 || t <= 0) return;
+        predictTimeLocally();
+    }
+    function applyPosition(position, silent) {
+        const result = matchRouteWithCoordinates(position.coords.latitude, position.coords.longitude);
+        if (result.error) {
+            if (!silent) setLocStatus('定位：轨迹数据未就绪');
+            return false;
+        }
+        document.getElementById('currDist').value = result.matchedKm.toFixed(2);
+        setLocStatus('定位：已获取 ' + hmNow() + (result.deviationKm > 1.0 ? '（偏离路线 ' + result.deviationKm.toFixed(2) + ' 公里）' : ''));
+        tryAutoPredict();
+        return true;
+    }
+    function startWatching() {
+        if (watchId !== null || !navigator.geolocation) return;
+        watchId = navigator.geolocation.watchPosition(
+            (position) => {
+                const now = Date.now();
+                if (now - lastWatchUpdate < 10000) return;
+                lastWatchUpdate = now;
+                if (cacheReady()) applyPosition(position, true);
+            },
+            () => {},
+            { enableHighAccuracy: true, timeout: 20000, maximumAge: 5000 }
+        );
     }
     function doSilentLocate() {
         navigator.geolocation.getCurrentPosition(
             (position) => {
-                const result = matchRouteWithCoordinates(position.coords.latitude, position.coords.longitude);
-                if (result.error) return;
-                document.getElementById('currDist').value = result.matchedKm.toFixed(2);
+                if (applyPosition(position, true)) startWatching();
             },
-            () => {},
+            (error) => {
+                if (error.code === 1) setLocStatus('定位：未授权，请在浏览器站点设置里允许位置信息');
+                else setLocStatus('定位：获取失败，点「设备自动定位」重试');
+            },
             { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
         );
+    }
+    function autoLocateOnLoad() {
+        if (!navigator.geolocation) { setLocStatus('定位：浏览器不支持'); return; }
+        let tries = 0;
+        const iv = setInterval(() => {
+            tries++;
+            if (cacheReady() || tries > 30) {
+                clearInterval(iv);
+                if (cacheReady() || projectCsvDataCache.length > 0) doSilentLocate();
+            }
+        }, 500);
+    }
+    function onDataReady() {
+        if (cacheReady()) doSilentLocate();
+        else tryAutoPredict();
     }
     function setNowTime() {
         timeTouched = false;
@@ -217,6 +267,7 @@
 
         const diffHours = (nowMins - startMins) / 60;
         document.getElementById('currTime').value = diffHours.toFixed(2);
+        tryAutoPredict();
     }
 
     // ==================== 高鲁棒性 GPS 解析器 ====================
@@ -318,6 +369,7 @@
             alert(`⚠️ 坐标警告：此点距离当前路线最近处有 ${(result.deviationKm).toFixed(2)} 公里，请确认是否偏离路线！`);
         }
         document.getElementById('currDist').value = result.matchedKm.toFixed(2);
+        tryAutoPredict();
     }
 
     function autoLocate() {
@@ -337,11 +389,15 @@
                     alert(`⚠️ 定位警告：当前位置距离路线最近处有 ${(result.deviationKm).toFixed(2)} 公里，请确认是否偏离路线！`);
                 }
                 document.getElementById('currDist').value = result.matchedKm.toFixed(2);
+                setLocStatus('定位：已获取 ' + hmNow());
+                tryAutoPredict();
+                startWatching();
             },
             (error) => {
                 btn.innerText = originalText; btn.disabled = false;
                 let msg = "定位失败。请确保已授予浏览器位置权限。";
                 if (error.code === 1) msg = "您拒绝了定位请求。";
+                setLocStatus('定位：' + msg);
                 alert(msg);
             },
             { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
@@ -425,6 +481,7 @@
     async function loadProjectRecords(projectId) {
         const res = await fetch(`${API_PREFIX}/projects/${projectId}/records`);
         const records = await res.json();
+        expectedCsvCount = records.length;
         
         const listUi = document.getElementById('gpxList');
         const recordsCard = document.getElementById('recordsCard');
@@ -463,6 +520,7 @@
         } else {
             recordsCard.style.display = 'none';
         }
+        onDataReady();
     }
 
     // ==================== 基础初始化逻辑 ====================
