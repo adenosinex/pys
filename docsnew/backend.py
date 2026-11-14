@@ -21,6 +21,18 @@ from urllib.error import URLError, HTTPError
 
 import yaml
 
+# C 解析器（libyaml 存在时）：与 SafeLoader 同样的安全 schema，
+# 解析速度约 6 倍。索引构建每篇文档都要解析一次 frontmatter，
+# 这是冷启动耗时的大头之一；不存在时退回纯 Python 解析。
+_YAML_LOADER = getattr(yaml, "CSafeLoader", None)
+
+
+def _yaml_load(text):
+    if _YAML_LOADER is not None:
+        return yaml.load(text, Loader=_YAML_LOADER)
+    return yaml.safe_load(text)
+
+
 logger = logging.getLogger(__name__)
 
 # --- request shims (fed by the dispatcher) ---
@@ -64,7 +76,7 @@ TRASH_DIR = DOCS_DIR + "_trash"  # 保持回收站在扫描目录之外
 # always wins over the in-app store.
 
 CRED_FILE = os.path.join(os.path.dirname(DOCS_DIR), "credentials.json")
-CRED_KEYS = ("OP_API_KEY",)
+CRED_KEYS = ("OP_API_KEY", "LOCAL_API_KEY")
 
 
 def _cred_values():
@@ -177,7 +189,7 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
     if not match:
         return {}, content
     try:
-        data = yaml.safe_load(match.group(1)) or {}
+        data = _yaml_load(match.group(1)) or {}
         return (data if isinstance(data, dict) else {}), content[match.end():]
     except yaml.YAMLError:
         # 不吞掉原始内容中的数据；保存前端传来的原文时不破坏旧格式。
@@ -236,10 +248,11 @@ def write_atomic(path: Path, content: str) -> None:
             os.unlink(temp_name)
 
 
-def build_doc_index(full_path: Path, rel_path: str, raw_content: str, meta: dict | None = None) -> dict:
+def build_doc_index(full_path: Path, rel_path: str, raw_content: str, meta: dict | None = None,
+                    pure_content: str | None = None) -> dict:
     if meta is None:
         meta, pure_content = parse_frontmatter(raw_content)
-    else:
+    elif pure_content is None:
         _, pure_content = parse_frontmatter(raw_content)
     tags = meta.get("tags", [])
     if not isinstance(tags, list):
@@ -296,10 +309,13 @@ def build_memory_index() -> None:
                     if path.is_symlink():
                         continue
                     raw = path.read_text(encoding="utf-8")
-                    meta, _ = parse_frontmatter(raw)
-                    raw, meta = ensure_created_time_in_frontmatter(path, raw, meta)
+                    meta, pure_content = parse_frontmatter(raw)
+                    new_raw, meta = ensure_created_time_in_frontmatter(path, raw, meta)
+                    if new_raw is not raw:
+                        raw = new_raw
+                        meta, pure_content = parse_frontmatter(raw)
                     rel = path.relative_to(root).as_posix()
-                    item = build_doc_index(path, rel, raw, meta)
+                    item = build_doc_index(path, rel, raw, meta, pure_content)
                     if item["id"] in new_index:
                         logger.warning("重复文档 ID，已跳过 %s", path)
                         continue
@@ -387,7 +403,23 @@ def list_documents():
     with INDEX_LOCK:
         docs = sorted((dict(d) for d in FILE_INDEX.values()),
                       key=lambda d: (d["is_pinned"], d["update_time"]), reverse=True)
-    return jsonify({"docs": docs})
+    total = len(docs)
+    limit_raw = args_get("limit")
+    offset_raw = args_get("offset")
+    if limit_raw is None and offset_raw is None:
+        return jsonify({"docs": docs})
+    try:
+        limit = int(limit_raw) if limit_raw is not None else total
+    except (TypeError, ValueError):
+        limit = total
+    try:
+        offset = int(offset_raw) if offset_raw is not None else 0
+    except (TypeError, ValueError):
+        offset = 0
+    limit = max(0, min(limit, 5000))
+    offset = max(0, min(offset, total))
+    return jsonify({"docs": docs[offset:offset + limit],
+                    "total": total, "limit": limit, "offset": offset})
 
 
 def get_document(doc_id):
@@ -791,4 +823,8 @@ def handle(method, subpath, args, json_data):
         if not ok:
             return 400, {"error": err}
         return 200, {"ok": True, "keys": _cred_status()}
+    if seg and seg[0] == "ai" and len(seg) == 2 and seg[1] in (
+            "config", "scan", "run", "status", "jobs"):
+        import ai_console
+        return ai_console.handle(seg[1], method, args, json_data)
     return 404, {"error": "接口不存在"}

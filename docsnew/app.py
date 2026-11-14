@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, unquote
 
 import auth
 import backend
+from ai_page import AI_CONSOLE_HTML
 from pages import PAGES
 from webutil import json_response, read_json, serve_file
 
@@ -173,6 +174,21 @@ DOCS_DATA_WIDGET = """
 """
 
 
+AI_LINK_WIDGET = """
+<div id="aiw" style="position:fixed;left:14px;bottom:14px;z-index:9999;font-family:system-ui,-apple-system,'PingFang SC',sans-serif">
+  <button id="aiw-btn" type="button" style="padding:8px 14px;border-radius:999px;border:1px solid #c7cede;background:#fff;color:#333;font-size:13px;cursor:pointer;box-shadow:0 2px 10px rgba(20,30,60,.15)">AI 控制台</button>
+</div>
+<script>
+(function () {
+  var base = location.pathname.replace(/\\/docs\\/?$/, "");
+  document.getElementById("aiw-btn").addEventListener("click", function () {
+    location.href = base + "/ai";
+  });
+})();
+</script>
+"""
+
+
 CRED_WIDGET = """
 <div id="credw" style="position:fixed;right:14px;bottom:14px;z-index:9999;font-family:system-ui,-apple-system,'PingFang SC',sans-serif">
   <button id="credw-btn" type="button" style="padding:8px 14px;border-radius:999px;border:1px solid #c7cede;background:#fff;color:#333;font-size:13px;cursor:pointer;box-shadow:0 2px 10px rgba(20,30,60,.15)">AI 凭据</button>
@@ -231,10 +247,12 @@ def application(environ, start_response):
     if path == "/" and method == "GET":
         start_response("302 Found", [("Location", "docs"), ("Content-Length", "0")])
         return [b""]
+    if method == "GET" and path == "/ai":
+        return _page_response(start_response, AI_CONSOLE_HTML)
     if method == "GET" and path[1:] in PAGES:
         html = PAGES[path[1:]]
         if path == "/docs":
-            inject = CRED_WIDGET + DOCS_DATA_WIDGET
+            inject = CRED_WIDGET + DOCS_DATA_WIDGET + AI_LINK_WIDGET
             html = (html.replace("</body>", inject + "</body>", 1)
                     if "</body>" in html else html + inject)
         return _page_response(start_response, html)
@@ -242,7 +260,7 @@ def application(environ, start_response):
         rel = path[len("/static/"):]
         full = os.path.normpath(os.path.join(STATIC_DIR, rel))
         if full.startswith(STATIC_DIR):
-            return serve_file(start_response, full, environ)
+            return serve_file(start_response, full, environ, immutable=True)
         return json_response(start_response, {"error": "not found"}, 404)
 
     if path.startswith("/docapi/"):

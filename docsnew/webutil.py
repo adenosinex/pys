@@ -4,9 +4,11 @@ import json
 import mimetypes
 import os
 import re
+from email.utils import formatdate
 
 STATUS = {200: "200 OK", 201: "201 Created", 204: "204 No Content",
-          206: "206 Partial Content", 400: "400 Bad Request",
+          206: "206 Partial Content", 304: "304 Not Modified",
+          400: "400 Bad Request",
           401: "401 Unauthorized", 404: "404 Not Found",
           409: "409 Conflict", 416: "416 Range Not Satisfiable",
           500: "500 Internal Server Error",
@@ -85,7 +87,7 @@ def parse_multipart(environ):
     return fields, files
 
 
-def serve_file(start_response, path, environ, download_name=None):
+def serve_file(start_response, path, environ, download_name=None, immutable=False):
     if not os.path.isfile(path):
         return json_response(start_response, {"error": "not found"}, 404)
     size = os.path.getsize(path)
@@ -93,6 +95,17 @@ def serve_file(start_response, path, environ, download_name=None):
     headers = [("Content-Type", ctype), ("Accept-Ranges", "bytes")]
     if download_name:
         headers.append(("Content-Disposition", "attachment;filename=" + download_name))
+    if immutable and not download_name:
+        # 版本号写在文件名里的静态资源：内容永不变化，浏览器可缓存
+        # 一年不再请求；带 ETag，显式刷新时走 304。
+        st = os.stat(path)
+        etag = '"%x-%x"' % (int(st.st_mtime), size)
+        headers.append(("ETag", etag))
+        headers.append(("Last-Modified", formatdate(st.st_mtime, usegmt=True)))
+        headers.append(("Cache-Control", "public, max-age=31536000, immutable"))
+        if environ.get("HTTP_IF_NONE_MATCH") == etag:
+            start_response(STATUS[304], headers)
+            return [b""]
     range_header = environ.get("HTTP_RANGE", "")
     start, end = 0, size - 1
     code = 200

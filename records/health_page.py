@@ -134,7 +134,7 @@ HEALTH_PAGE = r"""<!doctype html>
       <h3>隐私</h3>
       <div class="kv"><label style="flex:1">隐蔽模式（敏感项只显示代号）</label>
         <span class="switch"><input type="checkbox" id="me-stealth"><i></i></span></div>
-      <p class="mut">敏感类别在所有列表里都只显示代号（见下方映射）。开启隐蔽模式后再进一步：敏感记录的值、标签和备注也隐藏，只剩时间和代号，点开详情需再次确认。</p>
+      <p class="mut">敏感类别在所有列表里都只显示代号（见下方映射）。开启隐蔽模式后再进一步：敏感记录的值、标签和备注也隐藏，只剩时间和代号。</p>
     </div>
     <div class="card">
       <h3>代号映射</h3>
@@ -280,7 +280,6 @@ function bindRows(root, records) {
   $$(".rec", root).forEach(el => el.addEventListener("click", () => {
     const rec = records.find(r => r.id === el.dataset.id);
     if (!rec) return;
-    if (stealth() && isSensitive(rec) && !confirm("这是敏感记录，确认查看详情？")) return;
     openSheet({ mode: "edit", rec });
   }));
 }
@@ -348,7 +347,7 @@ async function loadSuggests() {
 const VALUE_CONF = {
   food: { kind: "enum", label: "热量档（可选）", options: ["低", "中", "高"] },
   stool: { kind: "bristol", label: "布里斯托分型" },
-  intimacy: { kind: "bool", label: "" },
+  intimacy: { kind: "quicknum", label: "数值", options: [4, 5, 6, 7] },
   sleep: { kind: "enum", label: "大致长短", options: ["偏短", "正常", "偏长"] },
   exercise: { kind: "measure", label: "时长", unit: "分钟", step: 5 },
   note: { kind: "none" }
@@ -402,6 +401,10 @@ function renderSheet() {
   if (conf.kind === "scale") {
     valueHtml = '<div class="steplabel">' + conf.label + '</div><div class="chips">' +
       [1, 2, 3, 4, 5].map(n => '<button class="chip' + (st.value && st.value.v === n ? " on" : "") + '" data-act="val" data-v="' + n + '">' + n + "</button>").join("") + "</div>";
+  } else if (conf.kind === "quicknum") {
+    valueHtml = '<div class="steplabel">' + conf.label + '</div><div class="chips">' +
+      conf.options.map(n => '<button class="chip' + (st.value && st.value.v === n ? " on" : "") + '" data-act="qnum" data-v="' + n + '">' + n + "</button>").join("") + "</div>" +
+      '<div class="row2" style="margin-top:8px"><input type="number" id="sh-qnum" step="1" min="0" inputmode="numeric" placeholder="或输入数字，如 8" value="' + (st.value && typeof st.value.v === "number" ? st.value.v : "") + '"></div>';
   } else if (conf.kind === "bristol") {
     const desc = { 1: "偏干·硬块", 2: "偏干", 3: "略干", 4: "正常·顺滑", 5: "正常·软", 6: "偏稀", 7: "稀水" };
     valueHtml = '<div class="steplabel">' + conf.label + '</div><div class="chips">' +
@@ -475,6 +478,13 @@ async function sheetAction(act, v) {
     if (t) { st.item = t; renderSheet(); }
     return;
   }
+  if (act === "qnum") {
+    const q = $("#sh-qnum");
+    if (q) q.value = "";
+    st.value = { type: "measure", v: Number(v), unit: "" };
+    if (st.mode === "create") { sheetAction("save"); return; }
+    renderSheet(); return;
+  }
   if (act === "val") {
     const conf = VALUE_CONF[st.category] || { kind: "none" };
     if (conf.kind === "scale") st.value = { type: "scale", v: Number(v) };
@@ -501,10 +511,12 @@ async function sheetAction(act, v) {
     if (conf.kind === "measure") {
       const n = parseFloat(($("#sh-num") || {}).value);
       value = (!isNaN(n) && n > 0) ? { type: "measure", v: n, unit: conf.unit } : null;
+    } else if (conf.kind === "quicknum") {
+      const qv = parseFloat((($("#sh-qnum") || {}).value || "").trim());
+      value = !isNaN(qv) ? { type: "measure", v: qv, unit: "" } : (st.value || null);
     } else if (conf.kind === "bool") value = { type: "bool", v: true };
     const whenVal = $("#sh-when").value;
-    if (!whenVal) { alert("请选择时间"); return; }
-    const dt = new Date(whenVal);
+    const dt = whenVal ? new Date(whenVal) : new Date();
     let finalTags = st.tags.slice();
     if (st.category === "sleep") {
       finalTags = finalTags.filter(t => !t.startsWith("残留困意·") && !DUR_TAGS.includes(t));
@@ -517,11 +529,10 @@ async function sheetAction(act, v) {
       if (st.after) finalTags.push("便后·" + st.after);
     }
     const payload = {
-      category: st.category, item: st.item || (sortedItems(st.category)[0] || ""),
+      category: st.category, item: st.item || (sortedItems(st.category)[0] || (CATS[st.category] || {}).name || st.category),
       value, tags: finalTags, note: $("#sh-note").value.trim(),
       ts: Math.floor(dt.getTime() / 1000), date: todayStr(dt)
     };
-    if (!payload.item) { alert("请先选择或填写项目名（例如药名）"); return; }
     if (st.mode === "edit") {
       try { await apiPost("/records/" + st.id, payload); }
       catch (e) { alert("保存失败：" + e.message); return; }

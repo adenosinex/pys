@@ -806,7 +806,9 @@ class _CorsResp:
 
 
 def _handle_relay(environ, start_response, name, rest):
-    """Legacy per-upstream URL: /r/<name>/v1/<path> (kept working)."""
+    """Legacy per-upstream URL: /r/<name>/v1/<path> (kept working).
+    A '<name>/' prefix on the body's model is stripped before the
+    request goes upstream, same as the unified entry."""
     store = _load_store()
     up = store["upstreams"].get(name)
     if up is None:
@@ -920,14 +922,28 @@ def _relay_forward(environ, start_response, name, up, rest, rd,
     orig_model = rd["model"]
     model = orig_model
     req_stream = rd["stream"]
-    if fwd_model is not None and fwd_model != orig_model and body:
+    # The upstream must only ever see its own native model id: the
+    # '<upstream>/' routing prefix is apirelay's own modification
+    # and the platform does not recognize it. Strip it here, at the
+    # forwarding boundary, on EVERY entry path -- the unified entry
+    # resolves it via _resolve_route, but the legacy /r/<name>/v1/
+    # entry used to forward the body verbatim, so a client posting
+    # an aggregated id there leaked the prefix upstream (2026-11-12
+    # fix). Only the target upstream's own name is stripped; a
+    # foreign head (an upstream-native id such as 'openai/gpt-4')
+    # passes through untouched.
+    fwd = fwd_model if fwd_model is not None else orig_model
+    pfx = name + "/"
+    if fwd.startswith(pfx) and len(fwd) > len(pfx):
+        fwd = fwd[len(pfx):]
+    if fwd != orig_model and body:
         try:
             reqj = json.loads(body.decode("utf-8", "replace"))
             if isinstance(reqj, dict):
-                reqj["model"] = fwd_model
+                reqj["model"] = fwd
                 body = json.dumps(reqj,
                                   ensure_ascii=False).encode("utf-8")
-                model = fwd_model
+                model = fwd
         except Exception:
             pass
     url = _api_base(up.get("base_url")) + "/" + rest

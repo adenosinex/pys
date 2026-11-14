@@ -723,7 +723,7 @@ button:focus-visible, [role="button"]:focus-visible { outline: 2px solid #817cf5
                  顶部模式
                  ================================================= -->
             <div class="sidebar-top">
-                <div class="side-heading"><span>我的工作区</span><span class="total-pill">{{ documents.length }} 篇</span></div>
+                <div class="side-heading"><span>我的工作区</span><span class="total-pill">{{ totalCount > 0 ? totalCount : documents.length }} 篇</span></div>
                 <div class="mode-switch">
                     <button type="button" class="mode-button" :class="{ active: sidebarMode === 'docs' }"
                             @click="sidebarMode = 'docs'">
@@ -1706,6 +1706,8 @@ const { createApp, ref, computed, watch, nextTick, onMounted, onUnmounted } = Vu
 const app = createApp({
     setup() {
         const documents = ref([]);
+        const totalCount = ref(0);
+        let listSeq = 0;
         const searchResults = ref([]);
         const searchQuery = ref('');
         const activeDocId = ref('');
@@ -2296,18 +2298,56 @@ title: ${JSON.stringify(title)}
                 !calendarCollapsed.value;
         };
         const fetchDocuments = async () => {
+            listSeq++;
             try {
                 const response = await fetch(API_BASE + '/docapi/documents');
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}`);
                 }
                 const data = await response.json();
-                documents.value =
-                    data.docs || [];
+                documents.value = data.docs || [];
+                totalCount.value = data.total || documents.value.length;
             }
             catch (error) {
                 console.error('加载文档失败:', error);
                 ElementPlus.ElMessage.error('文档列表加载失败');
+            }
+        };
+        const fetchDocumentsPaged = async () => {
+            const seq = ++listSeq;
+            try {
+                const first = await fetch(API_BASE + '/docapi/documents?limit=40&offset=0');
+                if (!first.ok) throw new Error(`HTTP ${first.status}`);
+                const head = await first.json();
+                if (seq !== listSeq) return;
+                documents.value = head.docs || [];
+                totalCount.value = head.total || documents.value.length;
+                let offset = documents.value.length;
+                const total = totalCount.value;
+                while (offset < total) {
+                    if (seq !== listSeq) return;
+                    const res = await fetch(API_BASE + '/docapi/documents?limit=250&offset=' + offset);
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    const page = await res.json();
+                    if (seq !== listSeq) return;
+                    const seen = new Set(documents.value.map(d => d.id));
+                    for (const d of (page.docs || [])) {
+                        if (!seen.has(d.id)) documents.value.push(d);
+                    }
+                    if (!page.docs || page.docs.length === 0) break;
+                    offset += page.docs.length;
+                    await new Promise(r => setTimeout(r, 0));
+                }
+                if (seq === listSeq) {
+                    documents.value = documents.value.slice().sort((a, b) => {
+                        if (b.is_pinned !== a.is_pinned) return b.is_pinned - a.is_pinned;
+                        return b.update_time - a.update_time;
+                    });
+                }
+            }
+            catch (error) {
+                console.error('加载文档失败:', error);
+                if (documents.value.length === 0) ElementPlus.ElMessage.error('文档列表加载失败');
             }
         };
         const fetchRelated = async (id) => {
@@ -3036,7 +3076,7 @@ tags:
         onMounted(async () => {
             updateIsMobile();
             window.addEventListener('keydown', handleGlobalKeyDown);
-            await fetchDocuments();
+            await fetchDocumentsPaged();
         });
         onUnmounted(() => {
             window.removeEventListener('keydown', handleGlobalKeyDown);
@@ -4729,6 +4769,8 @@ const app = createApp({
     setup() {
 
         const documents   = ref([]);
+        const totalCount  = ref(0);
+        let viewListSeq = 0;
         const loadingDocs = ref(false);
         const keyword     = ref('');
         const activeCat   = ref(null);
@@ -5115,7 +5157,7 @@ const app = createApp({
         };
 
         /* ---------- 其他计算 ---------- */
-        const totalDocs  = computed(() => documents.value.length);
+        const totalDocs  = computed(() => totalCount.value > 0 ? totalCount.value : documents.value.length);
 
         const overallAvg = computed(() => {
             if (stats.value && stats.value.total) {
@@ -5260,15 +5302,36 @@ const app = createApp({
 
         /* ---------- 加载 ---------- */
         const loadAll = async () => {
+            const seq = ++viewListSeq;
             loadingDocs.value = true;
             try {
-                const res = await fetch(api('/docapi/documents'));
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                const data = await res.json();
-                documents.value = data.docs || data.documents || [];
+                const first = await fetch(api('/docapi/documents?limit=40&offset=0'));
+                if (!first.ok) throw new Error(`HTTP ${first.status}`);
+                const head = await first.json();
+                if (seq !== viewListSeq) return;
+                documents.value = head.docs || head.documents || [];
+                totalCount.value = head.total || documents.value.length;
+                loadingDocs.value = false;
+                let offset = documents.value.length;
+                const total = totalCount.value;
+                while (offset < total) {
+                    if (seq !== viewListSeq) return;
+                    const res = await fetch(api('/docapi/documents?limit=250&offset=' + offset));
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    const page = await res.json();
+                    if (seq !== viewListSeq) return;
+                    const seen = new Set(documents.value.map(d => d.id));
+                    const chunk = page.docs || page.documents || [];
+                    for (const d of chunk) {
+                        if (!seen.has(d.id)) documents.value.push(d);
+                    }
+                    if (chunk.length === 0) break;
+                    offset += chunk.length;
+                    await new Promise(r => setTimeout(r, 0));
+                }
             } catch (e) {
                 console.error('加载失败:', e);
-                ElementPlus.ElMessage.error('文档列表加载失败');
+                if (documents.value.length === 0) ElementPlus.ElMessage.error('文档列表加载失败');
             } finally {
                 loadingDocs.value = false;
             }

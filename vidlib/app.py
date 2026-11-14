@@ -2498,6 +2498,21 @@ def _ext_check(params):
     return bool(given) and secrets.compare_digest(given, _ext_token())
 
 
+def _upload_token():
+    tok = _cred("upload_token")
+    if not tok:
+        creds = _load_creds()
+        tok = secrets.token_urlsafe(24)
+        creds["upload_token"] = tok
+        _save_creds(creds)
+    return tok
+
+
+def _upload_check(environ, params):
+    given = params.get("t") or environ.get("HTTP_X_UPLOAD_TOKEN") or ""
+    return bool(given) and secrets.compare_digest(given, _upload_token())
+
+
 def _ext_words(chars):
     chars = chars or 0
     if chars >= 10000:
@@ -7033,6 +7048,10 @@ UPLOAD_PAGE = r"""<div class="topbar"><a class="btn ghost" href="./">← 返回<
 </details>
 </div>
 <p style="color:#8b94a7;font-size:12.5px;line-height:1.7">分片上传（8MB/片）：最多 4 个文件并行、每个文件 3 片并行，失败分片自动重试 3 次。入队后先按文件名+大小整批预检：同名同大小的直接跳过（不读文件内容）；没中的逐个计算哈希，算完一个就预检一个、命中同样跳过，没中的立刻开始上传（不等整批算完），已存在的文件一个分片都不传。速度为近几秒的实时速度，不是全程平均。文件先到服务器暂存区，后台算哈希去重、抽缩略图，再自动归档到谷歌硬盘并删除本地副本；同哈希重复上传只新增一个条目，不重复占谷歌空间。排队中的文件可点 ✕ 取消，上传中的也可中止（已传分片作废）。暂存区预算 __BUDGET__，归档跟不上时请稍后再传。</p></div>
+<div class="panel"><h2>批量上传脚本</h2>
+<p style="color:#8b94a7;font-size:13px;line-height:1.7">视频多、文件大时，网页上传容易卡：用脚本在电脑上跑，输入文件夹路径就自动传完——断点续传、失败重试、已存在的文件秒传跳过。需要 Python 3，不用装任何依赖。</p>
+<p><a class="btn" href="api/upload-script" download>下载上传脚本</a></p>
+<p style="color:#8b94a7;font-size:13px;line-height:1.7">用法：<code>python3 vidlib_upload.py</code>（Windows 用 <code>py vidlib_upload.py</code>），按提示输入文件夹路径；第一次运行会问上传令牌，在「管理 → 视频」页的「批量上传令牌」里。</p></div>
 <script>
 const CH=8*1024*1024,PARF=4,PARC=3;
 const elActive=document.getElementById("list-active");
@@ -7768,6 +7787,32 @@ def _admin_sections():
         '("\u5931\u8d25\uff1a"+(j.message||""));'
         'if(j.ok)setTimeout(function(){location.reload();},700);};'
         '</script>')
+    sec_uptoken = (
+        '<div class="panel"><h2>批量上传令牌</h2>'
+        '<div class="kv">上传令牌：<code>'
+        + _esc(_upload_token()) +
+        '</code></div>'
+        '<p style="color:#8b94a7;font-size:13px;line-height:1.7">'
+        '给批量上传脚本用的令牌：第一次运行脚本时会问起，粘贴即可，'
+        '脚本会记住它。重置后旧令牌立即失效，脚本下次运行时需重新输入。'
+        '脚本下载见「上传」页。</p>'
+        '<p><button type="button" id="uptokenreset">'
+        '重置令牌</button> '
+        '<span class="msg" id="uptokenmsg"></span></p></div>')
+    sec_js_uptoken = (
+        '<script>'
+        'async function postJ(u,b){const r=await fetch(u,{method:"POST",'
+        'headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});'
+        'return r.json();}'
+        'document.getElementById("uptokenreset").onclick=async function(){'
+        'if(!confirm("重置后旧令牌立即失效，脚本下次运行时需重新输入。'
+        '继续？"))return;'
+        'const j=await postJ("api/admin/upload-token",{});'
+        'const m=document.getElementById("uptokenmsg");'
+        'm.textContent=j.ok?"已重置，页面刷新中…":'
+        '("失败："+(j.message||""));'
+        'if(j.ok)setTimeout(function(){location.reload();},700);};'
+        '</script>')
     _ai_key, _ai_model, _ai_on = _ai_title_config()
     _ai_batch = _ai_batch_size()
     _ai_stats_rows = []
@@ -8078,6 +8123,7 @@ def _admin_sections():
     return {"videos": sec_videos, "js_videos": sec_js_videos,
             "filecats": sec_filecats, "js_filecats": sec_js_filecats,
             "ext": sec_ext, "js_ext": sec_js_ext,
+            "uptoken": sec_uptoken, "js_uptoken": sec_js_uptoken,
             "novels": sec_novels, "js_novels": sec_js_novels,
             "settings": sec_settings, "js_settings": sec_js_settings}
 
@@ -8154,7 +8200,8 @@ def page_admin_videos(base_href=""):
     s = _admin_sections()
     return _page("管理 · 视频",
                  _admin_topbar("videos") + s["videos"]
-                 + s["js_videos"],
+                 + s["uptoken"]
+                 + s["js_videos"] + s["js_uptoken"],
                  base_href=base_href)
 
 
@@ -9007,6 +9054,15 @@ def application(environ, start_response):
     if path == "/ext" or path.startswith("/ext/"):
         return ext_handle(environ, start_response, params)
 
+    # Script uploads: own token, reached via Caddy at
+    # /vidlib-api/up/* (prefix stripped before it gets here).
+    # Reuses the /api/uploads/* handlers below with token auth.
+    if path == "/up" or path.startswith("/up/"):
+        if not _upload_check(environ, params):
+            return _json(start_response, "404 Not Found", {"ok": False})
+        path = "/api/uploads/" + path[4:]
+        environ["PATH_INFO"] = path
+
     # Phone music clients (Subsonic): the protocol's own
     # credential, reached via Caddy at /vidlib-api/subsonic/*
     # (prefix stripped before it gets here).
@@ -9815,6 +9871,21 @@ def application(environ, start_response):
                 (note, time.time(), row["id"]))
         return _json(start_response, "200 OK", {"ok": True})
 
+    if path == "/api/upload-script" and method == "GET":
+        try:
+            with open(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "upload_script.py"), "rb") as fh:
+                body = fh.read()
+        except OSError:
+            return _json(start_response, "404 Not Found", {"ok": False})
+        start_response("200 OK", [
+            ("Content-Type", "text/x-python; charset=utf-8"),
+            ("Content-Disposition",
+             'attachment; filename="vidlib_upload.py"'),
+            ("Content-Length", str(len(body)))])
+        return [body]
+
     if path == "/api/uploads/check" and method == "POST":
         data = _read_json(environ)
         if isinstance(data, dict) and isinstance(
@@ -10015,6 +10086,13 @@ def application(environ, start_response):
         _save_creds(creds)
         return _json(start_response, "200 OK",
                      {"ok": True, "url": _ext_import_url()})
+
+    if path == "/api/admin/upload-token" and method == "POST":
+        creds = _load_creds()
+        creds["upload_token"] = secrets.token_urlsafe(24)
+        _save_creds(creds)
+        return _json(start_response, "200 OK",
+                     {"ok": True, "token": _upload_token()})
 
     if path == "/api/admin/novel/title-len" and method == "POST":
         data = _read_json(environ)

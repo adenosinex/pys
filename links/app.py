@@ -467,7 +467,9 @@ def handle_projects_create(environ, start_response, kind):
             return _json(start_response, "409 Conflict",
                          {"ok": False, "error": "slug_taken", "message": "该标识已被占用，请换一个。"})
         # The panel bridge runs in its own interpreter next to the panel
-        # (/tmp/apphub-register-bridge.py, written by the installer): it
+        # (/srv/apphub/bin/apphub-register-bridge.py, installed durably;
+        # NEVER in /tmp: the box reboot on 2026-11-13 wiped /tmp and broke
+        # every registration with a bare "未知错误" until this was moved): it
         # imports the panel's own services and registers the project
         # through services.project_manager.create_or_update_project,
         # so registration semantics (code dir, data dir, Caddy site
@@ -480,16 +482,19 @@ def handle_projects_create(environ, start_response, kind):
             import subprocess
             cp = subprocess.run(
                 ["/srv/apphub/envs/panel/bin/python",
-                 "/tmp/apphub-register-bridge.py"],
+                 "/srv/apphub/bin/apphub-register-bridge.py"],
                 env=env, capture_output=True, text=True, timeout=20)
             try:
                 result = json.loads((cp.stdout or "").strip().splitlines()[-1])
             except Exception:
                 result = {}
             if cp.returncode != 0 or not result.get("ok"):
+                detail = result.get("error") or None
+                if not detail and (cp.stderr or "").strip():
+                    detail = (cp.stderr or "").strip().splitlines()[-1]
                 return _json(start_response, "502 Bad Gateway",
                              {"ok": False, "error": "register_failed",
-                              "message": "平台登记失败：" + str(result.get("error") or "未知错误")[:200]})
+                              "message": "平台登记失败：" + str(detail or "未知错误")[:200]})
         except Exception as exc:  # noqa: BLE001
             return _json(start_response, "502 Bad Gateway",
                          {"ok": False, "error": "register_failed",
