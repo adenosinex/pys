@@ -73,13 +73,14 @@
                         <span>:</span>
                         <input type="number" id="startM" placeholder="分" min="0" max="59" inputmode="numeric" oninput="handleStartTimeChange()" onclick="this.select()">
                     </div>
+                    <button onclick="setStartNow()" type="button" style="margin-top:6px;padding:6px 10px;font-size:13px;">设为现在</button>
                 </div>
                 <div class="input-group">
                     <label>当前时间 (修改即联动)</label>
                     <div class="time-boxes">
-                        <input type="number" id="nowH" placeholder="时" min="0" max="23" inputmode="numeric" oninput="calcDiffTime()" onclick="this.select()">
+                        <input type="number" id="nowH" placeholder="时" min="0" max="23" inputmode="numeric" oninput="markTimeTouched(); calcDiffTime()" onclick="this.select()">
                         <span>:</span>
-                        <input type="number" id="nowM" placeholder="分" min="0" max="59" inputmode="numeric" oninput="calcDiffTime()" onclick="this.select()">
+                        <input type="number" id="nowM" placeholder="分" min="0" max="59" inputmode="numeric" oninput="markTimeTouched(); calcDiffTime()" onclick="this.select()">
                     </div>
                 </div>
             </div>
@@ -154,7 +155,45 @@
         }
     }
 
+    let timeTouched = false;
+    function markTimeTouched() { timeTouched = true; }
+    function setStartNow() {
+        const now = new Date();
+        document.getElementById('startH').value = String(now.getHours()).padStart(2, '0');
+        document.getElementById('startM').value = String(now.getMinutes()).padStart(2, '0');
+        handleStartTimeChange();
+    }
+    function startTimeTicker() {
+        setNowTime();
+        setInterval(() => {
+            if (!timeTouched && document.visibilityState === 'visible') setNowTime();
+        }, 60000);
+    }
+    function autoLocateOnLoad() {
+        if (!navigator.geolocation) return;
+        if (projectCsvDataCache.length > 0) { doSilentLocate(); return; }
+        let tries = 0;
+        const iv = setInterval(() => {
+            tries++;
+            if (projectCsvDataCache.length > 0 || tries > 20) {
+                clearInterval(iv);
+                if (projectCsvDataCache.length > 0) doSilentLocate();
+            }
+        }, 500);
+    }
+    function doSilentLocate() {
+        navigator.geolocation.getCurrentPosition(
+            (position) => {
+                const result = matchRouteWithCoordinates(position.coords.latitude, position.coords.longitude);
+                if (result.error) return;
+                document.getElementById('currDist').value = result.matchedKm.toFixed(2);
+            },
+            () => {},
+            { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        );
+    }
     function setNowTime() {
+        timeTouched = false;
         const now = new Date();
         document.getElementById('nowH').value = String(now.getHours()).padStart(2, '0');
         document.getElementById('nowM').value = String(now.getMinutes()).padStart(2, '0');
@@ -525,6 +564,8 @@
                 select.dispatchEvent(new Event('change'));
             }
         }
+        startTimeTicker();
+        autoLocateOnLoad();
     };
 </script>
 </body>
