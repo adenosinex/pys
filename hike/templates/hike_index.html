@@ -472,6 +472,7 @@
             let localBestDistDiff = Infinity;
             const refSpeed = (gpx.avgSpeed && gpx.avgSpeed > 0) ? gpx.avgSpeed : 0;
             
+            const cands = [];
             data.forEach(item => {
                 let distDiff = Math.abs(item.dist - currentDist);
                 // 环线：距离按一圈取模，起点附近也要考虑终点一侧的点
@@ -480,11 +481,28 @@
                 }
                 if (distDiff > 0.5) return;
                 if (item.time <= 0.01) return;
-                const score = refSpeed > 0 ? Math.abs(item.dist / currentTime - refSpeed) : Math.abs((isNaN(item.time) ? Infinity : item.time) - currentTime);
-                if (localBest === null || score < localBestScore || (score === localBestScore && distDiff < localBestDistDiff)) {
-                    localBest = item;
+                cands.push({ item: item, distDiff: distDiff });
+            });
+            // 按基准时间聚类：时间断层超 0.5h 说明是不同的圈/路段，先用速度选簇，再在簇内取距离最近的点
+            const tOf = c => (isNaN(c.item.time) ? Infinity : c.item.time);
+            cands.sort((a, b) => tOf(a) - tOf(b));
+            const clusters = [];
+            cands.forEach(c => {
+                const lastCluster = clusters[clusters.length - 1];
+                if (lastCluster && tOf(c) - tOf(lastCluster[lastCluster.length - 1]) <= 0.5) {
+                    lastCluster.push(c);
+                } else {
+                    clusters.push([c]);
+                }
+            });
+            clusters.forEach(cl => {
+                let rep = cl[0];
+                cl.forEach(c => { if (c.distDiff < rep.distDiff) rep = c; });
+                const score = refSpeed > 0 ? Math.abs(rep.item.dist / currentTime - refSpeed) : Math.abs(tOf(rep) - currentTime);
+                if (localBest === null || score < localBestScore || (score === localBestScore && rep.distDiff < localBestDistDiff)) {
+                    localBest = rep.item;
                     localBestScore = score;
-                    localBestDistDiff = distDiff;
+                    localBestDistDiff = rep.distDiff;
                 }
             });
 
