@@ -142,18 +142,32 @@
         // 只有时和分都填了才缓存
         if (h !== '' && m !== '') {
             const timeStr = String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
-            localStorage.setItem('hike_start_hm', timeStr);
+            const now = new Date();
+            let stamp = new Date(now.getFullYear(), now.getMonth(), now.getDate(), parseInt(h), parseInt(m));
+            if (stamp.getTime() > now.getTime() + 5 * 60000) stamp = new Date(stamp.getTime() - 24 * 3600 * 1000);
+            const dateStr = stamp.getFullYear() + '-' + String(stamp.getMonth() + 1).padStart(2, '0') + '-' + String(stamp.getDate()).padStart(2, '0');
+            localStorage.setItem('hike_start_v2', dateStr + 'T' + timeStr);
             calcDiffTime(); 
         }
     }
 
     function loadTimeStatus() {
-        const startHM = localStorage.getItem('hike_start_hm');
-        if (startHM) {
-            const [h, m] = startHM.split(':');
-            document.getElementById('startH').value = h;
-            document.getElementById('startM').value = m;
+        localStorage.removeItem('hike_start_hm');
+        const raw = localStorage.getItem('hike_start_v2');
+        if (!raw) return;
+        const parts = raw.split('T');
+        if (parts.length !== 2) return;
+        const dp = parts[0].split('-');
+        const tp = parts[1].split(':');
+        if (dp.length !== 3 || tp.length !== 2) return;
+        const stored = new Date(parseInt(dp[0]), parseInt(dp[1]) - 1, parseInt(dp[2]), parseInt(tp[0]), parseInt(tp[1]));
+        const elapsedMs = Date.now() - stored.getTime();
+        if (isNaN(elapsedMs) || elapsedMs < 0 || elapsedMs > 12 * 3600 * 1000) {
+            localStorage.removeItem('hike_start_v2');
+            return;
         }
+        document.getElementById('startH').value = tp[0];
+        document.getElementById('startM').value = tp[1];
     }
 
     let timeTouched = false;
@@ -197,6 +211,10 @@
             if (!silent) setLocStatus('定位：轨迹数据未就绪');
             return false;
         }
+        if (result.deviationKm > 1.0) {
+            setLocStatus('定位：偏离路线 ' + result.deviationKm.toFixed(2) + ' 公里，未填入距离');
+            return false;
+        }
         document.getElementById('currDist').value = result.matchedKm.toFixed(2);
         setLocStatus('定位：已获取 ' + hmNow() + (result.deviationKm > 1.0 ? '（偏离路线 ' + result.deviationKm.toFixed(2) + ' 公里）' : ''));
         tryAutoPredict();
@@ -218,7 +236,8 @@
     function doSilentLocate() {
         navigator.geolocation.getCurrentPosition(
             (position) => {
-                if (applyPosition(position, true)) startWatching();
+                applyPosition(position, true);
+                startWatching();
             },
             (error) => {
                 if (error.code === 1) setLocStatus('定位：未授权，请在浏览器站点设置里允许位置信息');
