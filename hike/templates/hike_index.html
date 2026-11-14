@@ -549,6 +549,32 @@
     }
 
     // ==================== 数据获取与解析 ====================
+    // 裁掉首尾静止段：按实际出发/到达时间算；起点/终点起位移超 50 米才算真正出发/到达，中间静止保留；裁后距离与时间重定零点
+    function trimStationaryEnds(data) {
+        if (data.length < 2) return data;
+        const first = data.find(p => p.lat && p.lon);
+        let last = null;
+        for (let i = data.length - 1; i >= 0; i--) {
+            if (data[i].lat && data[i].lon) { last = data[i]; break; }
+        }
+        if (!first || !last || first === last) return data;
+        let startIdx = -1;
+        for (let i = 0; i < data.length; i++) {
+            const p = data[i];
+            if (p.lat && p.lon && calcHaversine(first.lat, first.lon, p.lat, p.lon) > 0.05) { startIdx = i; break; }
+        }
+        if (startIdx < 0) return data;
+        let endIdx = -1;
+        for (let i = data.length - 1; i >= 0; i--) {
+            const p = data[i];
+            if (p.lat && p.lon && calcHaversine(last.lat, last.lon, p.lat, p.lon) > 0.05) { endIdx = i; break; }
+        }
+        if (endIdx < 0 || endIdx - startIdx < 1) return data;
+        const sliced = data.slice(startIdx, endIdx + 1);
+        const d0 = isNaN(sliced[0].dist) ? 0 : sliced[0].dist;
+        const t0 = isNaN(sliced[0].time) ? 0 : sliced[0].time;
+        return sliced.map(p => ({ lat: p.lat, lon: p.lon, dist: p.dist - d0, time: p.time - t0 }));
+    }
     // 环线：首尾点闭合（0.3km 内）且后半程不大量重合前半程；往返：闭合且大量重合
     function classifyRoute(data) {
         const pts = data.filter(p => p.lat && p.lon);
@@ -598,10 +624,11 @@
                         return { dist: parseFloat(parts[0]), time: parseFloat(parts[1]) };
                     }).filter(item => !isNaN(item.dist));
                     
-                    kind = classifyRoute(parsedData);
-                    const lastPt = parsedData.length > 0 ? parsedData[parsedData.length - 1] : null;
+                    const trimmedData = trimStationaryEnds(parsedData);
+                    kind = classifyRoute(trimmedData);
+                    const lastPt = trimmedData.length > 0 ? trimmedData[trimmedData.length - 1] : null;
                     const avgSpeed = (lastPt && lastPt.time > 0) ? lastPt.dist / lastPt.time : 0;
-                    projectCsvDataCache.push({ name: r.original_name, data: parsedData, isLoop: kind === '环线', avgSpeed: avgSpeed });
+                    projectCsvDataCache.push({ name: r.original_name, data: trimmedData, isLoop: kind === '环线', avgSpeed: avgSpeed });
                 } catch (e) {
                     console.error("缓存 CSV 数据失败:", r.original_name, e);
                 }
