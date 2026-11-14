@@ -46,6 +46,9 @@
         .time-boxes input::-webkit-outer-spin-button,
         .time-boxes input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
         .time-boxes span { font-weight: bold; color: #8e8e93; font-size: 18px; }
+        #trackMapSvg { width: 100%; height: auto; display: block; background: #f7f7fa; border-radius: 8px; }
+        .km-label { font-size: 11px; fill: #666; paint-order: stroke; stroke: #f7f7fa; stroke-width: 3px; }
+        .km-dot { cursor: pointer; }
     </style>
 </head>
 <body>
@@ -110,6 +113,10 @@
             
             <button onclick="predictTimeLocally()">前端离线测算</button>
             <div id="predictResult" class="result-box"></div>
+            <div id="trackMapWrap" style="display:none;margin-top:15px;">
+                <div style="font-size:12px;color:#8e8e93;margin-bottom:6px;">🗺️ 路线示意图（点公里标记可填入距离）</div>
+                <div id="trackMap"></div>
+            </div>
         </div>
 
         <div class="card" id="recordsCard" style="display: none;">
@@ -217,6 +224,8 @@
         }
         document.getElementById('currDist').value = result.matchedKm.toFixed(2);
         setLocStatus('定位：已获取 ' + hmNow() + (result.deviationKm > 1.0 ? '（偏离路线 ' + result.deviationKm.toFixed(2) + ' 公里）' : ''));
+        lastMatchPoint = { lat: position.coords.latitude, lon: position.coords.longitude };
+        renderTrackMap();
         tryAutoPredict();
         return true;
     }
@@ -411,6 +420,8 @@
             alert(`⚠️ 坐标警告：此点距离当前路线最近处有 ${(result.deviationKm).toFixed(2)} 公里，请确认是否偏离路线！`);
         }
         document.getElementById('currDist').value = result.matchedKm.toFixed(2);
+        lastMatchPoint = { lat: coords.lat, lon: coords.lon };
+        renderTrackMap();
         tryAutoPredict();
     }
 
@@ -432,6 +443,8 @@
                 }
                 document.getElementById('currDist').value = result.matchedKm.toFixed(2);
                 setLocStatus('定位：已获取 ' + hmNow());
+                lastMatchPoint = { lat: position.coords.latitude, lon: position.coords.longitude };
+                renderTrackMap();
                 tryAutoPredict();
                 startWatching();
             },
@@ -444,6 +457,70 @@
             },
             { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
         );
+    }
+
+    // ==================== 路线示意图 ====================
+    let lastMatchPoint = null;
+    const MAP_COLORS = ['#007aff', '#34c759', '#ff9500', '#af52de', '#ff3b30', '#00c7be'];
+    function renderTrackMap() {
+        const wrap = document.getElementById('trackMapWrap');
+        const host = document.getElementById('trackMap');
+        if (!wrap || !host) return;
+        const withCoords = projectCsvDataCache.filter(g => g.data.some(p => p.lat && p.lon));
+        if (withCoords.length === 0) { wrap.style.display = 'none'; host.innerHTML = ''; return; }
+        let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+        withCoords.forEach(g => g.data.forEach(p => {
+            if (!p.lat || !p.lon) return;
+            if (p.lat < minLat) minLat = p.lat;
+            if (p.lat > maxLat) maxLat = p.lat;
+            if (p.lon < minLon) minLon = p.lon;
+            if (p.lon > maxLon) maxLon = p.lon;
+        }));
+        if (!isFinite(minLat)) { wrap.style.display = 'none'; return; }
+        const midLat = (minLat + maxLat) / 2 * Math.PI / 180;
+        const kx = Math.cos(midLat) || 1;
+        const W = 560, H = 360, PAD = 28;
+        const spanX = Math.max((maxLon - minLon) * kx, 1e-9);
+        const spanY = Math.max(maxLat - minLat, 1e-9);
+        const scale = Math.min((W - 2 * PAD) / spanX, (H - 2 * PAD) / spanY);
+        const ox = (W - spanX * scale) / 2, oy = (H - spanY * scale) / 2;
+        const X = lon => ox + (lon - minLon) * kx * scale;
+        const Y = lat => oy + (maxLat - lat) * scale;
+        const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        let parts = ['<svg id="trackMapSvg" viewBox="0 0 ' + W + ' ' + H + '" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="路线示意图">'];
+        withCoords.forEach((g, gi) => {
+            const pts = g.data.filter(p => p.lat && p.lon);
+            if (pts.length < 2) return;
+            const color = MAP_COLORS[gi % MAP_COLORS.length];
+            const d = pts.map((p, i) => (i === 0 ? 'M' : 'L') + X(p.lon).toFixed(1) + ' ' + Y(p.lat).toFixed(1)).join(' ');
+            parts.push('<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" opacity="0.85"><title>' + esc(g.name) + '</title></path>');
+        });
+        const base = withCoords[0];
+        const bpts = base.data.filter(p => p.lat && p.lon);
+        const totalKm = bpts.length ? bpts[bpts.length - 1].dist : 0;
+        for (let km = 1; km < totalKm; km++) {
+            let best = null, bestDiff = Infinity;
+            bpts.forEach(p => { const dd = Math.abs(p.dist - km); if (dd < bestDiff) { bestDiff = dd; best = p; } });
+            if (!best) continue;
+            const cx = X(best.lon).toFixed(1), cy = Y(best.lat).toFixed(1);
+            parts.push('<g class="km-dot" data-km="' + km + '" onclick="setDistFromMap(' + km + ')"><circle cx="' + cx + '" cy="' + cy + '" r="11" fill="transparent"/><circle cx="' + cx + '" cy="' + cy + '" r="4" fill="#ffffff" stroke="#007aff" stroke-width="2"/><text class="km-label" x="' + (+cx + 8) + '" y="' + (+cy + 4) + '">' + km + '</text></g>');
+        }
+        if (bpts.length >= 2) {
+            const s = bpts[0], e = bpts[bpts.length - 1];
+            parts.push('<circle cx="' + X(s.lon).toFixed(1) + '" cy="' + Y(s.lat).toFixed(1) + '" r="6" fill="#34c759" stroke="#ffffff" stroke-width="2"><title>起点</title></circle>');
+            parts.push('<circle cx="' + X(e.lon).toFixed(1) + '" cy="' + Y(e.lat).toFixed(1) + '" r="6" fill="#ff3b30" stroke="#ffffff" stroke-width="2"><title>终点</title></circle>');
+        }
+        if (lastMatchPoint && lastMatchPoint.lat && lastMatchPoint.lon) {
+            const cx = X(lastMatchPoint.lon).toFixed(1), cy = Y(lastMatchPoint.lat).toFixed(1);
+            parts.push('<circle cx="' + cx + '" cy="' + cy + '" r="10" fill="#007aff" opacity="0.25"/><circle cx="' + cx + '" cy="' + cy + '" r="5" fill="#007aff" stroke="#ffffff" stroke-width="2"><title>当前位置</title></circle>');
+        }
+        parts.push('</svg>');
+        host.innerHTML = parts.join('');
+        wrap.style.display = 'block';
+    }
+    function setDistFromMap(km) {
+        document.getElementById('currDist').value = km.toFixed(1);
+        tryAutoPredict();
     }
 
     // ==================== 离线前端计算核心逻辑 ====================
@@ -669,6 +746,7 @@
             recordsCard.style.display = 'none';
         }
         onDataReady();
+        renderTrackMap();
     }
 
     // ==================== 基础初始化逻辑 ====================
