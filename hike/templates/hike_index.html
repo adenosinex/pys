@@ -335,6 +335,9 @@
 
     function matchRouteWithCoordinates(userLat, userLon) {
         if (projectCsvDataCache.length === 0) return { error: "当前项目无轨迹数据，无法匹配。" };
+        const elapsed = parseFloat(document.getElementById('currTime').value);
+        const hasElapsed = !isNaN(elapsed) && elapsed > 0;
+        let nearCandidates = [];
         
         let globalClosestDist = Infinity;
         let matchedRouteDistKm = 0;
@@ -347,11 +350,31 @@
                         globalClosestDist = distToPoint;
                         matchedRouteDistKm = point.dist;
                     }
+                    if (distToPoint <= 0.2) {
+                        nearCandidates.push({ dist: distToPoint, km: point.dist, time: point.time });
+                    }
                 }
             });
         });
 
         if (globalClosestDist === Infinity) return { error: "历史轨迹中没有坐标数据。请删除旧项目重传 GPX 文件！" };
+        // 环线/往返/交叉点：同一位置对应多个轨迹点时，用已耗时挑时间最接近的
+        if (hasElapsed && nearCandidates.length > 1) {
+            let best = null;
+            let bestTimeDiff = Infinity;
+            nearCandidates.forEach(c => {
+                const t = isNaN(c.time) ? Infinity : c.time;
+                const td = Math.abs(t - elapsed);
+                if (best === null || td < bestTimeDiff || (td === bestTimeDiff && c.dist < best.dist)) {
+                    bestTimeDiff = td;
+                    best = c;
+                }
+            });
+            if (best !== null) {
+                matchedRouteDistKm = best.km;
+                globalClosestDist = best.dist;
+            }
+        }
         return { matchedKm: matchedRouteDistKm, deviationKm: globalClosestDist };
     }
 
@@ -423,19 +446,29 @@
         projectCsvDataCache.forEach(gpx => {
             const data = gpx.data;
             if (data.length === 0 || data[data.length-1].dist < currentDist) return;
+            const totalDist = data[data.length-1].dist;
 
             let localBest = null;
-            let localMinDist = Infinity;
+            let localBestTimeDiff = Infinity;
+            let localBestDistDiff = Infinity;
             
             data.forEach(item => {
                 let distDiff = Math.abs(item.dist - currentDist);
-                if (distDiff < localMinDist) {
-                    localMinDist = distDiff;
+                // 环线：距离按一圈取模，起点附近也要考虑终点一侧的点
+                if (gpx.isLoop && totalDist > 0) {
+                    distDiff = Math.min(distDiff, Math.abs(item.dist - currentDist - totalDist), Math.abs(item.dist - currentDist + totalDist));
+                }
+                if (distDiff > 0.5) return;
+                const t = isNaN(item.time) ? Infinity : item.time;
+                const timeDiff = Math.abs(t - currentTime);
+                if (localBest === null || timeDiff < localBestTimeDiff || (timeDiff === localBestTimeDiff && distDiff < localBestDistDiff)) {
                     localBest = item;
+                    localBestTimeDiff = timeDiff;
+                    localBestDistDiff = distDiff;
                 }
             });
 
-            if (!localBest || localMinDist > 0.5 || localBest.time <= 0.01) return;
+            if (!localBest || localBest.time <= 0.01) return;
 
             let timeDiff = Math.abs(currentTime - localBest.time);
             if (timeDiff < globalMinDiff) {
@@ -478,6 +511,27 @@
     }
 
     // ==================== 数据获取与解析 ====================
+    // 环线：首尾点闭合（0.3km 内）且后半程不大量重合前半程；往返：闭合且大量重合
+    function classifyRoute(data) {
+        const pts = data.filter(p => p.lat && p.lon);
+        if (pts.length < 10) return '';
+        const first = pts[0];
+        const last = pts[pts.length - 1];
+        const totalDist = data[data.length - 1].dist;
+        if (isNaN(totalDist) || totalDist < 1) return '';
+        if (calcHaversine(first.lat, first.lon, last.lat, last.lon) > 0.3) return '';
+        const half = Math.floor(pts.length / 2);
+        let near = 0;
+        let sampled = 0;
+        for (let i = half; i < pts.length; i += 10) {
+            sampled++;
+            for (let j = 0; j < half; j += 10) {
+                if (calcHaversine(pts[i].lat, pts[i].lon, pts[j].lat, pts[j].lon) <= 0.05) { near++; break; }
+            }
+        }
+        if (sampled > 0 && near / sampled > 0.3) return '往返';
+        return '环线';
+    }
     async function loadProjectRecords(projectId) {
         const res = await fetch(`${API_PREFIX}/projects/${projectId}/records`);
         const records = await res.json();
@@ -491,14 +545,8 @@
         if (records.length > 0) {
             recordsCard.style.display = 'block';
             for (const r of records) {
-                listUi.innerHTML += `
-                    <li class="file-item">
-                        <div style="display: flex; flex-direction: column;">
-                            <span>${r.original_name}</span>
-                            <span style="font-size: 12px; color: #8e8e93; margin-top: 4px;">缓存就绪 | ${r.size_formatted}</span>
-                        </div>
-                    </li>`;
                 
+                let kind = '';
                 try {
                     const csvRes = await fetch(`${API_PREFIX}/csv/${r.id}`);
                     const csvText = await csvRes.text();
@@ -512,10 +560,18 @@
                         return { dist: parseFloat(parts[0]), time: parseFloat(parts[1]) };
                     }).filter(item => !isNaN(item.dist));
                     
-                    projectCsvDataCache.push({ name: r.original_name, data: parsedData });
+                    kind = classifyRoute(parsedData);
+                    projectCsvDataCache.push({ name: r.original_name, data: parsedData, isLoop: kind === '环线' });
                 } catch (e) {
                     console.error("缓存 CSV 数据失败:", r.original_name, e);
                 }
+                listUi.innerHTML += `
+                    <li class="file-item">
+                        <div style="display: flex; flex-direction: column;">
+                            <span>${r.original_name}</span>
+                            <span style="font-size: 12px; color: #8e8e93; margin-top: 4px;">${kind ? '缓存就绪 · ' + kind + ' | ' : '缓存就绪 | '}${r.size_formatted}</span>
+                        </div>
+                    </li>`;
             }
         } else {
             recordsCard.style.display = 'none';
