@@ -575,6 +575,30 @@
         const t0 = isNaN(sliced[0].time) ? 0 : sliced[0].time;
         return sliced.map(p => ({ lat: p.lat, lon: p.lon, dist: p.dist - d0, time: p.time - t0 }));
     }
+    // 均匀补齐断点：相邻两点时间间隔超 60 秒时，按 30 秒一格线性插值补点（位置/距离/时间均匀过渡）；断点之外的数值不受影响
+    function fillTimeGaps(data) {
+        if (data.length < 2) return data;
+        const out = [data[0]];
+        for (let i = 1; i < data.length; i++) {
+            const prev = data[i - 1];
+            const cur = data[i];
+            const dt = cur.time - prev.time;
+            if (isFinite(dt) && dt > 60 / 3600) {
+                const n = Math.min(Math.floor(dt * 3600 / 30), 120);
+                for (let k = 1; k <= n; k++) {
+                    const f = k / (n + 1);
+                    out.push({
+                        lat: (prev.lat !== undefined && cur.lat !== undefined) ? prev.lat + (cur.lat - prev.lat) * f : prev.lat,
+                        lon: (prev.lon !== undefined && cur.lon !== undefined) ? prev.lon + (cur.lon - prev.lon) * f : prev.lon,
+                        dist: prev.dist + (cur.dist - prev.dist) * f,
+                        time: prev.time + (cur.time - prev.time) * f,
+                    });
+                }
+            }
+            out.push(cur);
+        }
+        return out;
+    }
     // 环线：首尾点闭合（0.3km 内）且后半程不大量重合前半程；往返：闭合且大量重合
     function classifyRoute(data) {
         const pts = data.filter(p => p.lat && p.lon);
@@ -625,10 +649,11 @@
                     }).filter(item => !isNaN(item.dist));
                     
                     const trimmedData = trimStationaryEnds(parsedData);
-                    kind = classifyRoute(trimmedData);
-                    const lastPt = trimmedData.length > 0 ? trimmedData[trimmedData.length - 1] : null;
+                    const filledData = fillTimeGaps(trimmedData);
+                    kind = classifyRoute(filledData);
+                    const lastPt = filledData.length > 0 ? filledData[filledData.length - 1] : null;
                     const avgSpeed = (lastPt && lastPt.time > 0) ? lastPt.dist / lastPt.time : 0;
-                    projectCsvDataCache.push({ name: r.original_name, data: trimmedData, isLoop: kind === '环线', avgSpeed: avgSpeed });
+                    projectCsvDataCache.push({ name: r.original_name, data: filledData, isLoop: kind === '环线', avgSpeed: avgSpeed });
                 } catch (e) {
                     console.error("缓存 CSV 数据失败:", r.original_name, e);
                 }
