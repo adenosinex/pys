@@ -6,6 +6,7 @@ PAGES = {
     'docs': r'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+<link rel="icon" href="/assets/logos/docsnew">
 <script>window.API_BASE = location.pathname.replace(/\/[^/]*$/, "");</script>
     <meta charset="UTF-8">
     <meta
@@ -527,7 +528,12 @@ button:focus-visible, [role="button"]:focus-visible { outline: 2px solid #817cf5
 .header-search .el-input__wrapper:hover { background: #f2f4fa; }
 .search-shortcut { padding: 3px 5px; font-size: 10px; border: 1px solid #e3e7f0; background: white; color: #a0a9bd; border-radius: 5px; }
 .header-actions { flex-shrink: 0; gap: 16px; }
-.header-actions .el-switch__label { font-size: 12px; color: #707a91; }
+.console-section { margin-bottom: 20px; }
+.console-section:last-child { margin-bottom: 0; }
+.console-title { font-weight: 600; font-size: 14px; color: #222; margin-bottom: 4px; }
+.console-desc { font-size: 12px; color: #778; margin: 0 0 10px; line-height: 1.6; }
+.console-file { display: block; margin: 10px 0; font-size: 12px; color: #778; }
+.console-msg { font-size: 12px; color: #2c7a3f; margin-top: 8px; min-height: 16px; }
 .header-create { border-radius: 9px; padding-inline: 14px; }
 .workspace-body { min-height: 0; }
 .document-sidebar { background: #fbfcff; border-right: 1px solid var(--ui-line); box-shadow: 1px 0 0 #f7f8fc; }
@@ -558,6 +564,7 @@ button:focus-visible, [role="button"]:focus-visible { outline: 2px solid #817cf5
 .empty-small { padding:28px 12px; color:#99a4b5; display:flex; flex-direction:column; align-items:center; gap:7px; text-align:center; font-size:12px; }
 .empty-small .el-icon { font-size:27px; color:#bfc6d7; }
 .empty-small small { color:#adb5c4; font-size:10px; }
+.list-more { padding:10px 0 8px; color:#99a4b5; text-align:center; font-size:11px; cursor:pointer; }
 .editor-main { background:#fff; }
 .editor-empty { background: radial-gradient(ellipse at 50% 30%, #f3f2ff 0%, #ffffff 58%); padding:30px; }
 .empty-hero { display:flex; flex-direction:column; align-items:center; max-width:550px; text-align:center; }
@@ -572,6 +579,11 @@ button:focus-visible, [role="button"]:focus-visible { outline: 2px solid #817cf5
 .editor-toolbar .rename-hint { color:#aab2c3; font-size:10px; }
 .editor-toolbar .el-button--success { --el-button-bg-color: #4f46e5; --el-button-border-color: #4f46e5; --el-button-hover-bg-color: #6259e6; --el-button-hover-border-color: #6259e6; --el-button-active-bg-color: #4338ca; --el-button-active-border-color: #4338ca; }
 .editor-canvas { background:#ffffff; }
+.switching-overlay { position:absolute; inset:0; z-index:30; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; background:rgba(255,255,255,0.72); pointer-events:none; }
+.switching-bar { width:180px; height:4px; border-radius:2px; background:#e2e8f0; overflow:hidden; }
+.switching-bar-fill { width:40%; height:100%; border-radius:2px; background:#3b82f6; animation:switching-slide 1s ease-in-out infinite; }
+@keyframes switching-slide { 0% { transform:translateX(-100%); } 100% { transform:translateX(250%); } }
+.switching-text { font-size:12px; color:#64748b; }
 .vditor { border:none !important; }
 .vditor-toolbar { padding:7px 14px !important; min-height:44px; background:#fff !important; border-bottom:1px solid var(--ui-line) !important; }
 .vditor-toolbar__item { border-radius:6px; }
@@ -615,7 +627,7 @@ button:focus-visible, [role="button"]:focus-visible { outline: 2px solid #817cf5
 .mobile-nav-item.active { color:var(--ui-brand); }
 @media (min-width:769px) and (max-width:1160px) {
   .brand-section { min-width:210px; }
-  .brand-copy span,.header-sync,.auto-ai-switch,.rename-hint { display:none !important; }
+  .brand-copy span,.header-sync,.rename-hint { display:none !important; }
   .inspector-aside { width:250px; min-width:250px; max-width:250px; }
   .document-aside { width:260px; min-width:260px; max-width:260px; }
   .timeline-aside { width:345px; min-width:345px; max-width:345px; }
@@ -625,7 +637,7 @@ button:focus-visible, [role="button"]:focus-visible { outline: 2px solid #817cf5
   .brand-section { min-width:0; flex:1; gap:9px; }
   .brand-icon { width:33px; height:33px; font-size:18px; border-radius:10px; }
   .brand-copy strong { font-size:13px; }
-  .brand-copy span,.header-sync,.auto-ai-switch { display:none !important; }
+  .brand-copy span,.header-sync { display:none !important; }
   .header-actions { gap:6px; }
   .header-search { width:100% !important; max-width:none; flex:none; order:3; }
   .header-search .el-input__wrapper { min-height:36px; }
@@ -693,7 +705,7 @@ button:focus-visible, [role="button"]:focus-visible { outline: 2px solid #817cf5
             </el-input>
         </div>
         <div class="header-actions flex items-center gap-2">
-            <el-switch v-model="autoAiTags" active-text="静默 AI 补全" size="small" class="auto-ai-switch"></el-switch>
+            <el-button class="header-console" size="small" plain @click="consoleDialogVisible = true">控制台</el-button>
             <el-button v-if="isMobile" type="primary" circle @click="createNew" aria-label="新建笔记">
                 <el-icon><plus></plus></el-icon>
             </el-button>
@@ -702,6 +714,22 @@ button:focus-visible, [role="button"]:focus-visible { outline: 2px solid #817cf5
             </el-button>
         </div>
     </header>
+
+    <el-dialog v-model="consoleDialogVisible" title="控制台" width="min(420px, 92vw)">
+        <div class="console-section">
+            <div class="console-title">AI 控制台</div>
+            <p class="console-desc">批量生成摘要、分类标题、管理 AI 凭据。</p>
+            <el-button type="primary" @click="goAiConsole">打开 AI 控制台</el-button>
+        </div>
+        <div class="console-section">
+            <div class="console-title">数据备份</div>
+            <p class="console-desc">导出为 zip（整个笔记目录）。导入只新增文件，同名笔记不会被覆盖。</p>
+            <el-button @click="exportBackup">导出 zip 备份</el-button>
+            <input ref="backupFileInput" type="file" accept=".zip,application/zip" class="console-file">
+            <el-button @click="importBackup" :loading="backupBusy">导入所选 zip</el-button>
+            <div class="console-msg">{{ backupMsg }}</div>
+        </div>
+    </el-dialog>
 
 
     <!-- =========================================================
@@ -746,7 +774,9 @@ button:focus-visible, [role="button"]:focus-visible { outline: 2px solid #817cf5
                  ================================================= -->
             <div
                 v-if="sidebarMode === 'docs'"
-                class="flex-1 overflow-y-auto p-2">
+                ref="docsListEl"
+                class="flex-1 overflow-y-auto p-2"
+                @scroll="onDocsListScroll">
 
                 <template v-if="searchQuery.trim()">
 
@@ -834,6 +864,10 @@ button:focus-visible, [role="button"]:focus-visible { outline: 2px solid #817cf5
 
                     </div>
                     <div v-if="documents.length === 0" class="empty-small"><el-icon><document></document></el-icon><span>还没有笔记</span><small>点击“快速记录”开始</small></div>
+                    <div v-if="documents.length > 0 && documents.length < totalCount" class="list-more" @click="loadMoreDocuments">
+                        <span v-if="listLoading">加载中…</span>
+                        <span v-else>已加载 {{ documents.length }} / {{ totalCount }} 篇</span>
+                    </div>
                 </template>
 
             </div>
@@ -1376,6 +1410,10 @@ button:focus-visible, [role="button"]:focus-visible { outline: 2px solid #817cf5
 
                 <div class="flex-1 overflow-hidden relative editor-canvas">
                     <div id="vditor-container" class="absolute inset-0"></div>
+                    <div v-if="switchingDoc" class="switching-overlay">
+                        <div class="switching-bar"><div class="switching-bar-fill"></div></div>
+                        <div class="switching-text">切换中 · {{ switchElapsed }}</div>
+                    </div>
                 </div>
                 <div class="editor-statusbar" aria-live="polite">
                     <span class="status-indicator" :class="{ 'status-error': saveStatus === '保存失败', 'status-dirty': dirty }"></span>
@@ -1708,6 +1746,9 @@ const app = createApp({
         const documents = ref([]);
         const totalCount = ref(0);
         let listSeq = 0;
+        const listLoading = ref(false);
+        const listOffset = ref(0);
+        const docsListEl = ref(null);
         const searchResults = ref([]);
         const searchQuery = ref('');
         const activeDocId = ref('');
@@ -1726,6 +1767,28 @@ const app = createApp({
         const saving = ref(false);
         const syncing = ref(false);
         const isSearching = ref(false);
+        const switchingDoc = ref(false);
+        const switchElapsed = ref('0.0s');
+        let switchStart = 0;
+        let switchRevealTimer = null;
+        let switchTickTimer = null;
+        const showSwitching = () => {
+            clearTimeout(switchRevealTimer);
+            clearInterval(switchTickTimer);
+            switchStart = performance.now();
+            switchElapsed.value = '0.0s';
+            switchRevealTimer = setTimeout(() => {
+                switchingDoc.value = true;
+                switchTickTimer = setInterval(() => {
+                    switchElapsed.value = ((performance.now() - switchStart) / 1000).toFixed(1) + 's';
+                }, 100);
+            }, 300);
+        };
+        const hideSwitching = () => {
+            clearTimeout(switchRevealTimer);
+            clearInterval(switchTickTimer);
+            switchingDoc.value = false;
+        };
         const renaming = ref(false);
         const clipboardTitleLoading = ref(false);
         const deleting = ref(false);
@@ -1733,14 +1796,6 @@ const app = createApp({
         const aiLoading = ref(false);
         const generatedTags = ref([]);
         const isFocusMode = ref(false);
-        const autoAiTags = ref(localStorage.getItem('autoAiTags') === 'true');
-        watch(autoAiTags, value => {
-            localStorage.setItem('autoAiTags', value);
-            if (value)
-                scheduleAutoAiTags();
-            else
-                clearTimeout(autoAiTimer);
-        });
         const dirty = ref(false);
         let saveTimer = null;
         let saveSequence = 0;
@@ -1770,38 +1825,56 @@ const app = createApp({
         let vditorInstance = null;
         let isVditorReady = false;
         let searchTimer = null;
-        let autoAiTimer = null;
-        let autoAiRunning = false;
-        const scheduleAutoAiTags = (delay = 5000) => {
-            clearTimeout(autoAiTimer);
-            if (!autoAiTags.value || autoAiRunning)
+        const consoleDialogVisible = ref(false);
+        const backupFileInput = ref(null);
+        const backupMsg = ref('');
+        const backupBusy = ref(false);
+        const goAiConsole = () => {
+            window.open(API_BASE + '/ai', '_blank', 'noopener');
+            consoleDialogVisible.value = false;
+        };
+        const exportBackup = async () => {
+            backupMsg.value = '';
+            try {
+                const response = await fetch(API_BASE + '/docapi/export', { cache: 'no-store' });
+                if (!response.ok)
+                    throw new Error(`HTTP ${response.status}`);
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(await response.blob());
+                a.download = 'docsnew-backup.zip';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                backupMsg.value = '备份已导出。';
+            }
+            catch (error) {
+                backupMsg.value = '导出失败：' + error.message;
+            }
+        };
+        const importBackup = async () => {
+            const file = backupFileInput.value?.files?.[0];
+            if (!file) {
+                backupMsg.value = '请先选择 zip 文件';
                 return;
-            autoAiTimer = setTimeout(async () => {
-                if (!autoAiTags.value || autoAiRunning)
-                    return;
-                autoAiRunning = true;
-                try {
-                    const response = await fetch(API_BASE + '/docapi/ai/batch_tags', { method: 'POST' });
-                    if (!response.ok)
-                        throw new Error(`HTTP ${response.status}`);
-                    const result = await response.json();
-                    if (result.processed > 0) {
-                        await fetchDocuments();
-                        if (activeDocId.value) {
-                            const item = documents.value.find(d => d.id === activeDocId.value);
-                            if (item)
-                                activeDocMeta.value = { ...activeDocMeta.value, tags: item.tags, tags_cache: item.tags_cache };
-                            fetchRelated(activeDocId.value);
-                        }
-                    }
-                }
-                catch (error) {
-                    console.warn('后台 AI 补全未完成：', error);
-                }
-                finally {
-                    autoAiRunning = false;
-                }
-            }, delay);
+            }
+            backupBusy.value = true;
+            try {
+                const response = await fetch(API_BASE + '/docapi/import', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/zip' },
+                    body: await file.arrayBuffer()
+                });
+                const data = await response.json();
+                if (!data.ok)
+                    throw new Error(data.error || '导入失败');
+                backupMsg.value = `导入完成：新增 ${data.added}，跳过 ${data.skipped}（同名不覆盖）。刷新页面查看。`;
+            }
+            catch (error) {
+                backupMsg.value = '导入失败：' + error.message;
+            }
+            finally {
+                backupBusy.value = false;
+            }
         };
         const getTimelineTimestamp = doc => {
             if (timelineTimeField.value ===
@@ -1999,6 +2072,9 @@ title: ${JSON.stringify(title)}
             if (index === -1) {
                 return;
             }
+            if (documents.value[index].title === title) {
+                return;
+            }
             documents.value[index] = {
                 ...documents.value[index],
                 title
@@ -2019,6 +2095,7 @@ title: ${JSON.stringify(title)}
                 documents.value.unshift({
                     ...meta
                 });
+                totalCount.value += 1;
             }
         };
         const pinnedDocs = computed(() => documents.value.filter(doc => doc.is_pinned === 1));
@@ -2109,6 +2186,18 @@ title: ${JSON.stringify(title)}
             clearTimeout(searchTimer);
             searchTimer =
                 setTimeout(forceSearch, 400);
+        });
+        watch(sidebarMode, mode => {
+            if (mode !== 'docs') {
+                if (documents.value.length < totalCount.value) {
+                    fetchDocuments();
+                }
+            }
+            else {
+                nextTick(() => {
+                    fillListViewport();
+                });
+            }
         });
         const calendarMonth = computed(() => {
             const date = new Date(timelineCursor.value);
@@ -2307,6 +2396,7 @@ title: ${JSON.stringify(title)}
                 const data = await response.json();
                 documents.value = data.docs || [];
                 totalCount.value = data.total || documents.value.length;
+                listOffset.value = documents.value.length;
             }
             catch (error) {
                 console.error('加载文档失败:', error);
@@ -2315,6 +2405,7 @@ title: ${JSON.stringify(title)}
         };
         const fetchDocumentsPaged = async () => {
             const seq = ++listSeq;
+            listLoading.value = true;
             try {
                 const first = await fetch(API_BASE + '/docapi/documents?limit=40&offset=0');
                 if (!first.ok) throw new Error(`HTTP ${first.status}`);
@@ -2322,32 +2413,69 @@ title: ${JSON.stringify(title)}
                 if (seq !== listSeq) return;
                 documents.value = head.docs || [];
                 totalCount.value = head.total || documents.value.length;
-                let offset = documents.value.length;
-                const total = totalCount.value;
-                while (offset < total) {
-                    if (seq !== listSeq) return;
-                    const res = await fetch(API_BASE + '/docapi/documents?limit=250&offset=' + offset);
-                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                    const page = await res.json();
-                    if (seq !== listSeq) return;
-                    const seen = new Set(documents.value.map(d => d.id));
-                    for (const d of (page.docs || [])) {
-                        if (!seen.has(d.id)) documents.value.push(d);
-                    }
-                    if (!page.docs || page.docs.length === 0) break;
-                    offset += page.docs.length;
-                    await new Promise(r => setTimeout(r, 0));
-                }
-                if (seq === listSeq) {
-                    documents.value = documents.value.slice().sort((a, b) => {
-                        if (b.is_pinned !== a.is_pinned) return b.is_pinned - a.is_pinned;
-                        return b.update_time - a.update_time;
-                    });
-                }
+                listOffset.value = documents.value.length;
             }
             catch (error) {
                 console.error('加载文档失败:', error);
                 if (documents.value.length === 0) ElementPlus.ElMessage.error('文档列表加载失败');
+            }
+            finally {
+                if (seq === listSeq) listLoading.value = false;
+            }
+        };
+        const loadMoreDocuments = async () => {
+            if (listLoading.value) {
+                return;
+            }
+            if (totalCount.value > 0 && documents.value.length >= totalCount.value) {
+                return;
+            }
+            const seq = listSeq;
+            listLoading.value = true;
+            try {
+                const res = await fetch(API_BASE + '/docapi/documents?limit=100&offset=' + listOffset.value);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const page = await res.json();
+                if (seq !== listSeq) return;
+                const seen = new Set(documents.value.map(d => d.id));
+                for (const d of (page.docs || [])) {
+                    if (!seen.has(d.id)) documents.value.push(d);
+                }
+                if (page.total) totalCount.value = page.total;
+                listOffset.value += (page.docs || []).length;
+                if (!page.docs || page.docs.length === 0) {
+                    totalCount.value = documents.value.length;
+                }
+                documents.value = documents.value.slice().sort((a, b) => {
+                    if (b.is_pinned !== a.is_pinned) return b.is_pinned - a.is_pinned;
+                    return b.update_time - a.update_time;
+                });
+                await nextTick();
+                fillListViewport();
+            }
+            catch (error) {
+                console.error('加载更多文档失败:', error);
+            }
+            finally {
+                if (seq === listSeq) listLoading.value = false;
+            }
+        };
+        const fillListViewport = () => {
+            const el = docsListEl.value;
+            if (!el) {
+                return;
+            }
+            if (el.scrollHeight <= el.clientHeight + 240) {
+                loadMoreDocuments();
+            }
+        };
+        const onDocsListScroll = event => {
+            if (searchQuery.value.trim()) {
+                return;
+            }
+            const el = event.target;
+            if (el.scrollTop + el.clientHeight >= el.scrollHeight - 240) {
+                loadMoreDocuments();
             }
         };
         const fetchRelated = async (id) => {
@@ -2431,8 +2559,6 @@ title: ${JSON.stringify(title)}
                             hour12: false
                         })}`;
                 }
-                if (autoAiTags.value)
-                    scheduleAutoAiTags();
                 return true;
             }
             catch (error) {
@@ -2560,7 +2686,8 @@ title: ${JSON.stringify(title)}
                         handleInput();
                         if (activeDocId.value) {
                             const title = parseTitleFromContent(value);
-                            if (title) {
+                            if (title &&
+                                title !== activeDocMeta.value.title) {
                                 syncCurrentTitleToList(title);
                                 activeDocMeta.value = {
                                     ...activeDocMeta.value,
@@ -2627,11 +2754,13 @@ tags:
             }
         };
         const loadDocument = async (id) => {
+            showSwitching();
             if ((activeDocId.value && activeDocId.value !== id) ||
                 isCreating.value) {
                 const success = await flushCurrentDocument();
                 if (!success) {
                     ElementPlus.ElMessage.error('当前文章保存失败，已取消切换');
+                    hideSwitching();
                     return;
                 }
             }
@@ -2671,6 +2800,7 @@ tags:
                 }
                 nextTick(() => {
                     initOrUpdateVditor(editorContent.value);
+                    hideSwitching();
                 });
                 fetchRelated(id);
                 if (isMobile.value) {
@@ -2681,6 +2811,7 @@ tags:
             catch (error) {
                 console.error('加载文档失败:', error);
                 ElementPlus.ElMessage.error('文档加载失败');
+                hideSwitching();
             }
         };
         const loadDocumentFromTimeline = async (id) => {
@@ -2959,7 +3090,7 @@ tags:
                 }
                 const data = await response.json();
                 if (data.tags?.includes('API_KEY_MISSING')) {
-                    throw new Error('未配置 OP_API_KEY，无法生成 AI 标签');
+                    throw new Error('未配置 OP_API_KEY，请在 AI 控制台凭据区配置');
                 }
                 if (data.tags?.includes('AI_ERROR')) {
                     throw new Error('AI 服务暂时不可用');
@@ -3077,6 +3208,13 @@ tags:
             updateIsMobile();
             window.addEventListener('keydown', handleGlobalKeyDown);
             await fetchDocumentsPaged();
+            await nextTick();
+            fillListViewport();
+            if (documents.value.length > 0) {
+                const newest = documents.value.reduce((a, b) =>
+                    (b.update_time > a.update_time ? b : a));
+                await loadDocument(newest.id);
+            }
         });
         onUnmounted(() => {
             window.removeEventListener('keydown', handleGlobalKeyDown);
@@ -3084,7 +3222,6 @@ tags:
             window.removeEventListener('beforeunload', handleBeforeUnload);
             clearTimeout(saveTimer);
             clearTimeout(searchTimer);
-            clearTimeout(autoAiTimer);
             vditorInstance?.destroy?.();
         });
         return {
@@ -3100,6 +3237,8 @@ tags:
             saving,
             syncing,
             isSearching,
+            switchingDoc,
+            switchElapsed,
             renaming,
             clipboardTitleLoading,
             deleting,
@@ -3108,7 +3247,13 @@ tags:
             aiLoading,
             generatedTags,
             isFocusMode,
-            autoAiTags,
+            consoleDialogVisible,
+            backupFileInput,
+            backupMsg,
+            backupBusy,
+            goAiConsole,
+            exportBackup,
+            importBackup,
             isMobile,
             mobileView,
             sidebarMode,
@@ -3160,7 +3305,12 @@ tags:
             selectCalendarDay,
             toggleTimelinePanel,
             flushAndBack,
-            formatTimelineTime
+            formatTimelineTime,
+            docsListEl,
+            listLoading,
+            totalCount,
+            onDocsListScroll,
+            loadMoreDocuments
         };
     }
 });
@@ -3219,6 +3369,7 @@ app.mount('#app');
     'view': r'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+<link rel="icon" href="/assets/logos/docsnew">
     <meta charset="UTF-8">
     <meta name="viewport"
           content="width=device-width, initial-scale=1.0, viewport-fit=cover">

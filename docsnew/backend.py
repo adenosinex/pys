@@ -76,7 +76,7 @@ TRASH_DIR = DOCS_DIR + "_trash"  # 保持回收站在扫描目录之外
 # always wins over the in-app store.
 
 CRED_FILE = os.path.join(os.path.dirname(DOCS_DIR), "credentials.json")
-CRED_KEYS = ("OP_API_KEY", "LOCAL_API_KEY")
+CRED_KEYS = ("OP_API_KEY", "LOCAL_API_KEY", "APPLE_SYNC_CODE", "CF_MIRROR_PASSPHRASE")
 
 
 def _cred_values():
@@ -699,6 +699,7 @@ def search_documents():
                     found.append(dict(item))
             except OSError:
                 logger.debug("搜索时文档不可读: %s", item["id"])
+    found.sort(key=lambda d: d.get("update_time") or 0, reverse=True)
     return jsonify({"results": found})
 
 

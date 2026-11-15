@@ -85,38 +85,6 @@ def _display_model(cfg: dict) -> str:
     return cfg.get("openrouter_model", "")
 
 
-def _normalize_flash_summary(text: str) -> str:
-    """Flash 专属输出归一化：只修格式，不改内容。
-
-    实测 Flash 有三处与已存摘要格式不一致（见 2026-11-14 对比）：
-    1) 主题行缺 ** —— 摘要识别依赖 **，缺了会重复生成；
-    2) 主题行末尾带句号等句末标点；
-    3) 关键句段内带 "1. " 序号。
-    只对 Flash 路径生效，openrouter/local 的输出原样不动。
-    """
-    topic_tag = _LB + "主题" + _RB
-    key_tag = _LB + "关键句" + _RB
-    end_tag = _LB + "结论" + _RB
-    lines = text.split("\n")
-    first_idx = next((i for i, ln in enumerate(lines) if ln.strip()), None)
-    if first_idx is not None:
-        line = lines[first_idx]
-        stripped = line.strip()
-        if stripped.startswith(topic_tag):
-            if not re.match(r"^" + re.escape(topic_tag) + r"\s*\*\*", stripped):
-                line = line.replace(topic_tag, topic_tag + "** ", 1)
-            lines[first_idx] = line.rstrip().rstrip("。？！；!?.")
-    in_key = False
-    for i, ln in enumerate(lines):
-        if key_tag in ln:
-            in_key = True
-            continue
-        if end_tag in ln:
-            in_key = False
-        if in_key:
-            lines[i] = re.sub(r"^\s*\d+[.、]\s*", "", ln)
-    return "\n".join(lines)
-
 # 脚本里本地模型的保守并发上限（本地端点弱于云端）。
 _LOCAL_CONCURRENCY_CAP = {"process": 2}
 
@@ -220,6 +188,15 @@ AI_PROMPT = r"""
 
 原始笔记：
 """
+
+# Flash 专属格式提示（只对 provider=flash 生效）：共享 Prompt 逐字不动，
+# 这段只追加给 Flash，替代已删除的代码归一化（2026-11-14 三篇实测 4/4 全过）。
+FLASH_FORMAT_NOTE = (
+    "\n格式自查（输出前逐项核对，必须全部满足）：\n"
+    "1. 第一行必须是 " + _LB + "主题" + _RB + "** 标题：标签后紧跟 ** 与一个空格，"
+    "标题末尾不加句号、问号、感叹号、分号等任何标点。\n"
+    "2. " + _LB + "关键句" + _RB + " 段内不要加 1. 2. 之类序号。\n"
+)
 
 CLASSIFY_SYSTEM_PROMPT = (
    '''【输出要求】
@@ -513,6 +490,9 @@ def parse_classification(text: str) -> Tuple[str, str, str]:
         raise RuntimeError("AI 返回为空")
     m = CODE_RE.search(first_line)
     if not m:
+        # 模型按 prompt 输出 bare unk（无法判断）时记为哨兵，由分类阶段转为跳过并记住。
+        if re.match(r"(?i)^unk\b", first_line.strip()):
+            return "unk", "", ""
         raise RuntimeError(f"无法从 AI 返回中解析分类代号：{first_line[:200]}")
     code1 = m.group(1).lower()
     code2 = m.group(2).lower()
@@ -651,16 +631,16 @@ class AIClient:
 
     def summarize(self, note_text: str) -> str:
         note_text = note_text[: int(self.cfg["max_input_chars"])]
-        text = self.chat(
+        user_prompt = AI_PROMPT + "\n" + note_text
+        if self.cfg.get("provider") == "flash":
+            user_prompt = AI_PROMPT + FLASH_FORMAT_NOTE + "\n" + note_text
+        return self.chat(
             [
                 {"role": "system", "content": AI_SYSTEM_PROMPT},
-                {"role": "user", "content": AI_PROMPT + "\n" + note_text},
+                {"role": "user", "content": user_prompt},
             ],
             0.2,
         )
-        if self.cfg.get("provider") == "flash":
-            text = _normalize_flash_summary(text)
-        return text
 
     def classify(self, title: str, snippet: str) -> Tuple[str, str, str]:
         user_prompt = (
@@ -686,6 +666,25 @@ def _list_items() -> list:
     with backend.INDEX_LOCK:
         return sorted((dict(d) for d in backend.FILE_INDEX.values()),
                       key=lambda d: (d["is_pinned"], d["update_time"]), reverse=True)
+
+
+def _scan_days(opts: dict) -> int:
+    """扫描范围天数：0/缺失/非法 = 全部。"""
+    try:
+        days = int(opts.get("scan_days") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return days if days > 0 else 0
+
+
+def _filter_recent(items, days: int):
+    """只保留 update_time 在最近 days 天内的文档；days=0 不过滤。
+
+    在读正文之前按索引元数据过滤，被滤掉的文档完全不参与扫描。"""
+    if not days:
+        return items
+    cutoff = time.time() - days * 86400
+    return [it for it in items if (it.get("update_time") or 0) >= cutoff]
 
 
 def _read_doc(doc_id: str):
@@ -820,6 +819,8 @@ def _classify_phase(content, item, ai, force, title_style, log):
     log("  [分类] 基础标题：" + base_title)
     log("  [分类] 调用 AI（前 %d 字）..." % len(snippet))
     code1, code2, label = ai.classify(base_title, snippet)
+    if code1 == "unk":
+        return content, "unk", "AI 判定无法判断（unk），已记住不再重试"
     new_title = build_title(code1, code2, base_title, title_style)
     log("  [分类] AI 分类：%s %s（%s）" % (code1, code2, label or "无标签"))
     log("  [分类] 新标题：" + new_title)
@@ -913,7 +914,7 @@ def _process_one(item, ai, opts, store, log):
     if changed and not opts["dry_run"]:
         _save_doc(doc_id, new_content)
         saved = True
-    if c_out == "success" and not opts["dry_run"]:
+    if c_out in ("success", "unk") and not opts["dry_run"]:
         try:
             store.add(doc_id)
         except Exception as e:
@@ -1018,8 +1019,10 @@ def _run_process(job: dict, cfg: dict, ai: AIClient, opts: dict) -> None:
     limit = int(opts.get("limit") or 0)
     concurrency = effective_concurrency(cfg, "process")
     store = ProcessedStore(STATE_FILE)
-    items = _list_items()
-    _job_log(job, "共获取 %d 篇文档" % len(items))
+    scan_days = _scan_days(opts)
+    items = _filter_recent(_list_items(), scan_days)
+    _job_log(job, "共获取 %d 篇文档%s" % (
+        len(items), "（最近 %d 天）" % scan_days if scan_days else ""))
     targets, counts = _process_scan(items, store, force, recent_extra, concurrency)
     _job_log(job, "待处理：%d 篇（摘要 %d 篇，分类 %d 篇）；跳过 %d 篇" % (
         counts["process"], counts["summary_process"],
@@ -1136,7 +1139,7 @@ def _handle_scan(data: dict):
         return 400, {"ok": False, "error": "job 只能是 process"}
     cfg = load_config()
     started = time.time()
-    items = _list_items()
+    items = _filter_recent(_list_items(), _scan_days(data))
     force = bool(data.get("force_reclassify", cfg["force_reclassify"]))
     recent_extra = bool(data.get("recent_3h_extra", cfg["recent_3h_extra"]))
     concurrency = effective_concurrency(cfg, "process")

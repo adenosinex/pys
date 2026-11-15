@@ -7,6 +7,7 @@
 AI_CONSOLE_HTML = r'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+<link rel="icon" href="/assets/logos/docsnew">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>AI 控制台 · 知识笔记</title>
@@ -121,6 +122,13 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
     <h2>一键处理</h2>
     <p class="desc">逐篇处理：每篇先生成快速浏览卡摘要（并用主题重写标题），再加分类前缀，一次保存。多篇并发进行。</p>
     <div class="opts">
+      <label>扫描范围
+        <select id="opt-days">
+          <option value="7">最近 7 天</option>
+          <option value="30">最近 30 天</option>
+          <option value="0">全部</option>
+        </select>
+      </label>
       <label><input type="checkbox" id="opt-recent" checked> 3 小时内结构不合格也重新生成</label>
       <label><input type="checkbox" id="opt-force"> 强制重新分类已有前缀的笔记</label>
       <label><input type="checkbox" id="opt-dry"> 试运行（只看结果，不保存）</label>
@@ -207,6 +215,24 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
       <button type="button" data-key="LOCAL_API_KEY" class="key-save">保存</button>
       <button type="button" data-key="LOCAL_API_KEY" class="key-clear">清除</button>
     </div>
+    <div class="keyrow">
+      <div class="grow">
+        <label>Apple 同步码 <span id="st-apple-key"></span>
+          <input type="password" id="in-apple-key" autocomplete="off" placeholder="Apple 访问码（同步器用）">
+        </label>
+      </div>
+      <button type="button" data-key="APPLE_SYNC_CODE" class="key-save">保存</button>
+      <button type="button" data-key="APPLE_SYNC_CODE" class="key-clear">清除</button>
+    </div>
+    <div class="keyrow">
+      <div class="grow">
+        <label>CF 镜像口令 <span id="st-cf-key"></span>
+          <input type="password" id="in-cf-key" autocomplete="off" placeholder="CF 只读镜像的加密口令（推送脚本用）">
+        </label>
+      </div>
+      <button type="button" data-key="CF_MIRROR_PASSPHRASE" class="key-save">保存</button>
+      <button type="button" data-key="CF_MIRROR_PASSPHRASE" class="key-clear">清除</button>
+    </div>
     <div class="hint" id="creds-msg"></div>
   </div>
 
@@ -224,6 +250,12 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
         <p><b>分类</b>：只处理正文开头 500 字内已有【主题】【关键词】【结论】的笔记；已有分类前缀的跳过（除非勾选强制重新分类）；已处理过的笔记记入缓存，不重复处理。摘要重写了标题的笔记一定会分类（新标题未经分类，旧缓存不再适用）。分类只看标题 + 正文前 200 字，输出两个小写英文代号拼成前缀；标题样式决定前缀形态，单引号包裹保证 YAML 安全。</p>
       </div>
     </details>
+  </div>
+
+  <div class="card">
+    <h2>导入脚本</h2>
+    <p class="desc">把本地 txt / md 批量传到 debi 笔记接口（原 1docs_import.py 的 debi 版，其余逻辑不变）。首次运行会提示输入全局直达码（保存后自动读取，也可用环境变量 DOCSNEW_DIRECT_CODE）。</p>
+    <button type="button" class="primary" id="btn-dl-import">下载脚本</button>
   </div>
 </div>
 
@@ -285,7 +317,7 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
   }
 
   var state = {
-    process: {running: false, jobId: null, logSeen: 0, poller: null, wait: null}
+    process: {running: false, jobId: null, logSeen: 0, poller: null, wait: null, lastLine: ""}
   };
 
   function setBusy(job, busy) {
@@ -352,6 +384,7 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
   function scanJob(job) {
     var w = waitStart(job, false);
     var body = {job: job};
+    body.scan_days = parseInt($("opt-days").value, 10) || 0;
     body.recent_3h_extra = $("opt-recent").checked;
     body.force_reclassify = $("opt-force").checked;
     return api("/docapi/ai/scan", {method: "POST",
@@ -386,6 +419,11 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
           loadJobs();
           scanJob(job);
         } else {
+          var logLines = (j.log || []).filter(function (l) { return l.trim(); });
+          if (logLines.length) st.lastLine = logLines[logLines.length - 1];
+          var tail = st.lastLine || "";
+          if (tail.length > 60) tail = tail.slice(0, 60) + "…";
+          $("counts-" + job).textContent = "进行中 · 已完成 " + j.done + " / " + j.total + (tail ? " · " + tail : "");
           st.poller = setTimeout(function () { pollStatus(job); }, 1000);
         }
       })
@@ -402,12 +440,14 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
 
   function runJob(job) {
     var body = {job: job};
+    body.scan_days = parseInt($("opt-days").value, 10) || 0;
     body.recent_3h_extra = $("opt-recent").checked;
     body.force_reclassify = $("opt-force").checked;
     body.dry_run = $("opt-dry").checked;
     body.title_style = $("opt-style").value;
     body.limit = parseInt($("opt-limit").value || "0", 10) || 0;
     setBusy(job, true);
+    state[job].lastLine = "";
     $("log-" + job).textContent = "";
     $("counts-" + job).textContent = "";
     state[job].wait = waitStart(job, true);
@@ -476,6 +516,8 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
       }
       keyStatus("st-op-key", "OP_API_KEY");
       keyStatus("st-local-key", "LOCAL_API_KEY");
+      keyStatus("st-apple-key", "APPLE_SYNC_CODE");
+      keyStatus("st-cf-key", "CF_MIRROR_PASSPHRASE");
     });
   }
 
@@ -499,6 +541,9 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
   }
 
   $("back-link").href = base + "/docs";
+  $("btn-dl-import").addEventListener("click", function () {
+    location.href = base + "/docapi/ai/import-script";
+  });
   $("goto-creds").addEventListener("click", function () {
     $("creds-card").scrollIntoView({behavior: "smooth", block: "start"});
   });
@@ -537,7 +582,8 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
   document.querySelectorAll(".key-save").forEach(function (btn) {
     btn.addEventListener("click", function () {
       var key = btn.getAttribute("data-key");
-      var input = key === "OP_API_KEY" ? $("in-op-key") : $("in-local-key");
+      var inputIds = {"OP_API_KEY": "in-op-key", "LOCAL_API_KEY": "in-local-key", "APPLE_SYNC_CODE": "in-apple-key", "CF_MIRROR_PASSPHRASE": "in-cf-key"};
+      var input = $(inputIds[key]);
       var v = input.value.trim();
       if (!v) { $("creds-msg").textContent = "请先粘贴 Key"; return; }
       var body = {};
@@ -571,6 +617,14 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
     });
   });
 
+  var daysSel = $("opt-days");
+  try {
+    var savedDays = localStorage.getItem("docsnew_scan_days");
+    if (savedDays === "7" || savedDays === "30" || savedDays === "0") daysSel.value = savedDays;
+  } catch (e) {}
+  daysSel.addEventListener("change", function () {
+    try { localStorage.setItem("docsnew_scan_days", daysSel.value); } catch (e) {}
+  });
   loadConfig().then(function () { scanJob("process"); });
   loadJobs();
 })();
