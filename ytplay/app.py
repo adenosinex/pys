@@ -1003,17 +1003,22 @@ var BASE = location.pathname;
 if (BASE.slice(-1) !== "/") { BASE += "/"; }
 var video = document.getElementById("player");
 var NATIVE = false;
-try { NATIVE = video.canPlayType("application/vnd.apple.mpegurl") !== ""; } catch (e) { NATIVE = false; }
+try {
+  var _ua = navigator.userAgent || "";
+  var _isSafari = /Safari/.test(_ua) && !/Chrome|Chromium|Edg|OPR|Firefox/.test(_ua);
+  NATIVE = _isSafari && video.canPlayType("application/vnd.apple.mpegurl") !== "";
+} catch (e) { NATIVE = false; }
 var hls = null;
 var hlsPromise = null;
 var currentDirect = "";
+var tracksDefaulted = false;
 var lastManifest = "";
 var timerId = null;
 var startMs = 0;
 var RECENT_KEY = "ytplay_recent_v1";
 
 function $(id) { return document.getElementById(id); }
-function show(el) { el.style.display = ""; }
+function show(el) { el.style.display = (el.id === "selrow") ? "flex" : (el.tagName === "BUTTON" ? "inline-block" : "block"); }
 function hide(el) { el.style.display = "none"; }
 function esc(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -1099,16 +1104,13 @@ function buildSelectors() {
   opt.textContent = "关闭字幕";
   subSel.appendChild(opt);
   var subs = hls.subtitleTracks || [];
+  var auds = hls.audioTracks || [];
   for (i = 0; i < subs.length; i++) {
     opt = document.createElement("option");
     opt.value = String(i);
     opt.textContent = (subs[i].name || subs[i].lang || ("字幕 " + (i + 1)));
     subSel.appendChild(opt);
   }
-  var subIdx = pickIndex(subs, ["zh-Hans", "zh-CN", "zh", "zh-Hant", "zh-TW", "zh-HK", "en"]);
-  hls.subtitleTrack = subIdx;
-  subSel.value = String(subIdx);
-  var auds = hls.audioTracks || [];
   audSel.innerHTML = "";
   for (i = 0; i < auds.length; i++) {
     opt = document.createElement("option");
@@ -1116,9 +1118,18 @@ function buildSelectors() {
     opt.textContent = (auds[i].name || auds[i].lang || ("音轨 " + (i + 1)));
     audSel.appendChild(opt);
   }
-  var audIdx = pickIndex(auds, ["zh-Hans", "zh-CN", "zh", "zh-Hant", "zh-TW", "zh-HK"]);
-  if (audIdx >= 0) { hls.audioTrack = audIdx; audSel.value = String(audIdx); }
-  else { audSel.value = String(hls.audioTrack); }
+  if (!tracksDefaulted && (subs.length > 0 || auds.length > 0)) {
+    var subIdx = pickIndex(subs, ["zh-Hans", "zh-CN", "zh", "zh-Hant", "zh-TW", "zh-HK", "en"]);
+    hls.subtitleTrack = subIdx;
+    subSel.value = String(subIdx);
+    var audIdx = pickIndex(auds, ["zh-Hans", "zh-CN", "zh", "zh-Hant", "zh-TW", "zh-HK"]);
+    if (audIdx >= 0) { hls.audioTrack = audIdx; audSel.value = String(audIdx); }
+    else { audSel.value = String(hls.audioTrack); }
+    tracksDefaulted = true;
+  } else {
+    subSel.value = String(hls.subtitleTrack);
+    audSel.value = String(hls.audioTrack);
+  }
   var levels = hls.levels || [];
   var order = [];
   for (i = 0; i < levels.length; i++) { order.push(i); }
@@ -1136,7 +1147,7 @@ function buildSelectors() {
     opt.textContent = (lv.height || "?") + "p · " + mbps + " Mbps";
     qSel.appendChild(opt);
   }
-  qSel.value = "-1";
+  qSel.value = String(hls.nextLevel);
   show($("selrow"));
 }
 function useDirectFallback(msg) {
@@ -1168,6 +1179,7 @@ async function playManifest(manifestUrl) {
     return;
   }
   if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
+  tracksDefaulted = false;
   hls = new Hls({maxBufferLength: 30});
   hls.loadSource(manifestUrl);
   hls.attachMedia(video);
@@ -1175,6 +1187,8 @@ async function playManifest(manifestUrl) {
     buildSelectors();
     video.play().catch(function () {});
   });
+  hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, function () { buildSelectors(); });
+  hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, function () { buildSelectors(); });
   hls.on(Hls.Events.ERROR, function (ev, data) {
     if (!data || !data.fatal) { return; }
     if (data.type === Hls.ErrorTypes.NETWORK_ERROR) { hls.startLoad(); }
@@ -1251,6 +1265,7 @@ async function resolve(url) {
     var elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     saveRecent(url, d);
     renderRecent();
+    if (d.video_id) { try { history.replaceState(null, "", BASE + "?v=" + encodeURIComponent(d.video_id)); } catch (e) {} }
     $("title").textContent = d.title || "";
     var subCount = (d.subtitles_manual || []).length + (d.subtitles_auto || []).length;
     var audCount = (d.audio_langs || []).length;
@@ -1292,6 +1307,10 @@ renderRecent();
 (function () {
   var q = new URLSearchParams(location.search);
   var u = q.get("u");
+  var v = q.get("v");
+  if (v && /^[A-Za-z0-9_-]{11}$/.test(v)) {
+    u = "https://www.youtube.com/watch?v=" + v;
+  }
   if (u) {
     $("url").value = u;
     resolve(u);
