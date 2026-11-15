@@ -18,7 +18,12 @@
   解析上游、剥前缀后模型与原文模型串), 网页可看与导出 CSV。
 - base_url 归一化: 登记值带不带 /v1 后缀都接受 (_api_base), 请求
   时归一, 不改登记原文。
-- 项目内无任何验证代码: 身份网关在面板层 (平台规则)。Stdlib only。
+- 项目内无任何验证代码: 身份网关在面板层 (平台规则)。Stdlib only,
+  PyJWT 仅用于 GCP 服务账号上游 (可选导入, 缺失时该上游失败关闭)。
+- GCP 上游: 条目带 "auth": "gcp_sa" 时, 不用静态 key, 改用服务账号
+  JSON 密钥 (DATA_DIR/vertex-sa.json, 0600) 签发 JWT 换取 OAuth
+  token, 自动缓存刷新; base_url 原样作 API 根 (Vertex openapi 根
+  不带 /v1 后缀, 不走 _api_base 补缀)。
 """
 import csv
 import html as html_mod
@@ -97,6 +102,89 @@ def _save_store(d):
     except Exception:
         pass
     os.replace(tmp, CRED_PATH)
+
+
+# ------------------------------------------- GCP service accounts
+try:
+    import jwt as _pyjwt
+except Exception:
+    _pyjwt = None
+
+GCP_SA_KEY_FILE = os.path.join(DATA_DIR, "vertex-sa.json")
+GCP_TOKEN_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+_gcp_sa = {"data": None}
+_gcp_token = {"token": "", "exp": 0.0}
+_gcp_token_lock = threading.Lock()
+
+
+def _gcp_sa_data():
+    """Parsed service-account key file, loaded once and cached
+    (a rotated key file takes effect on restart). Returns the
+    dict or None. Only the signer reads the key material."""
+    if _gcp_sa["data"] is not None:
+        return _gcp_sa["data"]
+    try:
+        with open(GCP_SA_KEY_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(d, dict) or not d.get("private_key"):
+        return None
+    if not d.get("client_email") or not d.get("token_uri"):
+        return None
+    _gcp_sa["data"] = d
+    return d
+
+
+def _gcp_access_token():
+    """OAuth access token for the service account, cached until
+    5 minutes before expiry. Minted via the JWT-bearer grant
+    (RS256-signed JWT -> token endpoint). Returns "" on any
+    failure: callers fail closed, never raise, never log the
+    token or the key."""
+    now = time.time()
+    if _gcp_token["token"] and _gcp_token["exp"] > now + 300:
+        return _gcp_token["token"]
+    if _pyjwt is None:
+        return ""
+    with _gcp_token_lock:
+        now = time.time()
+        if _gcp_token["token"] and _gcp_token["exp"] > now + 300:
+            return _gcp_token["token"]
+        sa = _gcp_sa_data()
+        if sa is None:
+            return ""
+        try:
+            claims = {
+                "iss": sa["client_email"],
+                "sub": sa["client_email"],
+                "aud": sa["token_uri"],
+                "scope": GCP_TOKEN_SCOPE,
+                "iat": int(now),
+                "exp": int(now) + 3600,
+            }
+            assertion = _pyjwt.encode(claims, sa["private_key"],
+                                      algorithm="RS256")
+            body = urllib.parse.urlencode({
+                "grant_type": ("urn:ietf:params:oauth:grant-type:"
+                               "jwt-bearer"),
+                "assertion": assertion,
+            }).encode("utf-8")
+            res = _http("POST", sa["token_uri"], headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+            }, body=body, ctimeout=10, rtimeout=30)
+            if res["status"] != 200 or res["error"]:
+                return ""
+            data = json.loads(res["body"].decode("utf-8", "replace"))
+            token = data.get("access_token") or ""
+            expires_in = data.get("expires_in") or 3600
+            if not token:
+                return ""
+            _gcp_token["token"] = token
+            _gcp_token["exp"] = time.time() + float(expires_in)
+            return token
+        except Exception:
+            return ""
 
 
 # ------------------------------------------------- token estimation
@@ -442,6 +530,61 @@ def _api_base(base):
     return b + "/v1"
 
 
+def _upstream_api_root(up):
+    """API root for one upstream entry. GCP service-account
+    upstreams carry the full Vertex openapi root as base_url
+    (it has no /v1 suffix and must not gain one); everything
+    else goes through _api_base."""
+    if (up or {}).get("auth") == "gcp_sa":
+        return (up.get("base_url") or "").strip().rstrip("/")
+    return _api_base((up or {}).get("base_url"))
+
+
+def _upstream_auth(up):
+    """Authorization headers for one upstream entry. GCP
+    service-account upstreams get a minted OAuth token; keyed
+    upstreams get their static key; empty-key upstreams get
+    nothing (never a bare 'Bearer '). A failed token mint
+    yields no headers: the caller fails closed."""
+    up = up or {}
+    if up.get("auth") == "gcp_sa":
+        token = _gcp_access_token()
+        if token:
+            return {"Authorization": "Bearer " + token}
+        return {}
+    key = up.get("key") or ""
+    if key:
+        return {"Authorization": "Bearer " + key}
+    return {}
+
+
+def _gcp_model_id(up, mid):
+    """Publisher-prefix default for GCP service-account upstreams:
+    a bare model id ('gemini-3.8-flash') becomes
+    'google/gemini-3.8-flash'; anything with a '/' already carries
+    its publisher and passes untouched. Other upstreams untouched."""
+    if (up or {}).get("auth") == "gcp_sa" and mid and "/" not in mid:
+        return "google/" + mid
+    return mid
+
+
+# Vertex publisher models verified serving for this project on the
+# global endpoint (2026-11-15). The OpenAI-compat /models endpoint
+# lists nothing, so the aggregated directory synthesizes these
+# entries when the live fetch comes back empty. Bare ids: the
+# forwarding boundary adds the 'google/' publisher segment (see
+# _gcp_model_id). gemini-2.5-flash is deliberately absent: it 404s
+# on global for this project.
+_GCP_KNOWN_MODELS = (
+    "gemini-3.8-flash",
+    "gemini-4-carbon",
+    "gemini-4-hydrogen",
+    "gemini-4-argon",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+)
+
+
 def _body_snip(body, limit=120):
     try:
         t = body.decode("utf-8", "replace")
@@ -520,9 +663,8 @@ def _run_tests(name):
         up = store["upstreams"].get(name)
         if not up:
             return
-        api = _api_base(up.get("base_url"))
-        key = up.get("key") or ""
-        auth = {"Authorization": "Bearer " + key} if key else {}
+        api = _upstream_api_root(up)
+        auth = _upstream_auth(up)
         rows = []
         mres = _http("GET", api + "/models", headers=dict(auth),
                      ctimeout=10, rtimeout=25, max_read=2000000)
@@ -668,13 +810,26 @@ def _extract_usage(acc, tail, is_stream):
             return norm(d.get("usage") or {})
         except Exception:
             return {}
+    # Streams carry usage in a trailing data chunk (only when the
+    # client asks via stream_options.include_usage). Parse the SSE
+    # data lines as JSON and take the LAST chunk carrying "usage":
+    # the earlier regex could not match usage objects with nested
+    # braces (completion_tokens_details / extra_properties), so
+    # every streaming row lost its token counts (2026-11-15 fix).
     text = tail.decode("utf-8", "replace")
-    found = re.findall(r'"usage"\s*:\s*(\{[^{}]*\})', text)
-    for raw in reversed(found):
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
         try:
-            return norm(json.loads(raw))
+            d = json.loads(payload)
         except Exception:
             continue
+        if isinstance(d, dict) and isinstance(d.get("usage"), dict):
+            return norm(d["usage"])
     return {}
 
 
@@ -872,9 +1027,8 @@ def _handle_models_agg(environ, start_response):
     results = {}
 
     def fetch(nm, up):
-        key = up.get("key") or ""
-        auth = {"Authorization": "Bearer " + key} if key else {}
-        res = _http("GET", _api_base(up.get("base_url")) + "/models",
+        auth = _upstream_auth(up)
+        res = _http("GET", _upstream_api_root(up) + "/models",
                     headers=auth, ctimeout=8, rtimeout=20,
                     max_read=2000000)
         ids = []
@@ -886,6 +1040,10 @@ def _handle_models_agg(environ, start_response):
                         ids.append(str(it["id"]))
             except Exception:
                 ids = []
+        if not ids and (up or {}).get("auth") == "gcp_sa":
+            # Vertex's OpenAI-compat /models lists nothing; the
+            # directory synthesizes the verified set with bare ids.
+            ids = list(_GCP_KNOWN_MODELS)
         results[nm] = ids
 
     ths = []
@@ -936,6 +1094,12 @@ def _relay_forward(environ, start_response, name, up, rest, rd,
     pfx = name + "/"
     if fwd.startswith(pfx) and len(fwd) > len(pfx):
         fwd = fwd[len(pfx):]
+    # GCP service-account upstreams address publisher models as
+    # '<publisher>/<model>' (Vertex requires the publisher segment).
+    # Accept the bare id too: 'vertex/gemini-3.8-flash' forwards as
+    # 'google/gemini-3.8-flash'. An id that already carries a
+    # publisher ('google/...', 'anthropic/...') passes untouched.
+    fwd = _gcp_model_id(up, fwd)
     if fwd != orig_model and body:
         try:
             reqj = json.loads(body.decode("utf-8", "replace"))
@@ -946,7 +1110,60 @@ def _relay_forward(environ, start_response, name, up, rest, rd,
                 model = fwd
         except Exception:
             pass
-    url = _api_base(up.get("base_url")) + "/" + rest
+    # Reasoning-budget floor, GCP service-account upstreams only: the
+    # client's max_tokens budget is consumed by reasoning first, so a
+    # small (or upstream-default) budget returns HTTP 200 with empty
+    # content (finish_reason=length) -- clients report it as a failed
+    # request. Raise an absent-or-small budget to the floor; never
+    # lower a larger client value. Fail-open: any parse problem leaves
+    # the body untouched. Other upstreams are never touched.
+    if (up.get("auth") == "gcp_sa" and body
+            and rest.rstrip("/").endswith("chat/completions")):
+        try:
+            _fj = json.loads(body.decode("utf-8", "replace"))
+            if isinstance(_fj, dict):
+                _floor = 8192
+                _changed = False
+                for _k in ("max_tokens", "max_completion_tokens"):
+                    _v = _fj.get(_k)
+                    if (isinstance(_v, (int, float))
+                            and not isinstance(_v, bool)
+                            and _v < _floor):
+                        _fj[_k] = _floor
+                        _changed = True
+                if ("max_tokens" not in _fj
+                        and "max_completion_tokens" not in _fj):
+                    _fj["max_tokens"] = _floor
+                    _changed = True
+                if _changed:
+                    body = json.dumps(_fj,
+                                      ensure_ascii=False).encode("utf-8")
+        except Exception:
+            pass
+    # Usage capture, GCP service-account upstreams only: ask Vertex
+    # to append a usage chunk to streamed responses so the relay log
+    # carries real token counts (the billing page's data source).
+    # Only when the client streams and has not set include_usage
+    # explicitly; an explicit client choice is never overridden.
+    # Fail-open like the floor above. Other upstreams untouched.
+    if (up.get("auth") == "gcp_sa" and body and req_stream
+            and rest.rstrip("/").endswith("chat/completions")):
+        try:
+            _uj = json.loads(body.decode("utf-8", "replace"))
+            if isinstance(_uj, dict):
+                _so = _uj.get("stream_options")
+                if _so is None:
+                    _uj["stream_options"] = {"include_usage": True}
+                    body = json.dumps(_uj,
+                                      ensure_ascii=False).encode("utf-8")
+                elif (isinstance(_so, dict)
+                        and "include_usage" not in _so):
+                    _so["include_usage"] = True
+                    body = json.dumps(_uj,
+                                      ensure_ascii=False).encode("utf-8")
+        except Exception:
+            pass
+    url = _upstream_api_root(up) + "/" + rest
     qs = environ.get("QUERY_STRING", "")
     if qs:
         url += "?" + qs
@@ -964,13 +1181,19 @@ def _relay_forward(environ, start_response, name, up, rest, rd,
     ctype = environ.get("CONTENT_TYPE", "")
     if ctype:
         fwd["Content-Type"] = ctype
-    # Upstreams with an empty key get NO Authorization header at all
-    # (e.g. loopback internal services: platform norm 2026-11-10 says
-    # internal calls carry no auth; never send a bare "Bearer ").
-    if up.get("key"):
-        fwd["Authorization"] = "Bearer " + up["key"]
-        if environ.get("HTTP_X_API_KEY"):
-            fwd["X-Api-Key"] = up["key"]
+    # Upstream auth: minted token for GCP service-account upstreams,
+    # static key otherwise, nothing for empty-key upstreams (never
+    # a bare "Bearer "). A GCP upstream whose token mint failed is
+    # refused here with a diagnosable error instead of dialing the
+    # upstream unauthenticated.
+    auth = _upstream_auth(up)
+    if up.get("auth") == "gcp_sa" and not auth:
+        return _json(start_response, "502 Bad Gateway",
+                     {"ok": False,
+                      "error": "Vertex 令牌获取失败: 服务账号密钥缺失或无效"})
+    fwd.update(auth)
+    if up.get("key") and environ.get("HTTP_X_API_KEY"):
+        fwd["X-Api-Key"] = up["key"]
     if body:
         fwd["Content-Length"] = str(len(body))
     parts = urllib.parse.urlsplit(url)
@@ -1008,6 +1231,16 @@ def _relay_forward(environ, start_response, name, up, rest, rd,
     for k, v in resp.getheaders():
         lk = k.lower()
         if lk in _HOP:
+            continue
+        # Upstream CORS headers must not reach the browser: the relay
+        # surface is its own CORS authority (_CorsResp appends the
+        # echo ACAO). Vertex echoes Origin, so passing its ACAO
+        # through produced TWO Access-Control-Allow-Origin headers
+        # and browsers reject the response outright (a duplicate ACAO
+        # fails the CORS check) -- every browser chat failed while
+        # curl/urllib saw clean 200s. Other upstreams send no CORS
+        # headers, which is why only Vertex broke.
+        if lk.startswith("access-control-"):
             continue
         if lk == "content-type":
             resp_ctype = v
@@ -1097,7 +1330,8 @@ def _api_status():
         ups.append({
             "name": name,
             "base_url": u.get("base_url", ""),
-            "api_base": _api_base(u.get("base_url", "")),
+            "api_base": _upstream_api_root(u),
+            "auth": u.get("auth", ""),
             "key_set": bool(u.get("key")),
             "created": u.get("created", ""),
             "testing": bool(_testing.get(name)),
