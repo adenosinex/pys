@@ -362,6 +362,7 @@ function openSheet(opts) {
     mode: opts.mode || "create",
     rec: rec,
     note: rec ? (rec.note || "") : "",
+    whenLocal: rec ? (rec.date + "T" + fmtTime(rec.ts)) : "",
     id: rec ? rec.id : uuid(),
     category: rec ? rec.category : (opts.category || CAT_ORDER[0] || "stool"),
     item: rec ? rec.item : (opts.item || ""),
@@ -390,6 +391,10 @@ function closeSheet() { $("#sheet-wrap").classList.remove("open"); sheetState = 
 
 function renderSheet() {
   const st = sheetState, el = $("#sheet");
+  const _w = $("#sh-when"); if (_w && _w.value) st.whenLocal = _w.value;
+  const _n = $("#sh-note"); if (_n) st.note = _n.value;
+  const _q = $("#sh-qnum"); if (_q && _q.value !== "") { const _qv = parseFloat(_q.value); if (!isNaN(_qv)) st.value = { type: "measure", v: _qv, unit: "" }; }
+  const _m = $("#sh-num"); if (_m && _m.value !== "") { const _mv = parseFloat(_m.value); if (!isNaN(_mv)) st.value = { type: "measure", v: _mv, unit: ((VALUE_CONF[st.category] || {}).unit || "") }; }
   const catChips = CAT_ORDER.map(c =>
     '<button class="chip' + (st.category === c ? " on" : "") + '" data-act="cat" data-v="' + c + '">' +
     esc(catLabel(c)) + "</button>").join("");
@@ -456,11 +461,6 @@ function renderSheet() {
     '<button class="btn block" data-act="save">' + (st.mode === "edit" ? "保存修改" : "保存记录") + "</button>" +
     (st.mode === "edit" ? '<button class="btn danger block" data-act="delete">删除这条</button>' : "") +
     '<button class="btn ghost block" data-act="close">取消</button>';
-  if (st.mode === "edit" && st.rec) {
-    $("#sh-note").value = st.rec.note || "";
-    const d = new Date(st.rec.ts * 1000);
-    $("#sh-when").value = st.rec.date + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
-  }
   $$("#sheet [data-act]").forEach(b => b.addEventListener("click", () => sheetAction(b.dataset.act, b.dataset.v)));
 }
 async function sheetAction(act, v) {
