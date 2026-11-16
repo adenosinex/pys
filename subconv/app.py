@@ -500,9 +500,26 @@ def plan_output(src, kept):
         region_winners.setdefault(region, []).extend(by_ip.values())
     for region, winners in region_winners.items():
         winners = sorted(winners, key=lambda t: _speed_key(t[2]))
+        # Cross-protocol twins: same region + same egress IP, both kept
+        # on purpose (dedup runs per protocol). Their numbers drift
+        # with retest speed, so BOTH names carry a stable port suffix
+        # in the self-run form (middle dot + the node's own service
+        # port). Nodes without a twin keep byte-identical names.
+        _twins = set()
+        _by_ip = {}
+        for _fp, _node, _test in winners:
+            _ip = _test.get("egress_ip") or ""
+            if _ip:
+                _by_ip.setdefault(_ip, []).append((_fp, _node))
+        for _members in _by_ip.values():
+            _protos = {str(_n.get("type") or "").lower() for _f, _n in _members}
+            if len(_members) > 1 and len(_protos) > 1:
+                _twins.update(_f for _f, _n in _members)
         for i, (_fp, node, test) in enumerate(winners):
             base = region if len(winners) == 1 else "%s-%02d" % (region, i + 1)
             display = rich_display(base, test)
+            if _fp in _twins and node.get("port"):
+                display += "\u00b7%s" % node["port"]
             new_node = dict(node)
             new_node["name"] = display
             renamed.append((display, new_node, test, region))
