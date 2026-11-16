@@ -35,7 +35,7 @@ Export page (/export, user spec 2026-11-13): search keywords with a
 latest-N cap and/or a Beijing-date range, then a fixed pipeline --
 blacklist filter first (keyword blacklist stored in
 export_blacklist.json, maintained on the page), then title dedup
-with the method of the /site/p1791363651 tool (run in the browser,
+with the method of the /site/textuni tool (run in the browser,
 same code and defaults, titles + size_bytes), then batch copy of
 100 magnet links at a time. Confirming a batch, or copying the next
 batch, records its infohashes in the processed table (exclude.db),

@@ -711,21 +711,21 @@ let regData = {html: [], py: []};
 const PROJCAT = {html: {name: "HTML 项目"}, py: {name: "PY 项目"}};
 const APPCATS = {
   py: [
-    {name: "内容媒体", slugs: ["zhihu-core", "yt-audio", "vidlib", "beastlib"]},
+    {name: "内容媒体", slugs: ["zhihu-core", "yt-audio", "vidlib", "beastlib", "u3magnet", "xlikes", "ytplay"]},
     {name: "文件工具", slugs: ["transfer", "cloudfiles", "nameclean", "filetools"]},
-    {name: "记录数据", slugs: ["records", "cards", "docsnew"]},
-    {name: "网络工具", slugs: ["subconv", "dnsmap", "speedtest", "openrouter"]},
-    {name: "平台效率", slugs: ["links", "clipboard", "burn", "medatlas"]}
+    {name: "记录数据", slugs: ["records", "cards", "docsnew", "bill"]},
+    {name: "网络工具", slugs: ["subconv", "dnsmap", "speedtest", "openrouter", "apirelay", "directmgr", "dohrelay"]},
+    {name: "平台效率", slugs: ["links", "clipboard", "burn", "medatlas", "chat", "hike"]}
   ],
   html: [
-    {name: "实用工具", slugs: ["p1791363651", "p1791168459", "p1790594923", "p1789779981", "p1789648409", "p1785485829", "p1785306635", "p1785206347", "p1780063319", "p1778768844", "magnet", "textuni"]},
-    {name: "AI 与模型", slugs: ["aicn", "p1788428731", "p1788428729", "p1787576892", "p1785741597", "p1780733162", "p1779539600", "aitest", "ormodel"]},
+    {name: "实用工具", slugs: ["p1791168459", "p1790594923", "p1789779981", "p1789648409", "p1785485829", "p1785306635", "p1785206347", "p1780063319", "p1778768844", "magnet", "textuni"]},
+    {name: "AI 与模型", slugs: ["aicn", "p1788428729", "p1787576892", "p1785741597", "p1780733162", "p1779539600", "aitest", "ormodel", "teleagent"]},
     {name: "健身与体能", slugs: ["p1783040627", "p1779874258", "p1779872310", "p1779868187", "p1779266591", "p1779202861", "p1779198872", "p1779109601", "p1779020616", "p1778982714", "p1778769593"]},
     {name: "健康与身体", slugs: ["p1790396626", "p1790396609", "p1783259896", "p1781665039", "p1779697722", "p1778981387"]},
     {name: "户外与出行", slugs: ["p1792850445", "p1787039714", "p1781923402", "p1780188079", "p1778984453", "p1778983199", "p1778983019", "p1778981876", "p1778981444", "p1778980516"]},
     {name: "设备与车辆", slugs: ["p1783476971", "p1782215175", "p1779544522", "p1779349290", "p1779001444", "p1778982865", "p1778982461", "p1778981955"]},
     {name: "认知与社会", slugs: ["p1792563415", "p1791946410", "p1790172372", "p1779853529", "p1779778997", "p1779546460", "p1779090887", "p1778991781", "p1778983287", "p1778982505"]},
-    {name: "选购依据", slugs: ["vps-buying-guide", "vps-benchmark-compare", "vps-platform-limits"]},
+    {name: "选购依据", slugs: ["vps-buying-guide", "vps-benchmark-compare", "vps-platform-limits", "vps3"]},
   ]
 };
 function catOf(p) {
@@ -1032,21 +1032,21 @@ let regData = {html: [], py: []};
 const PROJCAT = {html: {name: "HTML 项目"}, py: {name: "PY 项目"}};
 const APPCATS = {
   py: [
-    {name: "内容媒体", slugs: ["zhihu-core", "yt-audio", "vidlib", "beastlib"]},
+    {name: "内容媒体", slugs: ["zhihu-core", "yt-audio", "vidlib", "beastlib", "u3magnet", "xlikes", "ytplay"]},
     {name: "文件工具", slugs: ["transfer", "cloudfiles", "nameclean", "filetools"]},
-    {name: "记录数据", slugs: ["records", "cards", "docsnew"]},
-    {name: "网络工具", slugs: ["subconv", "dnsmap", "speedtest", "openrouter"]},
-    {name: "平台效率", slugs: ["links", "clipboard", "burn", "medatlas"]}
+    {name: "记录数据", slugs: ["records", "cards", "docsnew", "bill"]},
+    {name: "网络工具", slugs: ["subconv", "dnsmap", "speedtest", "openrouter", "apirelay", "directmgr", "dohrelay"]},
+    {name: "平台效率", slugs: ["links", "clipboard", "burn", "medatlas", "chat", "hike"]}
   ],
   html: [
-    {name: "实用工具", slugs: ["p1791363651", "p1791168459", "p1790594923", "p1789779981", "p1789648409", "p1785485829", "p1785306635", "p1785206347", "p1780063319", "p1778768844", "magnet", "textuni"]},
-    {name: "AI 与模型", slugs: ["aicn", "p1788428731", "p1788428729", "p1787576892", "p1785741597", "p1780733162", "p1779539600", "aitest", "ormodel"]},
+    {name: "实用工具", slugs: ["p1791168459", "p1790594923", "p1789779981", "p1789648409", "p1785485829", "p1785306635", "p1785206347", "p1780063319", "p1778768844", "magnet", "textuni"]},
+    {name: "AI 与模型", slugs: ["aicn", "p1788428729", "p1787576892", "p1785741597", "p1780733162", "p1779539600", "aitest", "ormodel", "teleagent"]},
     {name: "健身与体能", slugs: ["p1783040627", "p1779874258", "p1779872310", "p1779868187", "p1779266591", "p1779202861", "p1779198872", "p1779109601", "p1779020616", "p1778982714", "p1778769593"]},
     {name: "健康与身体", slugs: ["p1790396626", "p1790396609", "p1783259896", "p1781665039", "p1779697722", "p1778981387"]},
     {name: "户外与出行", slugs: ["p1792850445", "p1787039714", "p1781923402", "p1780188079", "p1778984453", "p1778983199", "p1778983019", "p1778981876", "p1778981444", "p1778980516"]},
     {name: "设备与车辆", slugs: ["p1783476971", "p1782215175", "p1779544522", "p1779349290", "p1779001444", "p1778982865", "p1778982461", "p1778981955"]},
     {name: "认知与社会", slugs: ["p1792563415", "p1791946410", "p1790172372", "p1779853529", "p1779778997", "p1779546460", "p1779090887", "p1778991781", "p1778983287", "p1778982505"]},
-    {name: "选购依据", slugs: ["vps-buying-guide", "vps-benchmark-compare", "vps-platform-limits"]},
+    {name: "选购依据", slugs: ["vps-buying-guide", "vps-benchmark-compare", "vps-platform-limits", "vps3"]},
   ]
 };
 function catOf(p) {
@@ -1441,21 +1441,21 @@ let regData = {html: [], py: []};
 const PROJCAT = {html: {name: "HTML 项目"}, py: {name: "PY 项目"}};
 const APPCATS = {
   py: [
-    {name: "内容媒体", slugs: ["zhihu-core", "yt-audio", "vidlib", "beastlib"]},
+    {name: "内容媒体", slugs: ["zhihu-core", "yt-audio", "vidlib", "beastlib", "u3magnet", "xlikes", "ytplay"]},
     {name: "文件工具", slugs: ["transfer", "cloudfiles", "nameclean", "filetools"]},
-    {name: "记录数据", slugs: ["records", "cards", "docsnew"]},
-    {name: "网络工具", slugs: ["subconv", "dnsmap", "speedtest", "openrouter"]},
-    {name: "平台效率", slugs: ["links", "clipboard", "burn", "medatlas"]}
+    {name: "记录数据", slugs: ["records", "cards", "docsnew", "bill"]},
+    {name: "网络工具", slugs: ["subconv", "dnsmap", "speedtest", "openrouter", "apirelay", "directmgr", "dohrelay"]},
+    {name: "平台效率", slugs: ["links", "clipboard", "burn", "medatlas", "chat", "hike"]}
   ],
   html: [
-    {name: "实用工具", slugs: ["p1791363651", "p1791168459", "p1790594923", "p1789779981", "p1789648409", "p1785485829", "p1785306635", "p1785206347", "p1780063319", "p1778768844", "magnet", "textuni"]},
-    {name: "AI 与模型", slugs: ["aicn", "p1788428731", "p1788428729", "p1787576892", "p1785741597", "p1780733162", "p1779539600", "aitest", "ormodel"]},
+    {name: "实用工具", slugs: ["p1791168459", "p1790594923", "p1789779981", "p1789648409", "p1785485829", "p1785306635", "p1785206347", "p1780063319", "p1778768844", "magnet", "textuni"]},
+    {name: "AI 与模型", slugs: ["aicn", "p1788428729", "p1787576892", "p1785741597", "p1780733162", "p1779539600", "aitest", "ormodel", "teleagent"]},
     {name: "健身与体能", slugs: ["p1783040627", "p1779874258", "p1779872310", "p1779868187", "p1779266591", "p1779202861", "p1779198872", "p1779109601", "p1779020616", "p1778982714", "p1778769593"]},
     {name: "健康与身体", slugs: ["p1790396626", "p1790396609", "p1783259896", "p1781665039", "p1779697722", "p1778981387"]},
     {name: "户外与出行", slugs: ["p1792850445", "p1787039714", "p1781923402", "p1780188079", "p1778984453", "p1778983199", "p1778983019", "p1778981876", "p1778981444", "p1778980516"]},
     {name: "设备与车辆", slugs: ["p1783476971", "p1782215175", "p1779544522", "p1779349290", "p1779001444", "p1778982865", "p1778982461", "p1778981955"]},
     {name: "认知与社会", slugs: ["p1792563415", "p1791946410", "p1790172372", "p1779853529", "p1779778997", "p1779546460", "p1779090887", "p1778991781", "p1778983287", "p1778982505"]},
-    {name: "选购依据", slugs: ["vps-buying-guide", "vps-benchmark-compare", "vps-platform-limits"]},
+    {name: "选购依据", slugs: ["vps-buying-guide", "vps-benchmark-compare", "vps-platform-limits", "vps3"]},
   ]
 };
 function catOf(p) {

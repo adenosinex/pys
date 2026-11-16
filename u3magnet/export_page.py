@@ -8,7 +8,7 @@ first screen must let the user search and see batch states.
 Pipeline (user spec 2026-11-13): keyword search (latest-N cap
 and/or Beijing-date range) -> keyword blacklist filter (server
 side, stored in export_blacklist.json, maintained on this page) ->
-title dedup with the method of the /site/p1791363651 tool (the
+title dedup with the method of the /site/textuni tool (the
 dedup functions below are that page's code with the same defaults,
 run in the browser over titles + size_bytes) -> size-ascending
 batches of 100 (smallest first, each batch header shows its total
@@ -137,7 +137,7 @@ summary::-webkit-details-marker{display:none}
 </div>
 <script>
 /* ============================================================
- * 标题去重：与 /site/p1791363651（视频标题去重工具 · 大小接近版）
+ * 标题去重：与 /site/textuni（视频标题去重工具 · 大小接近版）
  * 相同的方法与默认值。函数原文照搬，只改输入来源：条目直接
  * 取自搜索接口（标题 + size_bytes），不再解析文本行。
  * ============================================================ */
