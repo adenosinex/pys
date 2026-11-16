@@ -26,6 +26,7 @@ import csv
 import io
 import math
 import os
+import re
 import sqlite3
 import zipfile
 import xml.etree.ElementTree as ET
@@ -54,6 +55,17 @@ for path in [BASE_DIR, PROJECTS_BASE_DIR]:
 
 app = Flask(__name__)
 application = app
+
+# Upload bodies are base64 JSON; cap the whole request body. Werkzeug
+# enforces MAX_CONTENT_LENGTH while streaming, so an oversized body
+# never lands fully in memory. The 413 handler keeps the JSON API
+# contract instead of Flask's default HTML error page.
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+
+
+@app.errorhandler(413)
+def _too_large(_err):
+    return jsonify({"error": "请求体过大（上限 50MB）"}), 413
 
 
 def get_db():
@@ -103,6 +115,41 @@ def _parse_iso_time(text):
         return None
 
 
+class _EntityRejected(ValueError):
+    """XML input carries a DOCTYPE ENTITY declaration (billion-laughs)."""
+
+
+def _reject_entities(data: bytes) -> None:
+    # stdlib ET never fetches external entities (no XXE), but internal
+    # entity expansion (billion laughs) is real. GPX/KML never need
+    # entities, so reject the declaration bytes outright, case-insensitive.
+    if b"<!entity" in data.lower():
+        raise _EntityRejected("XML entity declarations are not allowed")
+
+
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _existing_project_id(project_id):
+    """Return the int project id iff it names an existing project, else None.
+
+    project_id is an INTEGER PRIMARY KEY minted by POST /api/projects;
+    uploads must reference an existing project, never create one.
+    """
+    if isinstance(project_id, bool):
+        return None
+    text = str(project_id)
+    if not _PROJECT_ID_RE.match(text):
+        return None
+    try:
+        pid = int(text)
+    except ValueError:
+        return None
+    with get_db() as conn:
+        row = conn.execute("SELECT 1 FROM projects WHERE id = ?", (pid,)).fetchone()
+    return pid if row is not None else None
+
+
 def _strip_ns(root):
     for el in root.iter():
         if "}" in el.tag:
@@ -111,7 +158,10 @@ def _strip_ns(root):
 
 
 def _gpx_points(gpx_path):
-    it = ET.iterparse(gpx_path)
+    with open(gpx_path, "rb") as f:
+        data = f.read()
+    _reject_entities(data)
+    it = ET.iterparse(io.BytesIO(data))
     for _, el in it:
         el.tag = el.tag.split("}", 1)[1] if "}" in el.tag else el.tag
     root = it.root
@@ -132,6 +182,7 @@ def _gpx_points(gpx_path):
 
 
 def _kml_track_points(kml_bytes):
+    _reject_entities(kml_bytes)
     root = _strip_ns(ET.fromstring(kml_bytes))
     points = []
     for track in root.iter("Track"):
@@ -206,6 +257,8 @@ def parse_track_to_csv(src_path, csv_path):
             return False
         _write_csv(points, csv_path)
         return True
+    except _EntityRejected:
+        raise
     except Exception as e:
         print(f"track parse error: {e}")
         return False
@@ -313,22 +366,39 @@ def upload_gpx():
         return jsonify({"error": "参数不全"}), 400
     if "," in file_base64:
         file_base64 = file_base64.split(",")[1]
-    project_dir = os.path.join(PROJECTS_BASE_DIR, str(project_id))
+    pid = _existing_project_id(project_id)
+    if pid is None:
+        return jsonify({"error": "项目不存在"}), 400
+    project_dir = os.path.join(PROJECTS_BASE_DIR, str(pid))
     os.makedirs(project_dir, exist_ok=True)
     timestamp = int(datetime.now().timestamp())
     safe_name = filename.replace(" ", "_")
     gpx_path = os.path.join(project_dir, f"{timestamp}_{safe_name}")
     csv_path = os.path.join(project_dir, f"{timestamp}_{safe_name}.csv")
     try:
-        with open(gpx_path, "wb") as f:
-            f.write(base64.b64decode(file_base64))
+        raw = base64.b64decode(file_base64)
     except Exception as e:
         return jsonify({"error": f"写入失败: {str(e)}"}), 500
-    if parse_track_to_csv(gpx_path, csv_path):
+    try:
+        _reject_entities(raw)
+    except _EntityRejected:
+        return jsonify({"error": "XML 实体声明不被允许"}), 400
+    try:
+        with open(gpx_path, "wb") as f:
+            f.write(raw)
+    except Exception as e:
+        return jsonify({"error": f"写入失败: {str(e)}"}), 500
+    try:
+        parsed_ok = parse_track_to_csv(gpx_path, csv_path)
+        entity_rejected = False
+    except _EntityRejected:
+        parsed_ok = False
+        entity_rejected = True
+    if parsed_ok:
         with get_db() as conn:
             conn.execute(
                 "INSERT INTO gpx_records (project_id, original_name, gpx_path, csv_path) VALUES (?, ?, ?, ?)",
-                (project_id, filename, gpx_path, csv_path),
+                (pid, filename, gpx_path, csv_path),
             )
         return jsonify({"message": "OK"})
     else:
@@ -336,6 +406,8 @@ def upload_gpx():
             os.remove(gpx_path)
         if os.path.exists(csv_path):
             os.remove(csv_path)
+        if entity_rejected:
+            return jsonify({"error": "XML 实体声明不被允许"}), 400
         return jsonify({"error": "格式不正确"}), 500
 
 

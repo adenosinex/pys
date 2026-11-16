@@ -21,6 +21,7 @@ app's data directory only and are never rendered back (host only).
 import base64
 import gzip
 import hashlib
+import html
 import json
 import os
 import re
@@ -694,6 +695,27 @@ def _probe_204(url, timeout=15):
     return "000", None
 
 
+def _port_is_listening(port):
+    """True if something already accepts TCP on 127.0.0.1:port."""
+    import socket as _socket
+
+    try:
+        with _socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_port_free(port, timeout=5.0):
+    """Bounded wait until nothing listens on 127.0.0.1:port. Best effort."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _port_is_listening(port):
+            return True
+        time.sleep(0.1)
+    return not _port_is_listening(port)
+
+
 def test_node(mihomo, node, light=False):
     """Run one node through a throwaway mihomo instance and measure
     egress / latency / speed. Returns a result dict (ok flag plus
@@ -701,6 +723,12 @@ def test_node(mihomo, node, light=False):
     is skipped (connectivity, latency and egress identity only) and
     the caller keeps the previous full-run speed on record."""
     result = {"ok": False, "tested_at": time.time()}
+    if _port_is_listening(TEST_PORT):
+        # A stale or foreign process already owns the test port:
+        # refuse instead of connecting to it and misattributing
+        # its answers to this node.
+        result["error"] = "test_port_busy"
+        return result
     os.makedirs(SCRATCH_DIR, exist_ok=True)
     try:
         os.chmod(SCRATCH_DIR, 0o700)
@@ -729,12 +757,18 @@ def test_node(mihomo, node, light=False):
         import socket as _socket
         up = False
         for _ in range(40):
+            if proc.poll() is not None:
+                # Our client died: whatever answers the port now
+                # is not ours — never trust it.
+                break
             try:
                 with _socket.create_connection(("127.0.0.1", TEST_PORT), timeout=0.5):
                     up = True
                     break
             except OSError:
                 time.sleep(0.25)
+        if up and proc.poll() is not None:
+            up = False
         if not up:
             result["error"] = "client_start_failed"
             return result
@@ -798,6 +832,14 @@ def test_node(mihomo, node, light=False):
             proc.wait(timeout=5)
         except Exception:
             proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        # Wait until the port is actually free: the next
+        # test_node() call must never connect to this dying
+        # instance and mistake it for its own.
+        _wait_port_free(TEST_PORT, timeout=5)
         try:
             os.unlink(cfg_path)
         except OSError:
@@ -1336,12 +1378,43 @@ def _auto_refresh_stale(store):
         _save_store(store)
 
 
+SELF_SUB_SECRET_FILE = os.path.join(DATA_DIR, "self_sub.secret.txt")
+_SELF_SUB_NAME_RE = re.compile(r"^[0-9a-f]{32}\.yaml$")
+
+
+def _self_sub_url(environ):
+    """Build this request's self-hosted subscription URL, or None.
+
+    The subscription filename is itself a credential: it lives only in
+    DATA_DIR/self_sub.secret.txt (one line), never in code. Returns None
+    when the file is missing/unreadable/malformed or no Host was sent;
+    callers render a placeholder instead of any hardcoded fallback.
+    """
+    try:
+        with open(SELF_SUB_SECRET_FILE, encoding="utf-8") as fh:
+            name = fh.read().strip()
+    except OSError:
+        return None
+    if not _SELF_SUB_NAME_RE.match(name):
+        return None
+    host = (environ.get("HTTP_HOST") or "").strip()
+    if not host:
+        return None
+    return "https://%s/sub/%s" % (host, name)
+
+
+def _render_page(environ):
+    url = _self_sub_url(environ)
+    value = html.escape(url, quote=True) if url else "未配置订阅文件名"
+    return PAGE.replace("__SELF_SUB_URL__", value, 1)
+
+
 def application(environ, start_response):
     method = environ.get("REQUEST_METHOD", "GET")
     path = environ.get("PATH_INFO") or "/"
 
     if path == "/" and method == "GET":
-        body = PAGE.encode("utf-8")
+        body = _render_page(environ).encode("utf-8")
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"),
                                   ("Content-Length", str(len(body)))])
         return [body]
@@ -1655,7 +1728,7 @@ PAGE = """<!DOCTYPE html>
     <div class="meta">自建节点的订阅链接（3 个节点：AnyTLS IPv6 / AnyTLS IPv4 / Hysteria2 IPv6）。
     默认是 IPv6 入口；IPv6 拉不到时把主机名 debi 换成 debi4 走 IPv4 即可。</div>
     <div class="linkbox">
-      <input type="text" readonly value="https://debi.su7.dpdns.org/sub/6f09ed75fc16a785f191d741146f3fc7.yaml">
+      <input type="text" readonly value="__SELF_SUB_URL__">
       <button type="button" class="copy" id="vps-copy">复制链接</button>
     </div>
   </div>

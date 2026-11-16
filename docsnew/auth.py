@@ -14,7 +14,21 @@ import secrets
 import time
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
-_RUNTIME = os.path.join(_BASE, ".runtime")
+def _platform_data_dir(base):
+    """Persistent data directory: the platform's DATA_DIR env var when
+    provided, else the ./data symlink the panel creates inside the
+    project folder (pointing at the central data directory), else
+    ./.runtime for standalone local runs."""
+    env = os.environ.get("DATA_DIR")
+    if env:
+        return env
+    link = os.path.join(base, "data")
+    if os.path.isdir(link):
+        return link
+    return os.path.join(base, ".runtime")
+
+
+_RUNTIME = _platform_data_dir(_BASE)
 ACCOUNT_FILE = os.environ.get("ACCOUNT_STATE_FILE") or os.path.join(_RUNTIME, "account.json")
 PBKDF2_ROUNDS = 200_000
 SESSION_TTL = 30 * 24 * 3600

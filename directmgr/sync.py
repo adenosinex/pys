@@ -38,7 +38,15 @@ RULE_SUFFIX = ",DIRECT"
 
 TOPKEYS = ["mixed-port", "allow-lan", "mode", "log-level", "dns",
            "proxies", "geox-url", "proxy-groups", "rule-providers", "rules"]
-EXPECT = {"proxies": 18, "proxy-groups": 12, "rule-providers": 5}
+# Minimum section sizes. These counts guard against truncated or
+# mangled files, NOT a fixed inventory: node/group/provider counts
+# legitimately change whenever the subscription grows or shrinks
+# (nodes added/removed, protocol expansion), so exact equality rots
+# and blocks every save. Floors stay valid across inventory changes;
+# the top-level key check plus the rules-delta check in the sync
+# path still catch structural damage. Never pin current counts
+# here -- that just re-creates this same failure on the next change.
+MIN_COUNTS = {"proxies": 1, "proxy-groups": 1, "rule-providers": 1}
 
 # Legacy section-2 anchor lines (first-landing migration source).
 LEGACY_HEAD = "  # ---- 2. 自有域名直连 ----"
@@ -161,9 +169,9 @@ def assert_structure(text, expect_rules_delta_from=None):
             counts[cur] += 1
         elif cur == "rules" and l.startswith("  - "):
             counts["rules"] = counts.get("rules", 0) + 1
-    for k, v in EXPECT.items():
-        if counts.get(k) != v:
-            raise ValueError("%s count %s != %s" % (k, counts.get(k), v))
+    for k, v in MIN_COUNTS.items():
+        if counts.get(k, 0) < v:
+            raise ValueError("%s count %s < minimum %s" % (k, counts.get(k), v))
     return counts
 
 

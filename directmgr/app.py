@@ -37,6 +37,7 @@ and it opens nothing else.
 import json
 import os
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -147,7 +148,7 @@ def _ssh_run(cfg, remote_cmd, stdin_text=None, timeout=60):
 
 
 def _read_remote(cfg, path):
-    return _ssh_run(cfg, "cat -- " + path)
+    return _ssh_run(cfg, "cat -- " + shlex.quote(path))
 
 
 def _write_remote(cfg, path, text, ts):
@@ -163,8 +164,12 @@ def _write_remote(cfg, path, text, ts):
     )
     import base64
     b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    # path/ts are shell words on the peer box: quote them so a space or
+    # metacharacter in a configured path can never break out into a
+    # second command. (b64 is base64 alphabet only, safe inside the
+    # single quotes as-is.)
     cmd = ("python3 -c \"import base64;exec(base64.b64decode('%s'))\" %s %s"
-           % (b64, path, ts))
+           % (b64, shlex.quote(path), shlex.quote(ts)))
     _ssh_run(cfg, cmd, stdin_text=text, timeout=60)
 
 

@@ -429,8 +429,14 @@ def application(environ, start_response):
                     ("Content-Length", str(size)),
                 ],
             )
-            fh = open(fpath, "rb")
-            return iter(lambda: fh.read(1024 * 1024), b"")
+            def _chunks():
+                with open(fpath, "rb") as fh:
+                    while True:
+                        chunk = fh.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+            return _chunks()
 
         if path == "/api/delete" and method == "POST":
             data = _read_json(environ)

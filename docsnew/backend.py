@@ -36,7 +36,7 @@ def _yaml_load(text):
 logger = logging.getLogger(__name__)
 
 # --- request shims (fed by the dispatcher) ---
-_REQ = {"json": None, "args": {}}
+_REQ_LOCAL = threading.local()
 
 
 def jsonify(payload=None, **kwargs):
@@ -46,7 +46,7 @@ def jsonify(payload=None, **kwargs):
 
 
 def args_get(key, default=None):
-    return _REQ["args"].get(key, default)
+    return getattr(_REQ_LOCAL, "args", {}).get(key, default)
 
 
 
@@ -334,7 +334,7 @@ def current_doc(doc_id: str) -> tuple[dict, Path] | None:
 
 
 def json_body() -> dict:
-    data = _REQ["json"]
+    data = getattr(_REQ_LOCAL, "json", None)
     return data if isinstance(data, dict) else {}
 
 
@@ -782,8 +782,8 @@ def _normalize(result):
 
 
 def handle(method, subpath, args, json_data):
-    _REQ["json"] = json_data
-    _REQ["args"] = args or {}
+    _REQ_LOCAL.json = json_data
+    _REQ_LOCAL.args = args or {}
     seg = [s for s in subpath.split("/") if s != ""]
     if seg and seg[0] == "skip":
         seg = seg[1:]

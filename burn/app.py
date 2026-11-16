@@ -268,6 +268,9 @@ def h_set(environ, start_response, code):
             "INSERT OR REPLACE INTO kv (code, content, expire_at, burn, created_at)"
             " VALUES (?, ?, ?, ?, ?)",
             (code, content, expire_at, burn, time.time()))
+        conn.execute(
+            "DELETE FROM kv WHERE expire_at IS NOT NULL AND expire_at <= ?",
+            (time.time(),))
     return _json(start_response, "200 OK", {"ok": True, "code": code})
 
 
