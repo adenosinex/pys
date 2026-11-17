@@ -19,9 +19,12 @@ LOCAL_API_KEY），永不硬编码、不回显。
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -54,6 +57,10 @@ DEFAULT_CONFIG = {
     "local_model": "gemini-3.7-flash",
     "local_base_url": "http://192.168.31.240:8083/v1",
     "local_timeout": 50,
+    "vertex_model": "vertex/gemini-3.8-flash",
+    "vertex_base_url": "http://127.0.0.1:19501/v1",
+    "vertex_timeout": 120,
+    "reasoning_effort": "low",
     "concurrency": 6,
     "max_input_chars": 30000,
     "recent_3h_extra": True,
@@ -72,6 +79,11 @@ _FLASH_MODELS = (
     "gemini-3.8-flash-low",
 )
 
+# Vertex 思考级别：实测 2026-11-16，low 让推理 token 归零（约 1500/篇 -> 0），
+# 摘要/分类质量不变。只作用于 vertex provider；其它 provider 不发该参数。
+# 空字符串 = 不发该参数（模型默认）；'none' 会被 Vertex 拒收（400）。
+_REASONING_EFFORTS = ("high", "low", "max", "medium", "minimal")
+
 # 摘要标签的方括号（chr 写法，避免源码里出现全角括号字形）。
 _LB = chr(12304)
 _RB = chr(12305)
@@ -82,6 +94,8 @@ def _display_model(cfg: dict) -> str:
         return cfg.get("flash_model", "")
     if cfg.get("provider") == "local":
         return cfg.get("local_model", "")
+    if cfg.get("provider") == "vertex":
+        return cfg.get("vertex_model", "")
     return cfg.get("openrouter_model", "")
 
 
@@ -108,13 +122,16 @@ def save_config(updates: dict) -> Tuple[bool, str, dict]:
     for key, value in (updates or {}).items():
         if key in DEFAULT_CONFIG:
             cfg[key] = value
-    if cfg.get("provider") not in ("flash", "openrouter", "local"):
-        return False, "provider 只能是 flash、openrouter 或 local。", cfg
+    if cfg.get("provider") not in ("flash", "openrouter", "local", "vertex"):
+        return False, "provider 只能是 flash、openrouter、local 或 vertex。", cfg
     if cfg.get("flash_model") not in _FLASH_MODELS:
         return False, "flash_model 不支持。", cfg
     if cfg.get("title_style") not in _TITLE_STYLES:
         return False, "title_style 不支持。", cfg
-    for key in ("flash_timeout", "openrouter_timeout", "local_timeout"):
+    cfg["reasoning_effort"] = str(cfg.get("reasoning_effort") or "")
+    if cfg["reasoning_effort"] not in ("",) + _REASONING_EFFORTS:
+        return False, "reasoning_effort 不支持。", cfg
+    for key in ("flash_timeout", "openrouter_timeout", "local_timeout", "vertex_timeout"):
         try:
             cfg[key] = max(5, min(600, int(cfg[key])))
         except (TypeError, ValueError):
@@ -125,7 +142,7 @@ def save_config(updates: dict) -> Tuple[bool, str, dict]:
         cfg["default_limit"] = max(0, min(5000, int(cfg["default_limit"])))
     except (TypeError, ValueError):
         return False, "数值字段必须是数字。", cfg
-    for key in ("flash_base_url", "openrouter_model", "openrouter_base_url", "local_model", "local_base_url"):
+    for key in ("flash_base_url", "openrouter_model", "openrouter_base_url", "local_model", "local_base_url", "vertex_model", "vertex_base_url"):
         cfg[key] = str(cfg.get(key) or "").strip()
         if not cfg[key]:
             return False, "%s 不能为空。" % key, cfg
@@ -189,7 +206,7 @@ AI_PROMPT = r"""
 原始笔记：
 """
 
-# Flash 专属格式提示（只对 provider=flash 生效）：共享 Prompt 逐字不动，
+# Flash 专属格式提示（只对 provider=flash/vertex 生效）：共享 Prompt 逐字不动，
 # 这段只追加给 Flash，替代已删除的代码归一化（2026-11-14 三篇实测 4/4 全过）。
 FLASH_FORMAT_NOTE = (
     "\n格式自查（输出前逐项核对，必须全部满足）：\n"
@@ -297,6 +314,17 @@ TOP_CODES = frozenset({
     "adu", "unk",
 })
 
+# Valid classify pairs, derived from the prompt table (single source
+# of truth: CLASSIFY_SYSTEM_PROMPT). Pairs mentioned in rules and
+# examples are table pairs too; the regex only matches lowercase
+# code-shaped pairs whose first code is a known top code.
+_PAIR_RE = re.compile(r"\b([a-z]{2,6}) ([a-z]{2,6})\b")
+VALID_PAIRS = frozenset(
+    (c1, c2)
+    for c1, c2 in _PAIR_RE.findall(CLASSIFY_SYSTEM_PROMPT)
+    if c1 in TOP_CODES
+)
+
 
 # ============================================================
 # 文本处理工具（与脚本一致）
@@ -368,14 +396,33 @@ def has_existing_ai_summary(content: str) -> bool:
     )
 
 
-def is_valid_quick_card(content: str) -> bool:
-    _, body = split_frontmatter(content)
+class FormatError(RuntimeError):
+    """AI 输出格式不合格。区别于传输/HTTP 错误：格式错误会触发批量熔断。"""
+
+
+def validate_summary_output(ai_text: str) -> None:
+    """Fresh-output gate: model output must be a complete quick card
+    before anything is saved. The format lives in the prompt; this
+    only verifies, never rewrites. Raises FormatError naming the
+    missing markers."""
+    _, body = split_frontmatter(ai_text)
     head = body.lstrip()[:300]
-    if not re.search(r"^【主题】\s*\*\*.+", head, flags=re.MULTILINE):
-        return False
-    for tag in ("【关键词】", "【关键句】", "【结论】"):
+    missing = []
+    title_pat = r"^" + _LB + "主题" + _RB + r"\s*\*\*.+"
+    if not re.search(title_pat, head, flags=re.MULTILINE):
+        missing.append(_LB + "主题" + _RB + "** 标题行")
+    for tag in (_LB + "关键词" + _RB, _LB + "关键句" + _RB, _LB + "结论" + _RB):
         if tag not in head:
-            return False
+            missing.append(tag)
+    if missing:
+        raise FormatError("AI 摘要格式不合格，缺少：" + "、".join(missing))
+
+
+def is_valid_quick_card(content: str) -> bool:
+    try:
+        validate_summary_output(content)
+    except FormatError:
+        return False
     return True
 
 
@@ -577,6 +624,13 @@ class AIClient:
             self.model = cfg["local_model"]
             self.timeout = int(cfg["local_timeout"])
             self.extra_headers = {}
+        elif cfg["provider"] == "vertex":
+            self.label = "Vertex（中继）"
+            self.base_url = cfg["vertex_base_url"]
+            self.api_key = _get_key("RELAY_API_KEY")
+            self.model = cfg["vertex_model"]
+            self.timeout = int(cfg["vertex_timeout"])
+            self.extra_headers = {}
         else:
             self.label = "OpenRouter"
             self.base_url = cfg["openrouter_base_url"]
@@ -595,6 +649,10 @@ class AIClient:
             "messages": messages,
             "temperature": temperature,
         }
+        if self.cfg.get("provider") == "vertex":
+            effort = self.cfg.get("reasoning_effort", "low")
+            if effort in _REASONING_EFFORTS:
+                payload["reasoning_effort"] = effort
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -632,7 +690,7 @@ class AIClient:
     def summarize(self, note_text: str) -> str:
         note_text = note_text[: int(self.cfg["max_input_chars"])]
         user_prompt = AI_PROMPT + "\n" + note_text
-        if self.cfg.get("provider") == "flash":
+        if self.cfg.get("provider") in ("flash", "vertex"):
             user_prompt = AI_PROMPT + FLASH_FORMAT_NOTE + "\n" + note_text
         return self.chat(
             [
@@ -770,6 +828,7 @@ def _summary_phase(content, item, ai, recent_extra, log):
     log("  [摘要] 调用 AI...")
     ai_text = ai.summarize(content)
     log("  [摘要] AI 返回：%s 字符" % f"{len(ai_text):,}")
+    validate_summary_output(ai_text)
     new_title = extract_title(ai_text)
     if not new_title:
         raise RuntimeError("AI 返回中没有找到主题标题")
@@ -821,6 +880,8 @@ def _classify_phase(content, item, ai, force, title_style, log):
     code1, code2, label = ai.classify(base_title, snippet)
     if code1 == "unk":
         return content, "unk", "AI 判定无法判断（unk），已记住不再重试"
+    if (code1, code2) not in VALID_PAIRS:
+        raise FormatError("分类代号不在代码表内：%s %s" % (code1, code2))
     new_title = build_title(code1, code2, base_title, title_style)
     log("  [分类] AI 分类：%s %s（%s）" % (code1, code2, label or "无标签"))
     log("  [分类] 新标题：" + new_title)
@@ -950,6 +1011,8 @@ def _persist_job_summary(job: dict) -> None:
             "id": job["id"],
             "job": job["job"],
             "status": job["status"],
+            "aborted": bool(job.get("aborted", False)),
+            "abort_reason": job.get("abort_reason"),
             "total": job["total"],
             "counters": dict(job["counters"]),
             "provider": job.get("provider"),
@@ -995,6 +1058,10 @@ def _run_job_thread(job: dict) -> None:
         _run_process(job, cfg, ai, opts)
         job["elapsed_ms"] = int((time.time() - started) * 1000)
         job["status"] = "done"
+        if job.get("aborted"):
+            _job_log(job, "[熔断] %s；熔断跳过 %d 篇" % (
+                job.get("abort_reason"),
+                job["counters"].get("aborted", 0)))
         _job_log(job, "=" * 60)
         _job_log(job, f"处理完成：成功 {job['counters']['success']}，"
                       f"跳过 {job['counters']['skip']}，"
@@ -1009,6 +1076,35 @@ def _run_job_thread(job: dict) -> None:
             if _RUNNING.get("job_id") == job["id"]:
                 _RUNNING["job_id"] = None
         _persist_job_summary(job)
+
+
+def _gate_account(job, gate, lock, abort_event, called_ai, format_failed):
+    """Batch circuit breaker: stop all further AI calls when the first
+    AI output fails format validation, or after 3 consecutive format
+    failures. Transport errors never trip the gate."""
+    if not called_ai and not format_failed:
+        return
+    with lock:
+        if gate["aborted"]:
+            return
+        if format_failed:
+            gate["attempted"] += 1
+            gate["consec"] += 1
+            if gate["attempted"] == 1:
+                reason = "首个 AI 输出格式不合格"
+            elif gate["consec"] >= 3:
+                reason = "连续 3 次 AI 输出格式不合格"
+            else:
+                reason = ""
+            if reason:
+                gate["aborted"] = True
+                job["aborted"] = True
+                job["abort_reason"] = reason
+                abort_event.set()
+                _job_log(job, (_LB + "熔断" + _RB + "%s，停止后续调用") % reason)
+        elif called_ai:
+            gate["attempted"] += 1
+            gate["consec"] = 0
 
 
 def _run_process(job: dict, cfg: dict, ai: AIClient, opts: dict) -> None:
@@ -1037,6 +1133,9 @@ def _run_process(job: dict, cfg: dict, ai: AIClient, opts: dict) -> None:
     by_id = {it["id"]: it for it in items}
     run_opts = {"recent_3h_extra": recent_extra, "force": force,
                 "dry_run": dry_run, "title_style": title_style}
+    gate = {"attempted": 0, "consec": 0, "aborted": False}
+    gate_lock = threading.Lock()
+    abort_event = threading.Event()
 
     def _one(index, target):
         item = by_id[target["id"]]
@@ -1047,17 +1146,33 @@ def _run_process(job: dict, cfg: dict, ai: AIClient, opts: dict) -> None:
         _job_log(job, "=" * 60)
         _job_log(job, "[%d/%d] %s" % (index, len(targets), item.get("title") or ""))
         _job_log(job, "ID: %s" % item.get("id"))
-        try:
-            res = _process_one(item, ai, run_opts, store, log)
-            result = res["outcome"]
-            detail = "摘要：" + res["summary"][1][:80] + "；分类：" + res["classify"][1][:80]
-        except Exception as e:
-            result, detail = "error", "%s: %s" % (type(e).__name__, e)
-            res = {"summary": ("error", detail), "classify": ("skip", ""),
-                   "saved": False}
-            _job_log(job, "  [错误] " + detail)
+        aborted_skip = False
+        if abort_event.is_set():
+            res = {"summary": ("skip", "批量熔断：已停止后续调用"),
+                   "classify": ("skip", ""), "saved": False}
+            result, detail = "skip", "批量熔断：已停止后续调用"
+            aborted_skip = True
+            called_ai = False
+            format_failed = False
+            _job_log(job, "  [熔断跳过] 不再调用 AI")
+        else:
+            try:
+                res = _process_one(item, ai, run_opts, store, log)
+                result = res["outcome"]
+                detail = "摘要：" + res["summary"][1][:80] + "；分类：" + res["classify"][1][:80]
+                called_ai = res["summary"][0] == "success" or res["classify"][0] in ("success", "unk")
+                format_failed = False
+            except Exception as e:
+                result, detail = "error", "%s: %s" % (type(e).__name__, e)
+                res = {"summary": ("error", detail), "classify": ("skip", ""),
+                       "saved": False}
+                called_ai = isinstance(e, FormatError)
+                format_failed = called_ai
+                _job_log(job, "  [错误] " + detail)
         with job["lock"]:
             job["counters"][result] += 1
+            if aborted_skip:
+                job["counters"]["aborted"] = job["counters"].get("aborted", 0) + 1
             job["done"] += 1
             if res["summary"][0] == "success":
                 job["counters"]["summary_success"] = job["counters"].get("summary_success", 0) + 1
@@ -1071,6 +1186,7 @@ def _run_process(job: dict, cfg: dict, ai: AIClient, opts: dict) -> None:
                 "classify": res["classify"][0],
                 "classify_detail": str(res["classify"][1])[:200],
                 "saved": res["saved"]})
+        _gate_account(job, gate, gate_lock, abort_event, called_ai, format_failed)
         _job_log(job, "  [%s] %s" % (result, detail[:120]))
         return result
 
@@ -1130,6 +1246,10 @@ def handle(action: str, method: str, args: dict, data):
         with _JOBS_LOCK:
             running = _RUNNING.get("job_id")
         return 200, {"ok": True, "jobs": _load_job_summaries(), "running": running}
+    if action == "sync-now" and method == "POST":
+        return _handle_sync_now()
+    if action == "sync-status" and method == "GET":
+        return _handle_sync_status()
     return 400, {"ok": False, "error": "不支持的请求"}
 
 
@@ -1210,3 +1330,94 @@ def _handle_status(args: dict):
         if job["status"] in ("done", "failed") or args.get("results") == "1":
             snapshot["results"] = list(job["results"])
     return 200, {"ok": True, "job": snapshot}
+
+
+# ============================================================
+# 手动同步：跑一次与定时器相同的 --quick（共用同一把锁）
+# ============================================================
+
+_SYNC_SCRIPT = "/srv/apphub/bin/docsnew_sync.py"
+_SYNC_LOCK = os.path.join(_CONFIG_DIR, "sync.lock")
+_SYNC_LOG = os.path.join(_CONFIG_DIR, "sync-manual.log")
+_SYNC_MANUAL = {"pid": None, "started_at": None, "proc": None}
+_SYNC_MANUAL_LOCK = threading.Lock()
+
+
+def _sync_lock_held() -> bool:
+    """True if another process holds the sync lock right now."""
+    try:
+        fd = os.open(_SYNC_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _pid_alive(pid) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError, TypeError, OverflowError):
+        return True
+    return True
+
+
+def _handle_sync_now():
+    if not os.path.exists(_SYNC_SCRIPT):
+        return 500, {"ok": False, "error": "同步脚本不存在"}
+    if _sync_lock_held():
+        return 409, {"ok": False, "error": "同步正在运行，请等它完成再试。",
+                     "running": True}
+    try:
+        log_fh = open(_SYNC_LOG, "wb")
+    except OSError as exc:
+        return 500, {"ok": False, "error": "无法打开同步日志：%s" % exc}
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, _SYNC_SCRIPT, "--quick"],
+            stdout=log_fh, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+            close_fds=True)
+    except OSError as exc:
+        log_fh.close()
+        return 500, {"ok": False, "error": "启动同步失败：%s" % exc}
+    log_fh.close()
+    with _SYNC_MANUAL_LOCK:
+        _SYNC_MANUAL["pid"] = proc.pid
+        _SYNC_MANUAL["started_at"] = int(time.time())
+        _SYNC_MANUAL["proc"] = proc
+    return 200, {"ok": True, "started": True, "pid": proc.pid}
+
+
+def _handle_sync_status():
+    with _SYNC_MANUAL_LOCK:
+        pid = _SYNC_MANUAL.get("pid")
+        started_at = _SYNC_MANUAL.get("started_at")
+        proc = _SYNC_MANUAL.get("proc")
+    alive = _pid_alive(pid)
+    if proc is not None and proc.poll() is not None:
+        alive = False
+    held = _sync_lock_held()
+    running = bool(alive or held)
+    source = "manual" if alive else ("timer" if held else None)
+    tail = []
+    try:
+        with open(_SYNC_LOG, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+        tail = [ln for ln in lines if ln.strip()][-8:]
+    except OSError:
+        tail = []
+    return 200, {"ok": True, "running": running, "source": source,
+                 "started_at": started_at, "log": tail}

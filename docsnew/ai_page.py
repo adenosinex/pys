@@ -158,6 +158,16 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
     </details>
   </div>
 
+  <div class="card" id="card-sync">
+    <h2>Apple 同步</h2>
+    <p class="desc">把 Apple 上的新笔记拉下来，并把 debi 这边的处理结果写回去。同步完成后自动扫描，有待处理文档就接着跑 AI 处理。定时器每 15 分钟自动跑一次（只同步，不处理）；已有同步在运行时点击会提示正忙。</p>
+    <div class="actions">
+      <button type="button" class="primary" id="btn-sync-now">立即同步</button>
+    </div>
+    <div class="counts" id="sync-status">尚未手动同步过。</div>
+    <div class="mini" id="sync-log"></div>
+  </div>
+
   <div class="card">
     <h2>配置</h2>
     <p class="desc">模型与运行参数。凭据不在这里保存，见下方凭据区。</p>
@@ -165,6 +175,7 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
       <label>Provider
         <select id="cfg-provider">
           <option value="flash">3.8 Flash（本机，默认）</option>
+          <option value="vertex">Vertex（中继）</option>
           <option value="openrouter">OpenRouter（云端）</option>
           <option value="local">本地模型（局域网）</option>
         </select>
@@ -182,6 +193,19 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
       <label>OpenRouter 模型 <input type="text" id="cfg-or-model"></label>
       <label>OpenRouter 地址 <input type="text" id="cfg-or-url"></label>
       <label>OpenRouter 超时（秒） <input type="number" id="cfg-or-timeout" min="5" max="600" step="1"></label>
+      <label>Vertex 模型 <input type="text" id="cfg-vx-model"></label>
+      <label>Vertex 地址 <input type="text" id="cfg-vx-url"></label>
+      <label>Vertex 超时（秒） <input type="number" id="cfg-vx-timeout" min="5" max="600" step="1"></label>
+      <label>推理级别（仅 Vertex）
+        <select id="cfg-reasoning">
+          <option value="">不指定（模型默认）</option>
+          <option value="minimal">minimal（最省）</option>
+          <option value="low">low（低）</option>
+          <option value="medium">medium（中）</option>
+          <option value="high">high（高）</option>
+          <option value="max">max（最高）</option>
+        </select>
+      </label>
       <label>本地模型 <input type="text" id="cfg-local-model"></label>
       <label>本地地址 <input type="text" id="cfg-local-url"></label>
       <label>本地超时（秒） <input type="number" id="cfg-local-timeout" min="5" max="600" step="1"></label>
@@ -214,6 +238,15 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
       </div>
       <button type="button" data-key="LOCAL_API_KEY" class="key-save">保存</button>
       <button type="button" data-key="LOCAL_API_KEY" class="key-clear">清除</button>
+    </div>
+    <div class="keyrow">
+      <div class="grow">
+        <label>中继 Key（Vertex） <span id="st-relay-key"></span>
+          <input type="password" id="in-relay-key" autocomplete="off" placeholder="apirelay 中继口令（Vertex 用）">
+        </label>
+      </div>
+      <button type="button" data-key="RELAY_API_KEY" class="key-save">保存</button>
+      <button type="button" data-key="RELAY_API_KEY" class="key-clear">清除</button>
     </div>
     <div class="keyrow">
       <div class="grow">
@@ -481,6 +514,10 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
       $("cfg-or-model").value = c.openrouter_model || "";
       $("cfg-or-url").value = c.openrouter_base_url || "";
       $("cfg-or-timeout").value = c.openrouter_timeout;
+      $("cfg-vx-model").value = c.vertex_model || "";
+      $("cfg-vx-url").value = c.vertex_base_url || "";
+      $("cfg-vx-timeout").value = c.vertex_timeout;
+      $("cfg-reasoning").value = (c.reasoning_effort === undefined || c.reasoning_effort === null) ? "low" : c.reasoning_effort;
       $("cfg-local-model").value = c.local_model || "";
       $("cfg-local-url").value = c.local_base_url || "";
       $("cfg-local-timeout").value = c.local_timeout;
@@ -489,8 +526,8 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
       $("opt-force").checked = !!c.force_reclassify;
       $("opt-dry").checked = !!c.dry_run;
       $("opt-style").value = c.title_style || "bracket";
-      var model = c.provider === "flash" ? c.flash_model : (c.provider === "local" ? c.local_model : c.openrouter_model);
-      var pname = c.provider === "flash" ? "3.8 Flash" : (c.provider === "local" ? "本地模型" : "OpenRouter");
+      var model = c.provider === "flash" ? c.flash_model : (c.provider === "vertex" ? c.vertex_model : (c.provider === "local" ? c.local_model : c.openrouter_model));
+      var pname = c.provider === "flash" ? "3.8 Flash" : (c.provider === "vertex" ? "Vertex" : (c.provider === "local" ? "本地模型" : "OpenRouter"));
       $("st-provider").textContent = pname + " · " + model;
       var keys = d.credentials || {};
       var keyBadge = $("st-key");
@@ -499,7 +536,7 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
         keyBadge.className = "badge ok";
         $("key-alert").hidden = true;
       } else {
-        var active = c.provider === "local" ? keys.LOCAL_API_KEY : keys.OP_API_KEY;
+        var active = c.provider === "local" ? keys.LOCAL_API_KEY : (c.provider === "vertex" ? keys.RELAY_API_KEY : keys.OP_API_KEY);
         if (active && active.configured) {
           keyBadge.textContent = "Key 已配置（" + (active.source === "env" ? "环境变量" : "页面保存") + "）";
           keyBadge.className = "badge ok";
@@ -516,6 +553,7 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
       }
       keyStatus("st-op-key", "OP_API_KEY");
       keyStatus("st-local-key", "LOCAL_API_KEY");
+      keyStatus("st-relay-key", "RELAY_API_KEY");
       keyStatus("st-apple-key", "APPLE_SYNC_CODE");
       keyStatus("st-cf-key", "CF_MIRROR_PASSPHRASE");
     });
@@ -540,6 +578,69 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
     }).catch(function () { $("jobs-list").innerHTML = '<div class="empty">加载失败。</div>'; });
   }
 
+  var syncPoller = null;
+  var syncChainArmed = false;
+  function chainProcessAfterSync() {
+    var body = {job: "process"};
+    body.scan_days = parseInt($("opt-days").value, 10) || 0;
+    body.recent_3h_extra = $("opt-recent").checked;
+    body.force_reclassify = $("opt-force").checked;
+    $("sync-status").textContent = "同步完成，正在扫描待处理文档…";
+    api("/docapi/ai/scan", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})
+      .then(function (d) {
+        if (!d.ok) { $("sync-status").textContent = "同步完成，扫描失败：" + (d.error || "未知错误"); return; }
+        if ((d.targets_total || 0) > 0) {
+          $("sync-status").textContent = "同步完成，发现 " + d.targets_total + " 篇待处理，开始 AI 处理…";
+          runJob("process");
+        } else {
+          $("sync-status").textContent = "同步完成，无待处理文档。";
+        }
+      })
+      .catch(function (e) { $("sync-status").textContent = "同步完成，扫描失败：" + e.message; });
+  }
+  function syncRender(d) {
+    var st = $("sync-status"), lg = $("sync-log");
+    if (d.running) {
+      st.textContent = d.source === "manual" ? "同步运行中…（手动触发）" : "同步运行中…（定时器）";
+    } else {
+      st.textContent = "同步空闲。";
+    }
+    var lines = (d.log || []).filter(function (l) { return l.trim(); });
+    lg.textContent = lines.join("\n");
+  }
+  function syncPoll() {
+    api("/docapi/ai/sync-status").then(function (d) {
+      if (!d.ok) { $("btn-sync-now").disabled = false; return; }
+      syncRender(d);
+      if (d.running) { syncPoller = setTimeout(syncPoll, 2000); }
+      else {
+        $("btn-sync-now").disabled = false;
+        if (syncChainArmed) { syncChainArmed = false; chainProcessAfterSync(); }
+      }
+    }).catch(function () { syncPoller = setTimeout(syncPoll, 3000); });
+  }
+  $("btn-sync-now").addEventListener("click", function () {
+    var btn = $("btn-sync-now");
+    btn.disabled = true;
+    $("sync-status").textContent = "正在启动同步…";
+    api("/docapi/ai/sync-now", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({})})
+      .then(function (d) {
+        if (!d.ok) {
+          $("sync-status").textContent = d.error || "启动失败";
+          btn.disabled = false;
+          return;
+        }
+        syncChainArmed = true;
+        syncPoll();
+      })
+      .catch(function (e) {
+        $("sync-status").textContent = "启动失败：" + e.message;
+        btn.disabled = false;
+      });
+  });
+
   $("back-link").href = base + "/docs";
   $("btn-dl-import").addEventListener("click", function () {
     location.href = base + "/docapi/ai/import-script";
@@ -561,6 +662,10 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
       openrouter_model: $("cfg-or-model").value.trim(),
       openrouter_base_url: $("cfg-or-url").value.trim(),
       openrouter_timeout: parseInt($("cfg-or-timeout").value || "120", 10),
+      vertex_model: $("cfg-vx-model").value.trim(),
+      vertex_base_url: $("cfg-vx-url").value.trim(),
+      vertex_timeout: parseInt($("cfg-vx-timeout").value || "120", 10),
+      reasoning_effort: $("cfg-reasoning").value,
       local_model: $("cfg-local-model").value.trim(),
       local_base_url: $("cfg-local-url").value.trim(),
       local_timeout: parseInt($("cfg-local-timeout").value || "50", 10),
@@ -582,7 +687,7 @@ pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
   document.querySelectorAll(".key-save").forEach(function (btn) {
     btn.addEventListener("click", function () {
       var key = btn.getAttribute("data-key");
-      var inputIds = {"OP_API_KEY": "in-op-key", "LOCAL_API_KEY": "in-local-key", "APPLE_SYNC_CODE": "in-apple-key", "CF_MIRROR_PASSPHRASE": "in-cf-key"};
+      var inputIds = {"OP_API_KEY": "in-op-key", "LOCAL_API_KEY": "in-local-key", "RELAY_API_KEY": "in-relay-key", "APPLE_SYNC_CODE": "in-apple-key", "CF_MIRROR_PASSPHRASE": "in-cf-key"};
       var input = $(inputIds[key]);
       var v = input.value.trim();
       if (!v) { $("creds-msg").textContent = "请先粘贴 Key"; return; }

@@ -1396,6 +1396,7 @@ def _auto_refresh_stale(store):
 
 
 SELF_SUB_SECRET_FILE = os.path.join(DATA_DIR, "self_sub.secret.txt")
+NC_SUB_SECRET_FILE = os.path.join(DATA_DIR, "nc_sub.secret.txt")
 _SELF_SUB_NAME_RE = re.compile(r"^[0-9a-f]{32}\.yaml$")
 
 
@@ -1420,10 +1421,29 @@ def _self_sub_url(environ):
     return "https://%s/sub/%s" % (host, name)
 
 
+
+def _nc_sub_url(environ):
+    """Same pattern as _self_sub_url, for the nc-box subscription."""
+    try:
+        with open(NC_SUB_SECRET_FILE, encoding="utf-8") as fh:
+            name = fh.read().strip()
+    except OSError:
+        return None
+    if not _SELF_SUB_NAME_RE.match(name):
+        return None
+    host = (environ.get("HTTP_HOST") or "").strip()
+    if not host:
+        return None
+    return "https://%s/sub/%s" % (host, name)
+
+
 def _render_page(environ):
     url = _self_sub_url(environ)
     value = html.escape(url, quote=True) if url else "未配置订阅文件名"
-    return PAGE.replace("__SELF_SUB_URL__", value, 1)
+    page = PAGE.replace("__SELF_SUB_URL__", value, 1)
+    nc_url = _nc_sub_url(environ)
+    nc_value = html.escape(nc_url, quote=True) if nc_url else "未配置订阅文件名"
+    return page.replace("__NC_SUB_URL__", nc_value, 1)
 
 
 def application(environ, start_response):
@@ -1751,6 +1771,15 @@ PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <div class="title" style="font-weight:600">VPS 自建订阅（nc）</div>
+    <div class="meta">自建节点的订阅链接（4 个节点：Trojan / VMess / Shadowsocks / Hysteria2）。50GB/月流量，每月 1 日重置。</div>
+    <div class="linkbox">
+      <input type="text" readonly value="__NC_SUB_URL__">
+      <button type="button" class="copy" id="nc-copy">复制链接</button>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="row">
       <button type="button" id="uiprobe-btn">平台可用性探测</button>
       <span class="msg" id="uiprobe-msg"></span>
@@ -1773,6 +1802,12 @@ $("vps-copy").onclick = async () => {
   try { await navigator.clipboard.writeText(input.value); $("vps-copy").textContent = "已复制"; }
   catch (e) { input.select(); document.execCommand("copy"); $("vps-copy").textContent = "已复制"; }
   setTimeout(() => { $("vps-copy").textContent = "复制链接"; }, 1500);
+};
+$("nc-copy").onclick = async () => {
+  const input = $("nc-copy").parentElement.querySelector("input");
+  try { await navigator.clipboard.writeText(input.value); $("nc-copy").textContent = "已复制"; }
+  catch (e) { input.select(); document.execCommand("copy"); $("nc-copy").textContent = "已复制"; }
+  setTimeout(() => { $("nc-copy").textContent = "复制链接"; }, 1500);
 };
 async function api(path, method, payload) {
   const opts = {method: method || "GET", headers: {}};

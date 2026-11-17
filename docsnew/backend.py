@@ -76,7 +76,7 @@ TRASH_DIR = DOCS_DIR + "_trash"  # 保持回收站在扫描目录之外
 # always wins over the in-app store.
 
 CRED_FILE = os.path.join(os.path.dirname(DOCS_DIR), "credentials.json")
-CRED_KEYS = ("OP_API_KEY", "LOCAL_API_KEY", "APPLE_SYNC_CODE", "CF_MIRROR_PASSPHRASE")
+CRED_KEYS = ("OP_API_KEY", "LOCAL_API_KEY", "RELAY_API_KEY", "APPLE_SYNC_CODE", "CF_MIRROR_PASSPHRASE")
 
 
 def _cred_values():
@@ -825,7 +825,8 @@ def handle(method, subpath, args, json_data):
             return 400, {"error": err}
         return 200, {"ok": True, "keys": _cred_status()}
     if seg and seg[0] == "ai" and len(seg) == 2 and seg[1] in (
-            "config", "scan", "run", "status", "jobs"):
+            "config", "scan", "run", "status", "jobs",
+            "sync-now", "sync-status"):
         import ai_console
         return ai_console.handle(seg[1], method, args, json_data)
     return 404, {"error": "接口不存在"}

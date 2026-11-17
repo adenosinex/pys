@@ -1181,6 +1181,15 @@ def _relay_forward(environ, start_response, name, up, rest, rd,
     ctype = environ.get("CONTENT_TYPE", "")
     if ctype:
         fwd["Content-Type"] = ctype
+    # The relay must see plain-text responses to log usage: a client
+    # Accept-Encoding (gzip/br, sent by browsers and ChatBox) makes
+    # the upstream return a compressed stream the usage parser cannot
+    # read, so every browser/client request logged empty tokens while
+    # curl/urllib probes (identity) logged fine (2026-11-16). Force
+    # identity on the upstream hop; the client still gets a working
+    # (uncompressed) stream. Compression on this hop is not worth
+    # the blindness.
+    fwd["Accept-Encoding"] = "identity"
     # Upstream auth: minted token for GCP service-account upstreams,
     # static key otherwise, nothing for empty-key upstreams (never
     # a bare "Bearer "). A GCP upstream whose token mint failed is
