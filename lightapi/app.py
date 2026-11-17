@@ -236,7 +236,7 @@ def _handle_blob(environ, start_response, method, spec):
         path = ("/api/collections/%s/records?%s"
                 % (urllib.parse.quote(coll, safe=""),
                    urllib.parse.urlencode(
-                       {"filter": filt, "perPage": "1", "sort": "created"})))
+                       {"filter": filt, "perPage": "1"})))
         status, payload = _pb_request("GET", path)
         if status != 200:
             return _send(start_response, "%d Gateway" % status, payload)
@@ -254,7 +254,7 @@ def _handle_blob(environ, start_response, method, spec):
         path = ("/api/collections/%s/records?%s"
                 % (urllib.parse.quote(coll, safe=""),
                    urllib.parse.urlencode(
-                       {"filter": filt, "perPage": "1", "sort": "created",
+                       {"filter": filt, "perPage": "1",
                         "fields": "id"})))
         status, found = _pb_request("GET", path)
         if status != 200:
