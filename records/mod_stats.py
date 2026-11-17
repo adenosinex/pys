@@ -1,8 +1,10 @@
-"""Daily + fuel records, ported from the user's myweb blueprints
-(1daily_extension / 4fuel_extension). Both share one SQLite table
-(universal_records) in .runtime/universal_stats.db, exactly like the
-originals shared db/universal_stats.db. Logic preserved; pytz became
-zoneinfo and Flask responses became webutil calls."""
+"""Daily records, ported from the user's myweb blueprint
+(1daily_extension). Uses one SQLite table (universal_records) in
+.runtime/universal_stats.db, exactly like the original shared
+db/universal_stats.db. Logic preserved; pytz became zoneinfo and
+Flask responses became webutil calls. (The 4fuel_extension moved to
+the standalone fuel light app in 2026-11; its rows now live in
+PocketBase.)"""
 import csv
 import io
 import os
@@ -191,87 +193,3 @@ def daily_import(environ, start_response):
                 "INSERT INTO universal_records (category, record_time, val1, remark) VALUES (?, ?, ?, ?)",
                 records)
     return json_response(start_response, {'status': 'ok', 'imported_rows': len(records)})
-
-
-# ---------------------------------------------------------------- fuel
-
-def fuel_main(environ, start_response):
-    if environ["REQUEST_METHOD"] == "POST":
-        data = read_json(environ) or {}
-        now = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
-        with _conn() as conn:
-            conn.execute(
-                "INSERT INTO universal_records (category, record_time, val1, val2, remark) VALUES (?, ?, ?, ?, ?)",
-                ('fuel', now, float(data.get('fuel_amount', 0)), float(data.get('total_mileage', 0)), data.get('remark', ''))
-            )
-        return json_response(start_response, {'status': 'ok'})
-    with _conn() as conn:
-        rows = conn.execute(
-            "SELECT id, record_time as _time, val1 as fuel_amount, val2 as total_mileage, remark "
-            "FROM universal_records WHERE category = 'fuel' ORDER BY _time ASC"
-        ).fetchall()
-    return json_response(start_response, [dict(row) for row in rows])
-
-
-def fuel_delete(environ, start_response, record_id):
-    with _conn() as conn:
-        cursor = conn.execute("DELETE FROM universal_records WHERE id=? AND category='fuel'", (record_id,))
-        success = cursor.rowcount > 0
-    return json_response(start_response, {'status': 'ok', 'deleted': success})
-
-
-def fuel_export(environ, start_response):
-    with _conn() as conn:
-        rows = conn.execute(
-            "SELECT record_time, val1, val2, remark FROM universal_records WHERE category='fuel' ORDER BY record_time ASC"
-        ).fetchall()
-    si = io.StringIO()
-    cw = csv.writer(si)
-    cw.writerow(['Time', 'Fuel_Amount', 'Total_Mileage', 'Remark'])
-    for row in rows:
-        cw.writerow([row['record_time'], row['val1'], row['val2'], row['remark']])
-    return csv_response(start_response, si.getvalue(), "fuel_stats.csv")
-
-
-def fuel_import(environ, start_response):
-    _fields, files = parse_multipart(environ)
-    if 'file' not in files:
-        return json_response(start_response, {'error': 'No file'}, 400)
-    blob = files['file'][1]
-    try:
-        raw_content = blob.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        try:
-            raw_content = blob.decode("gbk")
-        except UnicodeDecodeError:
-            return json_response(start_response, {'error': '文件编码不是 UTF-8 或 GBK，请检查文件格式'}, 400)
-    first_line = raw_content.split('\n')[0]
-    delimiter = '\t' if '\t' in first_line else ','
-    csv_input = csv.DictReader(io.StringIO(raw_content), delimiter=delimiter)
-    success_count = 0
-    with _conn() as conn:
-        for row in csv_input:
-            try:
-                def get_val(keys):
-                    for k in keys:
-                        if k in row:
-                            return row[k]
-                    return None
-
-                t_val = get_val(['Time', 'time'])
-                f_val = get_val(['Fuel_Amount', 'fuel_amount', 'Fuel_amount'])
-                m_val = get_val(['Total_Mileage', 'total_mileage', 'Total_mileage'])
-                r_val = get_val(['Remark', 'remark']) or ""
-                if not t_val or not f_val or not m_val:
-                    continue
-                raw_time = t_val.replace('/', '-').strip()
-                if len(raw_time.split(':')) == 2:
-                    raw_time += ":00"
-                conn.execute(
-                    "INSERT INTO universal_records (category, record_time, val1, val2, remark) VALUES (?, ?, ?, ?, ?)",
-                    ('fuel', raw_time, float(f_val), float(m_val), r_val)
-                )
-                success_count += 1
-            except Exception:
-                continue
-    return json_response(start_response, {'status': 'ok', 'imported_rows': success_count})

@@ -1,7 +1,7 @@
 """记录台 — the records hub for the App Hub.
 
 One project hosting the user's record-keeping features ported from
-myweb: daily stats, fuel log, history snapshots (+ tracker boards),
+myweb: daily stats, history snapshots (+ tracker boards),
 audio memos, snippets, and the /api2 universal store several pages
 are built on (product / supplies / exercise). Each feature keeps its
 original API shapes and its own SQLite file under .runtime/, so the
@@ -278,7 +278,6 @@ INDEX_HTML = """<!doctype html>
   <p class="sub">由 myweb 迁来的记录类功能，数据各自独立存储，互不干扰。</p>
   <div class="grid">
     <a class="card" href="daily"><div class="t">日常记录</div><div class="d">每日计数打卡，可导入导出 CSV</div></a>
-    <a class="card" href="fuel"><div class="t">加油记录</div><div class="d">油量与里程，自动算油耗</div></a>
     <a class="card" href="history"><div class="t">历史快照</div><div class="d">生活切片照片，可选 AI 背景分析</div></a>
     <a class="card" href="audiom"><div class="t">录音备忘</div><div class="d">录音转文字与摘要（需转写接口）</div></a>
     <a class="card" href="manuals"><div class="t">智能说明书</div><div class="d">说明书照片 AI 识别与标签（需 SiliconFlow 密钥）</div></a>
@@ -566,7 +565,7 @@ def application(environ, start_response):
         from urllib.parse import unquote
         return mod_store.collection_main(environ, start_response, unquote(m.group(1)))
 
-    # daily + fuel
+    # daily
     if path == "/api/credentials" and method in ("GET", "POST"):
         return handle_credentials(environ, start_response, method)
     if path.startswith("/api/health/"):
@@ -580,15 +579,6 @@ def application(environ, start_response):
     m = re.fullmatch(r"/api/daily_stats/(\d+)", path)
     if m and method == "DELETE":
         return mod_stats.daily_delete(environ, start_response, int(m.group(1)))
-    if path == "/api/fuel_stats" and method in ("GET", "POST"):
-        return mod_stats.fuel_main(environ, start_response)
-    if path == "/api/fuel_stats/export" and method == "GET":
-        return mod_stats.fuel_export(environ, start_response)
-    if path == "/api/fuel_stats/import" and method == "POST":
-        return mod_stats.fuel_import(environ, start_response)
-    m = re.fullmatch(r"/api/fuel_stats/(\d+)", path)
-    if m and method == "DELETE":
-        return mod_stats.fuel_delete(environ, start_response, int(m.group(1)))
 
     # snippets
     if path == "/api/snippets/export" and method == "GET":
