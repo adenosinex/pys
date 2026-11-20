@@ -1,29 +1,41 @@
-"""YouTube link -> text pipeline for zhihu-core.
+"""YouTube / Bilibili link -> text pipeline for zhihu-core.
 
-Triggered from /api/extract when a YouTube URL arrives and no routing
-rule is configured for it: the request returns immediately with a task
-id and this module runs the pipeline on one background worker thread.
+Triggered from /api/extract when a YouTube or Bilibili URL arrives
+and no routing rule is configured for it: the request returns
+immediately with a task id and this module runs the pipeline on one
+background worker thread. The task record carries a "platform"
+field ("youtube" / "bilibili"); records written before the Bilibili
+wiring default to "youtube".
 
 Pipeline (subtitles first, ASR as fallback):
-  1. subtitles: this project's OWN yt-dlp/deno, self-bootstrapped
-     into this project's own .runtime/bin from the official GitHub
-     releases, plus this project's OWN YouTube cookie (the
-     credentials.json key "youtube_cookie", write-only like the Mac
-     code below). yt-dlp reads the video info; the subtitle text
-     itself is fetched straight from the video's timedtext
-     endpoint (the yt-dlp subtitle-file download is rate-limited
-     separately by YouTube -- HTTP 429 from datacenter IPs -- so
-     it is kept only as a second try), language priority
+  1. subtitles: YouTube uses this project's OWN yt-dlp/deno,
+     self-bootstrapped into this project's own .runtime/bin from
+     the official GitHub releases, plus this project's OWN YouTube
+     cookie (the credentials.json key "youtube_cookie", write-only
+     like the Mac code below). yt-dlp reads the video info; the
+     subtitle text itself is fetched straight from the video's
+     timedtext endpoint (the yt-dlp subtitle-file download is
+     rate-limited separately by YouTube -- HTTP 429 from datacenter
+     IPs -- so it is kept only as a second try), language priority
      zh -> en -> any, manual before auto within one language;
      the raw captions are cleaned (timestamps stripped, YouTube's
      rolling duplicate lines merged) into paragraph text.
-  2. audio fallback (only when subtitles are unavailable): the audio
-     is fetched through the yt-audio loopback API (contract:
+     Bilibili reuses video_parse's direct subtitle fetch
+     (_bili_subtitle, WBI-signed, needs the user's own Bilibili
+     cookie); its lines are already clean, so no cue cleaning.
+  2. audio fallback (only when subtitles are unavailable): YouTube
+     audio is fetched through the yt-audio loopback API (contract:
      POST /api/fetch {"url"} -> {"job_id"}; GET /api/jobs/<id> ->
      job status/file_id; GET /files/<file_id> -> audio bytes;
      DELETE /api/files/<file_id> cleanup), uploaded to mac-compute
      (https://apple.su7.dpdns.org:5850, job type "asr") and the
      resulting text is collected from the job's result zip.
+     Bilibili audio is fetched directly instead (yt-audio accepts
+     YouTube URLs only): the best dash audio track from the
+     playurl API, downloaded with the platform Referer, then
+     uploaded to mac-compute's subscription-token API
+     (https://cp.zin7.de, X-Access-Code header, see mac_asr.py)
+     and collected the same way.
 
 Dependency note (2026-11-10 remediation): this module must not read
 any other project's files -- no sibling project directories, no
@@ -35,7 +47,10 @@ video-info or subtitle endpoint to call); the dependency audit
 flagged that shortcut and it was removed the same day: the
 binaries are self-bootstrapped now and the cookie is this
 project's own credential. The only remaining contact with
-yt-audio is the loopback HTTP API in step 2.
+yt-audio is the loopback HTTP API in step 2. The Bilibili cookie
+is read through this project's own FileCookieStore state file
+(the same file app.py's Bilibili panel writes), read-only, and is
+never written into task records.
 
 Every stage writes its progress into the task record (JSON on disk in
 the platform data directory), so the page can poll and render a live
@@ -45,7 +60,10 @@ the service process went away (the worker resumes unfinished tasks).
 The mac-compute access code lives only in <data dir>/credentials.json
 (key "mac_compute_access_code", file mode 0600). It is write-only:
 the API can store or remove it and report whether it exists, never
-read it back.
+read it back. The subscription token for the newer mac-compute API
+lives in the same file (key "mac_asr_token", written directly on
+the box by the operator, never through the page); this module only
+reads it and reports whether it exists.
 """
 import http.client
 import io
@@ -62,9 +80,29 @@ import zipfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
+if __package__:
+    from .cookie_manager import FileCookieStore
+    from .extractor import ZhihuError
+    from .video_parse import (UA_DESKTOP, _bili_subtitle,
+                              bili_dash_audio_url, bili_video_meta)
+    from . import mac_asr
+else:
+    from cookie_manager import FileCookieStore
+    from extractor import ZhihuError
+    from video_parse import (UA_DESKTOP, _bili_subtitle,
+                             bili_dash_audio_url, bili_video_meta)
+    import mac_asr
+
 MAC_BASE = "https://apple.su7.dpdns.org:5850"
 YT_AUDIO_API = os.environ.get("YT_AUDIO_API", "http://127.0.0.1:18572")
 CREDENTIALS_KEY = "mac_compute_access_code"
+MAC_ASR_TOKEN_KEY = "mac_asr_token"
+
+# Hosts that take the Bilibili branch of this pipeline. Single source
+# of truth for the set: app.py's dispatch condition aliases it, and
+# the page's classifyLink table matches it item for item.
+BILIBILI_HOSTS = {"bilibili.com", "www.bilibili.com",
+                  "m.bilibili.com", "b23.tv"}
 
 MAX_PENDING_TASKS = 5
 RETENTION_SEC = 24 * 3600
@@ -170,6 +208,37 @@ def remove_mac_code():
     return mac_code_configured()
 
 
+# ------------------------------------------- mac-compute subscription token
+#
+# Read-only here: the token is written directly into credentials.json
+# on the box by the operator (it must never travel through the page
+# or the public repo). The environment override mirrors the access
+# code's, and exists for the same reason (tests and one-off runs).
+
+def mac_asr_token_configured():
+    env = os.environ.get("MAC_ASR_TOKEN", "")
+    if env.strip():
+        return True
+    return bool(str(_read_credentials().get(MAC_ASR_TOKEN_KEY) or "").strip())
+
+
+def _mac_asr_token():
+    env = os.environ.get("MAC_ASR_TOKEN", "")
+    if env.strip():
+        return env.strip()
+    return str(_read_credentials().get(MAC_ASR_TOKEN_KEY) or "").strip()
+
+
+def _platform_for(url):
+    """Task platform from the URL host; unknown hosts stay "youtube"
+    so old callers and old records keep their behavior."""
+    try:
+        host = (urlsplit((url or "").strip()).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return "youtube"
+    return "bilibili" if host in BILIBILI_HOSTS else "youtube"
+
+
 # ------------------------------------------------------------ task store
 
 _lock = threading.Lock()
@@ -216,21 +285,22 @@ def _update(task, **kw):
 
 def _position(task):
     """1-based place in the serial pipeline (0 once finished)."""
-    if task["state"] in ("done", "error"):
+    if task.get("state") in ("done", "error"):
         return 0
     ahead = 0
+    created = task.get("created_at", 0)
     for other in _all_tasks():
-        if other["id"] == task["id"]:
+        if other.get("id") == task.get("id"):
             continue
-        if other["state"] in ("queued", "running") \
-                and other["created_at"] < task["created_at"]:
+        if other.get("state") in ("queued", "running") \
+                and other.get("created_at", 0) < created:
             ahead += 1
     return ahead + 1
 
 
 def _overall(task):
     """Coarse whole-task progress estimate (0-100) for the bar."""
-    state, stage = task["state"], task["stage"]
+    state, stage = task.get("state"), task.get("stage")
     pct = task.get("stage_percent")
     if state == "done":
         return 100
@@ -255,8 +325,10 @@ def _public(task):
     out = {k: v for k, v in task.items() if not k.startswith("_")}
     out["position"] = _position(task)
     out["overall_percent"] = _overall(task)
-    out["elapsed_sec"] = max(0, int(time.time() - task["created_at"]))
-    out["stage_label"] = STAGE_LABELS.get(task["stage"], task["stage"])
+    created = task.get("created_at") or time.time()
+    out["elapsed_sec"] = max(0, int(time.time() - created))
+    stage = task.get("stage") or "queued"
+    out["stage_label"] = STAGE_LABELS.get(stage, stage)
     return out
 
 
@@ -270,7 +342,8 @@ def get_task(task_id):
 def _purge_old():
     cutoff = time.time() - RETENTION_SEC
     for task in _all_tasks():
-        if task["created_at"] < cutoff and task["state"] in ("done", "error"):
+        if task.get("created_at", 0) < cutoff \
+                and task.get("state") in ("done", "error"):
             try:
                 _task_path(task["id"]).unlink()
             except OSError:
@@ -295,12 +368,13 @@ def _clean_tmp(task_id):
 def create_task(url, fmt):
     _ensure_worker()
     _purge_old()
-    pending = [t for t in _all_tasks() if t["state"] in ("queued", "running")]
+    pending = [t for t in _all_tasks() if t.get("state") in ("queued", "running")]
     if len(pending) >= MAX_PENDING_TASKS:
         return None
     task = {
         "id": secrets.token_hex(6),
         "url": url, "format": fmt,
+        "platform": _platform_for(url),
         "state": "queued", "stage": "queued",
         "stage_label": STAGE_LABELS["queued"],
         "detail": "", "stage_percent": None,
@@ -325,8 +399,9 @@ def _ensure_worker():
             return
         # Resume anything a previous process left unfinished.
         known = set(_queue)
-        for task in sorted(_all_tasks(), key=lambda t: t["created_at"]):
-            if task["state"] in ("queued", "running") and task["id"] not in known:
+        for task in sorted(_all_tasks(), key=lambda t: t.get("created_at", 0)):
+            if task.get("state") in ("queued", "running") \
+                    and task.get("id") not in known:
                 _queue.append(task["id"])
         thread = threading.Thread(target=_worker, daemon=True, name="yt-text-worker")
         _worker_state.update(pid=pid, thread=thread)
@@ -343,7 +418,7 @@ def _worker():
             time.sleep(1.0)
             continue
         task = _load(task_id)
-        if not task or task["state"] in ("done", "error"):
+        if not task or task.get("state") in ("done", "error"):
             continue
         try:
             _run_task(task)
@@ -368,31 +443,44 @@ def _set_stage(task, stage, detail="", percent=None):
 
 
 def _run_task(task):
+    platform = task.get("platform", "youtube")
     if not task.get("_mac_job_id"):
-        text, origin, fetched = _subtitle_path(task)
+        if platform == "bilibili":
+            text, origin, fetched = _bili_subtitle_path(task)
+        else:
+            text, origin, fetched = _subtitle_path(task)
         if text is None:
             _audio_path(task)  # fills result itself or raises TaskFail
             return
         _finish(task, text, origin, fetched)
         return
-    _mac_collect(task)  # resumed after a restart with a live Mac job
+    if platform == "bilibili":
+        _asr_collect(task)  # resumed after a restart with a live Mac job
+    else:
+        _mac_collect(task)  # resumed after a restart with a live Mac job
 
 
 def _finish(task, text, origin, fetched_bytes):
     elapsed_ms = int((time.time() - task["created_at"]) * 1000)
+    if task.get("platform", "youtube") == "bilibili":
+        kind, title_default, author, source = \
+            "bilibili", "B站视频", "B站", "B站"
+    else:
+        kind, title_default, author, source = \
+            "youtube", "YouTube 视频", "YouTube", "YouTube"
     content = text
     if task["format"] == "json":
-        doc = {"url": task["url"], "kind": "youtube", "id": task.get("_video_id", ""),
-               "title": task.get("title") or "YouTube 视频", "author": "YouTube",
+        doc = {"url": task["url"], "kind": kind, "id": task.get("_video_id", ""),
+               "title": task.get("title") or title_default, "author": author,
                "published": "", "text": text, "markdown": text,
-               "source": "YouTube", "extra": {"origin": origin}}
+               "source": source, "extra": {"origin": origin}}
         content = json.dumps(doc, ensure_ascii=False, indent=2)
     result = {
-        "ok": True, "url": task["url"], "kind": "youtube",
+        "ok": True, "url": task["url"], "kind": kind,
         "id": task.get("_video_id", ""),
-        "title": task.get("title") or "YouTube 视频",
-        "author": "YouTube", "published": "",
-        "source": "YouTube", "format": task["format"],
+        "title": task.get("title") or title_default,
+        "author": author, "published": "",
+        "source": source, "format": task["format"],
         "content": content, "origin": origin,
         "stats": {"elapsed_ms": elapsed_ms, "fetched_bytes": fetched_bytes,
                   "output_bytes": len(content.encode("utf-8")),
@@ -990,6 +1078,58 @@ def _subtitle_path(task):
     return text, "字幕直取（%s · %s）" % (kind, lang), len(raw)
 
 
+# -------------------------------------------------------- bilibili side
+
+def _bili_cookie():
+    """This project's own Bilibili cookie, read fresh on every use.
+
+    Same resolution order as app.py's bili_store: the
+    BILI_COOKIE_STATE_FILE env var, else the .runtime state file
+    next to the code (hub_app points the variable at the platform
+    data directory). Read-only here; the value is never written
+    into task records."""
+    path = os.environ.get(
+        "BILI_COOKIE_STATE_FILE",
+        str(Path(__file__).parent / ".runtime" / "bili-cookie-state.json"))
+    try:
+        record = FileCookieStore(path).read()
+    except ZhihuError:
+        return ""
+    return (record or {}).get("cookie", "") or ""
+
+
+def _bili_subtitle_path(task):
+    """Bilibili subtitle leg. Returns (text, origin, fetched_bytes)
+    or (None, '', 0) to fall back to the audio leg, mirroring the
+    YouTube leg's contract and 20-char threshold. The video's
+    (bvid, cid, page) are stashed in underscore fields so the audio
+    leg can reuse them without a second view-API call."""
+    _set_stage(task, "subtitle", "正在读取视频信息…")
+    cookie = _bili_cookie()
+    try:
+        bvid, cid, title, page = bili_video_meta(task["url"], cookie)
+    except ZhihuError:
+        return None, "", 0
+    task["_video_id"] = bvid
+    task["_bvid"], task["_cid"], task["_page"] = bvid, cid, page
+    if title:
+        task["title"] = str(title)[:300]
+    _save(task)
+    _set_stage(task, "subtitle", "正在获取字幕文本…")
+    sub = _bili_subtitle(bvid, cid, page, cookie)
+    if not sub:
+        return None, "", 0
+    text = sub.get("text") or ""
+    if len(text) < 20:
+        return None, "", 0
+    doc = sub.get("lang") or ""
+    if (sub.get("lan") or "").lower().startswith("ai"):
+        origin = "B站字幕（AI · %s）" % doc if doc else "B站AI字幕"
+    else:
+        origin = "B站字幕（%s）" % doc if doc else "B站字幕"
+    return text, origin, 0
+
+
 # --------------------------------------------------------- yt-audio client
 #
 # The ONLY contact with the yt-audio project: its loopback HTTP API.
@@ -1099,6 +1239,80 @@ def _ytaudio_download(task, folder):
         raise TaskFail("download", "下载到的音频为空。")
     if size > MAX_AUDIO_BYTES:
         raise TaskFail("download", "音频超过 300 MB 上限，无法转写。")
+    task["_audio_name"] = path.name
+    task["_audio_size"] = size
+    _save(task)
+    return path
+
+
+def _dash_audio_download(task, folder):
+    """Bilibili audio leg: download the best dash audio track
+    directly. yt-audio accepts YouTube URLs only, so there is no
+    loopback download to reuse; the playurl API + the platform
+    Referer (the same shape video_parse's open_download uses) get
+    the track. The upos CDN rejects range-less GETs with 403, so
+    the request carries an open-ended Range (verified 2026-11-17:
+    no-Range 403 on both urllib and curl, Range 206 on both). Same
+    constraints as the yt-audio leg: task tmp folder only, 300 MB
+    cap, deleted after upload."""
+    bvid = task.get("_bvid")
+    cid = task.get("_cid")
+    page = task.get("_page")
+    cookie = _bili_cookie()
+    if not bvid or not cid or not page:
+        try:
+            bvid, cid, title, page = bili_video_meta(task["url"], cookie)
+        except ZhihuError as exc:
+            raise TaskFail("download", "无法读取 B站视频信息：" + str(exc))
+        task["_video_id"] = bvid
+        task["_bvid"], task["_cid"], task["_page"] = bvid, cid, page
+        if title and not task.get("title"):
+            task["title"] = str(title)[:300]
+        _save(task)
+    _set_stage(task, "download", "正在获取音频地址…")
+    try:
+        audio_url = bili_dash_audio_url(bvid, cid, page, cookie)
+    except ZhihuError as exc:
+        raise TaskFail("download", "无法获取 B站音频地址：" + str(exc))
+    req = urllib.request.Request(
+        audio_url, headers={"User-Agent": UA_DESKTOP,
+                            "Referer": page, "Range": "bytes=0-"})
+    path = folder / "audio.m4a"
+    deadline = time.time() + DL_DEADLINE_SEC
+    _set_stage(task, "download", "正在下载音频…")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            if total > MAX_AUDIO_BYTES:
+                raise TaskFail("download", "音频超过 300 MB 上限，无法转写。")
+            size = 0
+            last_pct = -1
+            with open(path, "wb") as fh:
+                while True:
+                    if time.time() > deadline:
+                        raise TaskFail("download",
+                                       "音频下载超时（%d 秒）。" % DL_DEADLINE_SEC)
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_AUDIO_BYTES:
+                        raise TaskFail("download",
+                                       "音频超过 300 MB 上限，无法转写。")
+                    fh.write(chunk)
+                    if total:
+                        pct = int(size * 100.0 / total)
+                        if pct != last_pct:
+                            last_pct = pct
+                            _set_stage(task, "download", "正在下载音频…",
+                                       size * 100.0 / total)
+    except TaskFail:
+        raise
+    except (urllib.error.URLError, OSError):
+        raise TaskFail("download", "从 B站下载音频失败。")
+    size = path.stat().st_size
+    if size <= 0:
+        raise TaskFail("download", "下载到的音频为空。")
     task["_audio_name"] = path.name
     task["_audio_size"] = size
     _save(task)
@@ -1297,17 +1511,160 @@ def _mac_fetch_text(task, code, job_id):
     raise TaskFail("assemble", "Mac 转写结果为空。")
 
 
+# --------------------------------------- mac-compute side, token API leg
+#
+# The Bilibili audio leg talks to the newer mac-compute API
+# (https://cp.zin7.de, subscription token in X-Access-Code) through
+# the mac_asr module. This mirrors the older leg above stage for
+# stage (upload -> mac_queue -> asr -> assemble) so the page's
+# progress bar behaves identically; the older leg is untouched.
+
+def _asr_submit(task, audio_path):
+    token = _mac_asr_token()
+
+    def on_progress(sent, whole):
+        _set_stage(task, "upload", "已上传 %d%%" % int(sent * 100 / max(1, whole)),
+                   sent * 100.0 / max(1, whole))
+
+    try:
+        return mac_asr.submit(audio_path, token, on_progress)
+    except mac_asr.MacAsrError as exc:
+        if exc.status == 401:
+            raise TaskFail("upload", "Mac 转写订阅 token 被拒绝，请检查服务器端配置。")
+        raise TaskFail("upload", exc.message)
+
+
+def _asr_position(token, job):
+    """Best-effort queue position from the job list; None when unknown."""
+    try:
+        status, data = mac_asr.request("GET", "/api/jobs", token, timeout=60)
+        if status != 200:
+            return None
+        payload = json.loads(data.decode("utf-8", "replace"))
+        jobs = payload.get("jobs") if isinstance(payload, dict) else payload
+        if not isinstance(jobs, list):
+            return None
+    except (OSError, http.client.HTTPException, ValueError):
+        return None
+    active = [j for j in jobs if isinstance(j, dict)
+              and j.get("status") in ("queued", "running", "processing")]
+    mine = job.get("id")
+    for index, item in enumerate(active):
+        if item.get("id") == mine:
+            return index + 1
+    return None
+
+
+def _asr_collect(task):
+    token = _mac_asr_token()
+    job_id = task["_mac_job_id"]
+    started = task.get("_mac_started") or time.time()
+    deadline = started + MAC_DEADLINE_SEC
+    misses = 0
+    while time.time() < deadline:
+        try:
+            job = mac_asr.get_job(token, job_id)
+            misses = 0
+        except mac_asr.MacAsrError as exc:
+            if exc.status == 401:
+                raise TaskFail("asr", "Mac 转写订阅 token 被拒绝，请检查服务器端配置。")
+            if exc.status is not None:
+                raise TaskFail("asr", exc.message)
+            misses += 1
+            if misses >= 6:
+                raise TaskFail("asr", "无法连接 Mac 转写服务，请稍后重试。")
+            time.sleep(5)
+            continue
+        status = str(job.get("status") or "")
+        if status == "queued":
+            pos = job.get("position") or job.get("queue_position") \
+                or _asr_position(token, job)
+            detail = "排在第 %s 位" % pos if pos else "状态：排队中"
+            _set_stage(task, "mac_queue", detail)
+        elif status in ("running", "processing", "working"):
+            pct = None
+            raw = job.get("progress")
+            if isinstance(raw, (int, float)):
+                pct = raw * 100 if raw <= 1 else float(raw)
+                pct = max(0.0, min(100.0, pct))
+            note = str(job.get("message") or job.get("stage") or "")
+            _set_stage(task, "asr", note[:120], pct)
+        elif status == "done":
+            _set_stage(task, "assemble", "正在取回转写文本…")
+            text = _asr_fetch_text(task, token, job_id)
+            _finish(task, text, "音频转写（Mac ASR）",
+                    task.get("_audio_size") or 0)
+            return
+        elif status in ("failed", "dead", "error", "cancelled"):
+            reason = str(job.get("error") or job.get("message") or status)
+            raise TaskFail("asr", "Mac 转写失败：" + reason[:240])
+        else:
+            _set_stage(task, "mac_queue", "状态：" + (status or "等待中"))
+        time.sleep(5)
+    mac_asr.cancel(token, job_id)
+    raise TaskFail("asr", "Mac 转写超时（%d 分钟上限）。" % (MAC_DEADLINE_SEC // 60))
+
+
+def _asr_fetch_text(task, token, job_id):
+    try:
+        data = mac_asr.download(token, job_id)
+    except mac_asr.MacAsrError as exc:
+        if exc.status == 401:
+            raise TaskFail("assemble", "Mac 转写订阅 token 被拒绝，请检查服务器端配置。")
+        raise TaskFail("assemble", exc.message)
+    try:
+        bundle = zipfile.ZipFile(io.BytesIO(data))
+        names = bundle.namelist()
+    except zipfile.BadZipFile:
+        raise TaskFail("assemble", "Mac 返回的结果包损坏。")
+    if "result.txt" in names:
+        text = bundle.read("result.txt").decode("utf-8", "replace").strip()
+        if len(text) >= 20:
+            return text
+    if "result.srt" in names:
+        text = cues_to_text(_parse_srt(
+            bundle.read("result.srt").decode("utf-8", "replace")))
+        if len(text) >= 20:
+            return text
+    raise TaskFail("assemble", "Mac 转写结果为空。")
+
+
 def _audio_path(task):
     folder = _root() / "tmp" / task["id"]
     folder.mkdir(parents=True, exist_ok=True)
+    platform = task.get("platform", "youtube")
     audio = None
     saved = task.get("_audio_name")
     if saved and (folder / saved).exists():
         audio = folder / saved
     if audio is None:
-        warn = "" if mac_code_configured() else "（注意：Mac 转写未配置访问码）"
-        _set_stage(task, "download", "正在准备下载音频…" + warn)
-        audio = _ytaudio_download(task, folder)
+        if platform == "bilibili":
+            warn = "" if mac_asr_token_configured() else "（注意：Mac 转写订阅 token 未配置）"
+            _set_stage(task, "download", "正在准备下载音频…" + warn)
+            audio = _dash_audio_download(task, folder)
+        else:
+            warn = "" if mac_code_configured() else "（注意：Mac 转写未配置访问码）"
+            _set_stage(task, "download", "正在准备下载音频…" + warn)
+            audio = _ytaudio_download(task, folder)
+    if platform == "bilibili":
+        if not mac_asr_token_configured():
+            raise TaskFail(
+                "upload",
+                "该视频没有可用字幕，需要音频转写，但 Mac 转写订阅 token 尚未配置"
+                "（服务器端 credentials.json 缺少 mac_asr_token）。")
+        _set_stage(task, "upload", "正在上传到 Mac…")
+        job_id = _asr_submit(task, audio)
+        task["_mac_job_id"] = job_id
+        task["_mac_started"] = time.time()
+        _save(task)
+        try:
+            audio.unlink()
+        except OSError:
+            pass
+        task["_audio_name"] = ""
+        _save(task)
+        _asr_collect(task)
+        return
     if not mac_code_configured():
         raise TaskFail(
             "upload",

@@ -19,7 +19,7 @@
     <header>
       <div class="brandline">
         <a class="brand-logo" href="/" aria-label="链接转文本首页"><img src="/static/logo.svg" width="44" height="44" alt=""></a>
-        <div class="brand-title"><h1>链接转文本</h1><p>粘贴链接或整段文本，自动识别知乎、YouTube、抖音、B站和已配置的网站：视频优先输出字幕文本，YouTube 没有字幕时会自动下载音频送 Mac 转写。支持 Markdown / 纯文本 / JSON。</p></div>
+        <div class="brand-title"><h1>链接转文本</h1><p>粘贴链接或整段文本，自动识别知乎、YouTube、抖音、B站和已配置的网站：视频优先输出字幕文本，YouTube / B站没有字幕时会自动下载音频送 Mac 转写。支持 Markdown / 纯文本 / JSON。</p></div>
       </div>
     </header>
     <section id="workspace">
@@ -29,7 +29,7 @@
         <div class="cardhead"><h2>① 粘贴链接或文本</h2></div>
         <div class="labelrow"><label for="url">链接 / 含链接的文本</label><span class="spacer"></span><button id="pasteBtn" class="btn btn-ghost btn-sm" type="button">📋 一键粘贴</button></div>
         <textarea id="url" name="url" rows="3" maxlength="65536" placeholder="直接粘贴整段文字也行，例如：&#10;看到一篇讲得很清楚的文章 https://www.zhihu.com/question/28696373/answer/2835848212 推荐你看看"></textarea>
-        <p class="hint input-hint">自动识别知乎文章、回答、问题、YouTube 链接，以及抖音 / B站短视频（有字幕优先输出字幕，其次保声音）；在页面下方添加网站规则，即可扩展支持其他网站。</p>
+        <p class="hint input-hint">自动识别知乎文章、回答、问题、YouTube / B站链接（有字幕优先输出字幕，无字幕自动下载音频送 Mac 转写），以及抖音短视频（有字幕优先输出字幕，其次保声音）；在页面下方添加网站规则，即可扩展支持其他网站。</p>
         <div class="links" id="links" hidden><div class="linkshead" id="linkCount"></div><div class="chips" id="linkChips"></div></div>
         <div class="row format-row"><div><label for="format">输出格式</label><select id="format"><option value="text" selected>纯文本（推荐，喂 LLM / 检索）</option><option value="markdown">Markdown（含格式）</option><option value="json">JSON（含元数据）</option></select></div><div class="image-options"><label class="image-option"><input id="keep-images" type="checkbox" checked>保留图片链接</label></div></div>
         <div class="actions"><button id="extract-button" class="btn btn-primary" type="submit">提取文本</button><button id="oneClick" class="btn btn-ghost" type="button">⚡ 一键获取</button><button id="download" class="btn btn-ghost" type="button" disabled>下载</button><button id="reset" class="btn btn-ghost" type="button">清空</button><button id="cancel-extract" class="btn btn-ghost" type="button" hidden>取消请求</button><span id="status" class="status" role="status">就绪</span></div>
@@ -37,14 +37,14 @@
         <p class="hint quick-hint">「一键获取」会读取剪贴板中的链接并立即提取；完成后再次点击即可复制正文。Ctrl / ⌘ + Enter 可提取输入框中的链接。</p>
       </form>
       <div id="extract-message" class="message extract-message" role="status" aria-live="polite"></div>
-      <section id="result" class="result" hidden aria-labelledby="result-heading"><div class="card"><div class="cardhead reshead"><h2 id="result-heading">② 提取结果</h2><span class="spacer"></span><a id="result-source" class="btn btn-ghost btn-sm" target="_blank" rel="noopener noreferrer" hidden>打开原文 ↗</a><button id="copy" class="btn btn-primary btn-sm" type="button" disabled>一键复制</button></div><div class="meta"><div>标题<b id="result-title"></b></div><div>作者 / 日期<b id="result-meta"></b></div></div><pre id="content" tabindex="0" aria-label="提取的内容"></pre></div></section>
+      <section id="result" class="result" hidden aria-labelledby="result-heading"><div class="card"><div class="cardhead reshead"><h2 id="result-heading">② 提取结果</h2><span class="spacer"></span><a id="result-source" class="btn btn-ghost btn-sm" target="_blank" rel="noopener noreferrer" hidden>打开原文 ↗</a><button id="fetch-direct-link" class="btn btn-ghost btn-sm" type="button" hidden>获取视频直链</button><button id="copy" class="btn btn-primary btn-sm" type="button" disabled>一键复制</button></div><div class="meta"><div>标题<b id="result-title"></b></div><div>作者 / 日期<b id="result-meta"></b></div></div><pre id="content" tabindex="0" aria-label="提取的内容"></pre></div></section>
       <section class="card" id="video-panel" hidden>
         <div class="cardhead"><h2>短视频（抖音 / B站）</h2></div>
         <div id="video-result" hidden>
           <div class="meta"><div>标题<b id="video-title"></b></div><div>平台<b id="video-platform"></b></div></div>
           <video id="video-player" controls playsinline muted preload="none" style="width:min(100%,340px);max-height:38vh;background:#000;border-radius:8px;display:block"></video>
           <div class="actions"><a id="video-download" class="btn btn-primary" href="#">下载视频</a><button id="video-copy" class="btn btn-ghost" type="button">复制直链</button><a id="video-open" class="btn btn-ghost" href="#" target="_blank" rel="noopener noreferrer">打开直链 ↗</a><span id="video-status" class="status" role="status"></span></div>
-          <p class="hint">在上方输入框粘贴抖音 / B站链接点「提取文本」即可解析：有字幕时字幕直接出现在上方提取结果里；没有字幕时这里给出直链，并保证有声音（拿不到音画合成流时只取音频）。直链是平台 CDN 临时地址，会过期。播放由浏览器直连 CDN（快），被拒时自动切换服务器中转；「下载视频」走服务器中转。解析逻辑源自 <a href="https://github.com/jiuhunwl/short_videos" target="_blank" rel="noopener noreferrer">jiuhunwl/short_videos</a>。</p>
+          <p class="hint">在上方输入框粘贴抖音链接点「提取文本」即可解析：有字幕时字幕直接出现在上方提取结果里；没有字幕时这里给出直链，并保证有声音（拿不到音画合成流时只取音频）。B站视频走上方的转写流程，结果出来后点「获取视频直链」可在这里打开播放直链。直链是平台 CDN 临时地址，会过期。播放由浏览器直连 CDN（快），被拒时自动切换服务器中转；「下载视频」走服务器中转。解析逻辑源自 <a href="https://github.com/jiuhunwl/short_videos" target="_blank" rel="noopener noreferrer">jiuhunwl/short_videos</a>。</p>
         </div>
         <p id="video-message" class="message" role="status" aria-live="polite"></p>
       </section>

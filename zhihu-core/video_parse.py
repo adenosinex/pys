@@ -322,12 +322,18 @@ def _bili_subtitle(bvid, cid, page, user_cookie=""):
         if not text:
             return None
         return {"text": text,
-                "lang": track.get("lan_doc") or track.get("lan") or ""}
+                "lang": track.get("lan_doc") or track.get("lan") or "",
+                "lan": track.get("lan") or ""}
     except Exception:
         return None
 
 
-def bilibili_lowest(share_text, user_cookie=""):
+def bili_video_meta(share_text, user_cookie=""):
+    """Resolve a Bilibili share text/link to (bvid, cid, title, page).
+
+    Extracted from bilibili_lowest so the transcription pipeline can
+    reuse the same resolution without going through media parsing.
+    Raises ZhihuError when the link or the view API fails."""
     url = extract_url(share_text)
     if not url:
         raise ZhihuError("没找到链接。", "invalid_url", 400)
@@ -341,11 +347,48 @@ def bilibili_lowest(share_text, user_cookie=""):
     page = "https://www.bilibili.com/video/" + bvid + "/"
     view = _bili_api("/x/web-interface/view", {"bvid": bvid}, page,
                      user_cookie)
-    if view.get("code") != 0:
+    data = view.get("data") or {}
+    pages = data.get("pages") or []
+    if view.get("code") != 0 or not pages or "cid" not in pages[0]:
         raise ZhihuError("B站 view 接口失败，视频可能不存在或已删除。",
                          "parse_failed", 422)
-    cid = view["data"]["pages"][0]["cid"]
-    title = view["data"].get("title") or bvid
+    cid = pages[0]["cid"]
+    title = data.get("title") or bvid
+    return bvid, cid, title, page
+
+
+def bili_dash_audio_url(bvid, cid, page, user_cookie=""):
+    """Best dash audio track URL for a video, or ZhihuError.
+
+    Used by the transcription pipeline's audio leg (yt-audio accepts
+    YouTube URLs only, so Bilibili audio is fetched directly). The
+    playurl call must NOT carry platform=html5: that parameter
+    forces the muxed durl shape and suppresses dash entirely
+    (verified 2026-11-17, seven param variants, anonymous buvid).
+    fnval=16 requests dash; the highest-bandwidth audio track wins."""
+    play = _bili_api(
+        "/x/player/playurl",
+        {"otype": "json", "fnver": "0", "fnval": "16",
+         "player": "3", "qn": "64", "bvid": bvid, "cid": cid,
+         "high_quality": "0"},
+        page, user_cookie)
+    audios = (play.get("data") or {}).get("dash") or {}
+    best = None
+    for track in audios.get("audio") or []:
+        url = track.get("base_url") or track.get("baseUrl")
+        if not url:
+            continue
+        bandwidth = track.get("bandwidth") or 0
+        if best is None or bandwidth > best[0]:
+            best = (bandwidth, url)
+    if best:
+        return best[1]
+    raise ZhihuError("B站 playurl 接口没返回音频地址。",
+                     "parse_failed", 422)
+
+
+def bilibili_lowest(share_text, user_cookie=""):
+    bvid, cid, title, page = bili_video_meta(share_text, user_cookie)
     base = {"platform": "bilibili", "platform_name": "B站",
             "id": bvid, "title": title, "referer": page,
             "page_url": page, "source_repo": SOURCE_REPO}

@@ -28,6 +28,11 @@ else:
 YOUTUBE_HOSTS = {'youtube.com', 'www.youtube.com', 'm.youtube.com',
                  'youtu.be', 'www.youtu.be', 'music.youtube.com'}
 
+# Bilibili hosts taking the same built-in pipeline (subtitle-first /
+# ASR-fallback). The set lives in yt_text, which derives the task
+# platform from it; this alias keeps the dispatch condition readable.
+BILIBILI_HOSTS = yt_text.BILIBILI_HOSTS
+
 MAX_REQUEST_BYTES = 16 * 1024
 DEFAULT_BILI_TEST_URL = 'https://www.bilibili.com/video/BV1VeHQ6tEaS/'
 
@@ -151,7 +156,7 @@ def create_app(*, extract_fn=None, max_concurrency=None,
     def application(environ, start_response):
         path, method = environ.get('PATH_INFO', ''), environ.get('REQUEST_METHOD', 'GET')
         if path in {'/health', '/api/health'} and method == 'GET':
-            return response(start_response, 200, {'ok': True, 'service': 'zhihu-core', 'version': '1.5.1'})
+            return response(start_response, 200, {'ok': True, 'service': 'zhihu-core', 'version': '1.5.2'})
         if path in assets and method == 'GET':
             if path == '/':
                 origins = []
@@ -433,17 +438,17 @@ def create_app(*, extract_fn=None, max_concurrency=None,
             return error(start_response, exc.status, str(exc), exc.code)
         except (ValueError, UnicodeError, RecursionError):
             return error(start_response, 400, '请求参数无效，请检查 url、format 和 keep_images。', 'invalid_request')
-        # YouTube links with no configured routing rule take the built-in
-        # subtitle-first / ASR-fallback pipeline (yt_text). It runs
-        # asynchronously: this request only creates the task, and the
-        # page polls /api/yt-task/<id> for progress and the result.
-        # Configured rules (browser or server transport) keep their
-        # existing behavior via the router below.
+        # YouTube and Bilibili links with no configured routing rule
+        # take the built-in subtitle-first / ASR-fallback pipeline
+        # (yt_text). It runs asynchronously: this request only creates
+        # the task, and the page polls /api/yt-task/<id> for progress
+        # and the result. Configured rules (browser or server
+        # transport) keep their existing behavior via the router below.
         try:
             _host = (urlsplit(url.strip()).hostname or '').lower().rstrip('.')
         except ValueError:
             _host = ''
-        if _host in YOUTUBE_HOSTS:
+        if _host in YOUTUBE_HOSTS or _host in BILIBILI_HOSTS:
             try:
                 _routes = settings.read().get('routes', [])
             except Exception:

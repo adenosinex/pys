@@ -510,7 +510,7 @@ function armCopy() {
   controls();
 }
 
-const TEXT_URL_RE = /https?:\/\/[^\s"'<>《》「」『』【】（）()[\]{}，,。；;、！!…]+|(?:(?:zhuanlan\.|www\.|m\.)?zhihu\.com|(?:www\.|m\.|music\.)?youtube\.com|youtu\.be)\/[^\s"'<>《》「」『』【】（）()[\]{}，,。；;、！!…]+/gi;
+const TEXT_URL_RE = /https?:\/\/[^\s"'<>《》「」『』【】（）()[\]{}，,。；;、！!…]+|(?:(?:zhuanlan\.|www\.|m\.)?zhihu\.com|(?:www\.|m\.|music\.)?youtube\.com|youtu\.be|(?:www\.|m\.)?bilibili\.com|b23\.tv)\/[^\s"'<>《》「」『』【】（）()[\]{}，,。；;、！!…]+/gi;
 
 function classifyLink(raw) {
   let value = raw.replace(/[.,;:!?。，；：！？、)\]}>》」』"'…]+$/g, '');
@@ -526,7 +526,10 @@ function classifyLink(raw) {
     return {url: value, kind: '抖音视频', tail: host + path, media: 'video'};
   }
   if (['bilibili.com', 'www.bilibili.com', 'm.bilibili.com', 'b23.tv'].includes(host)) {
-    return {url: value, kind: 'B站视频', tail: host + path, media: 'video'};
+    // Bilibili takes the built-in transcription pipeline (async
+    // task, same as YouTube); only Douyin keeps the synchronous
+    // video-parse path.
+    return {url: value, kind: 'B站视频', tail: host + path};
   }
   let match;
   if (host === 'zhuanlan.zhihu.com' && (match = /^\/p\/([0-9]{1,30})$/.exec(path))) {
@@ -609,6 +612,7 @@ function resetExtraction({quiet = false} = {}) {
   $('result-meta').textContent = '';
   $('result-source').hidden = true;
   $('result-source').removeAttribute('href');
+  $('fetch-direct-link').hidden = true;
   $('result').hidden = true;
   $('video-panel').hidden = true;
   $('video-result').hidden = true;
@@ -628,9 +632,14 @@ async function extractContent({copyOnNextClick = false} = {}) {
   if (!activeUsername || flow.busy || flow.reading || flow.copying) return false;
   renderLinks();
   const selectedLink = flow.links.find(link => link.url === flow.selected);
-  if (selectedLink?.media === 'video'
-      || (!flow.selected && /BV[0-9A-Za-z]{10}/.test($('url').value))) {
+  if (selectedLink?.media === 'video') {
     return extractVideo({copyOnNextClick});
+  }
+  if (!flow.selected) {
+    // A bare BV number with no recognized link: synthesize the
+    // standard video URL and take the async transcription path.
+    const bv = /BV[0-9A-Za-z]{10}/.exec($('url').value);
+    if (bv) flow.selected = 'https://www.bilibili.com/video/' + bv[0] + '/';
   }
   if (!flow.selected) {
     extractMessage('没有识别到支持的链接。请粘贴知乎、YouTube、抖音、B站或已配置网站的完整链接。', 'warning');
@@ -645,6 +654,7 @@ async function extractContent({copyOnNextClick = false} = {}) {
   flow.phase = 'extracting';
   currentResult = null;
   $('result').hidden = true;
+  $('fetch-direct-link').hidden = true;
   $('content').textContent = '';
   $('status').textContent = '正在提取…';
   extractMessage('正在读取页面，请稍候…', 'pending');
@@ -656,6 +666,7 @@ async function extractContent({copyOnNextClick = false} = {}) {
     if (generation !== flow.generation || !activeUsername) return false;
     if (typeof data.content !== 'string' || !data.content.trim()) throw new Error('请求成功，但没有获取到正文。');
     currentResult = data;
+    $('fetch-direct-link').hidden = data.kind !== 'bilibili';
     $('result-title').textContent = data.title || '提取结果';
     $('result-meta').textContent = [data.author, data.published].filter(Boolean).join(' · ') || '—';
     { const elapsedMs = Math.round(performance.now() - startedAt); const kb = n => n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? (n / 1024).toFixed(1) + ' KB' : n + ' B'; const parts = ['用时 ' + (elapsedMs >= 1000 ? (elapsedMs / 1000).toFixed(1) + ' 秒' : elapsedMs + ' 毫秒')]; if (typeof data.stats?.fetched_bytes === 'number') parts.push('拉取 ' + kb(data.stats.fetched_bytes)); if (data.origin) parts.push('来源 ' + data.origin); const outBytes = new TextEncoder().encode(data.content).length; parts.push('输出 ' + kb(outBytes) + '（' + data.content.length.toLocaleString() + ' 字）'); $('result-meta').textContent += ' · ' + parts.join(' · '); }
@@ -702,6 +713,23 @@ async function readClipboardText() {
   return text.slice(0, 65536);
 }
 
+// Shared by the synchronous Douyin parse and the lazy "fetch direct
+// link" action on Bilibili transcription results: renders the video
+// panel (player + download + copy/open direct link).
+function renderVideoResult(data) {
+  $('video-title').textContent = data.title || data.id;
+  $('video-platform').textContent = data.platform_name + ' · ' + data.quality;
+  videoUsingProxy = false;
+  $('video-player').src = data.play_url;
+  $('video-download').href = videoStreamUrl(data, true);
+  $('video-download').textContent = data.audio_only ? '下载音频' : '下载视频';
+  $('video-open').href = data.play_url;
+  $('video-status').textContent = '';
+  $('video-message').textContent = '';
+  $('video-result').hidden = false;
+  $('video-panel').hidden = false;
+}
+
 async function extractVideo({copyOnNextClick = false} = {}) {
   disarmCopy();
   const generation = ++flow.generation;
@@ -722,6 +750,7 @@ async function extractVideo({copyOnNextClick = false} = {}) {
     if (data.subtitle_text) {
       currentResult = {title: data.title || '字幕', author: data.platform_name || '',
         published: '', content: data.subtitle_text, format: 'text'};
+      $('fetch-direct-link').hidden = true;
       $('result-title').textContent = data.title || '字幕原文';
       const elapsedMs = Math.round(performance.now() - startedAt);
       const parts = ['用时 ' + (elapsedMs >= 1000 ? (elapsedMs / 1000).toFixed(1) + ' 秒' : elapsedMs + ' 毫秒'),
@@ -745,17 +774,7 @@ async function extractVideo({copyOnNextClick = false} = {}) {
       }
       return true;
     }
-    $('video-title').textContent = data.title || data.id;
-    $('video-platform').textContent = data.platform_name + ' · ' + data.quality;
-    videoUsingProxy = false;
-    $('video-player').src = data.play_url;
-    $('video-download').href = videoStreamUrl(data, true);
-    $('video-download').textContent = data.audio_only ? '下载音频' : '下载视频';
-    $('video-open').href = data.play_url;
-    $('video-status').textContent = '';
-    $('video-message').textContent = '';
-    $('video-result').hidden = false;
-    $('video-panel').hidden = false;
+    renderVideoResult(data);
     flow.phase = 'idle';
     $('status').textContent = '解析完成 ✓';
     extractMessage(data.audio_only ? '该视频没有音画合成流，已改为只取音频（保证有声音）。' : '视频解析成功', 'success');
@@ -956,6 +975,36 @@ showAccount('platform');
 // https://github.com/jiuhunwl/short_videos
 let videoResult = null;
 let videoUsingProxy = false;
+let fetchDirectLinkBusy = false;
+
+// Lazy direct link for Bilibili transcription results: the task
+// result carries no CDN link (links expire, and the subtitle path
+// never fetches playurl), so resolve one on demand through the
+// existing parse endpoint and reuse the video panel.
+$('fetch-direct-link').addEventListener('click', async () => {
+  if (!currentResult?.url || fetchDirectLinkBusy) return;
+  fetchDirectLinkBusy = true;
+  $('fetch-direct-link').disabled = true;
+  $('video-result').hidden = true;
+  $('video-panel').hidden = false;
+  $('video-message').textContent = '正在解析直链…';
+  try {
+    const data = await api('/api/video/parse', {text: currentResult.url});
+    videoResult = data;
+    if (data.play_url) {
+      renderVideoResult(data);
+    } else {
+      $('video-result').hidden = true;
+      $('video-message').textContent = '该视频已有字幕，解析未返回播放直链。';
+    }
+  } catch (error) {
+    $('video-result').hidden = true;
+    $('video-message').textContent = error.message;
+  } finally {
+    fetchDirectLinkBusy = false;
+    $('fetch-direct-link').disabled = false;
+  }
+});
 
 function videoStreamUrl(data, download) {
   const params = new URLSearchParams({u: data.play_url, ref: data.referer,

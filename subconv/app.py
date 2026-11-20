@@ -1344,6 +1344,37 @@ def _is_loopback_direct(environ):
 # unreachable from outside. GET-only, read-only, no state changes.
 
 
+# --- direct domains (subrender-20261118) --------------------------------
+# The DIRECT-domain list lives in the shared subscriptions data dir and is
+# substituted into the self-built subscription templates at request time by
+# the subrender service (loopback :19999). No sync step: a save here takes
+# effect on debi immediately and on shoc with the next data sync (<=5 min).
+DIRECT_LIST_FILE = "/srv/apphub/data/projects/subscriptions/list.json"
+_DIRECT_DOMAIN_RE = re.compile(
+    r"^(?=.{4,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+    r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
+
+
+def _load_direct_list():
+    with open(DIRECT_LIST_FILE, encoding="utf-8") as fh:
+        return json.load(fh)["domains"]
+
+
+def _save_direct_list(items):
+    tmp = DIRECT_LIST_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"domains": items}, fh, ensure_ascii=False, indent=1)
+        fh.write("\n")
+    os.replace(tmp, DIRECT_LIST_FILE)
+
+
+def _direct_state(items):
+    return {"ok": True, "domains": items,
+            "note": "保存后立即在 debi 生效，shoc 最多 5 分钟后生效。"}
+
+
+
+
 def _ui_probe():
     import urllib.error
     import urllib.request
@@ -1351,7 +1382,7 @@ def _ui_probe():
     targets = [
         ("panel", "http://127.0.0.1:17800/"),
         ("subconv", "http://127.0.0.1:19170/"),
-        ("directmgr-notbuilt", "http://127.0.0.1:19999/"),
+        ("subrender", "http://127.0.0.1:19999/health"),
     ]
     results = {}
     for name, url in targets:
@@ -1471,6 +1502,52 @@ def application(environ, start_response):
             return _json(start_response, "200 OK",
                          {"ok": False, "error": "probe_failed",
                           "message": str(exc)[:200]})
+
+    if path == "/api/direct/list" and method == "GET":
+        with _lock:
+            return _json(start_response, "200 OK",
+                         _direct_state(_load_direct_list()))
+
+    if path == "/api/direct/add" and method == "POST":
+        data = _read_json(environ)
+        domain = data.get("domain")
+        note = str(data.get("note") or "").strip()[:80]
+        if not isinstance(domain, str) or domain != domain.strip() \
+                or not _DIRECT_DOMAIN_RE.match(domain or ""):
+            return _json(start_response, "400 Bad Request",
+                         {"ok": False, "error": "bad_format",
+                          "message": "格式不标准，应为纯域名如 dedirock.com"
+                                     "（小写、无协议/路径/端口/尾点）。"})
+        with _lock:
+            items = _load_direct_list()
+            if any(it["domain"] == domain for it in items):
+                return _json(start_response, "200 OK",
+                             {"ok": True, "duplicate": True,
+                              "message": "已在名单中：" + domain,
+                              **_direct_state(items)})
+            items.append({"domain": domain, "builtin": False,
+                          "note": note,
+                          "added_at": time.strftime(
+                              "%Y-%m-%d %H:%M", time.localtime())})
+            _save_direct_list(items)
+            return _json(start_response, "200 OK",
+                         {"ok": True, "message": "已添加，立即生效。",
+                          **_direct_state(items)})
+
+    if path == "/api/direct/delete" and method == "POST":
+        data = _read_json(environ)
+        domain = str(data.get("domain") or "")
+        with _lock:
+            items = _load_direct_list()
+            kept = [it for it in items if it["domain"] != domain]
+            if len(kept) == len(items):
+                return _json(start_response, "404 Not Found",
+                             {"ok": False, "error": "not_found",
+                              "message": "名单中没有这一条。"})
+            _save_direct_list(kept)
+            return _json(start_response, "200 OK",
+                         {"ok": True, "message": "已删除，立即生效。",
+                          **_direct_state(kept)})
 
     if path == "/api/session" and method == "GET":
         return _json(start_response, "200 OK",
@@ -1780,6 +1857,20 @@ PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <div class="title" style="font-weight:600">直连域名</div>
+    <div class="meta">这些域名走 DIRECT，不绕节点。保存后立即在 debi 的自建订阅里生效，shoc 最多 5 分钟后生效。只接受纯域名（小写、无协议/路径/端口/尾点）。</div>
+    <div id="direct-list" style="margin-top:10px"></div>
+    <label>域名</label>
+    <input id="d-domain" type="text" placeholder="如：example.com" autocapitalize="off" autocomplete="off" spellcheck="false">
+    <label>备注（可选）</label>
+    <input id="d-note" type="text" maxlength="80" placeholder="备注">
+    <div class="row" style="margin-top:12px">
+      <button id="d-add" class="primary" type="button">添加</button>
+      <span id="d-msg" class="msg"></span>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="row">
       <button type="button" id="uiprobe-btn">平台可用性探测</button>
       <span class="msg" id="uiprobe-msg"></span>
@@ -1819,6 +1910,36 @@ function esc(v) {
   return String(v == null ? "" : v).replace(/[&<>"']/g, (c) => (
     {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 }
+async function directLoad() {
+  const st = await api("api/direct/list");
+  const box = $("direct-list");
+  if (!st || !st.ok) { box.innerHTML = '<div class="meta err">名单读取失败。</div>'; return; }
+  if (!st.domains.length) { box.innerHTML = '<div class="meta">名单是空的。</div>'; return; }
+  box.innerHTML = st.domains.map((it) => {
+    const tag = it.builtin ? ' <span class="meta">内置</span>' : "";
+    const note = it.note ? ' <span class="meta">' + esc(it.note) + '</span>' : "";
+    const when = it.added_at ? ' <span class="meta">' + esc(it.added_at) + '</span>' : "";
+    const del = it.builtin ? "" : ' <button type="button" class="danger" data-del="' + esc(it.domain) + '">删除</button>';
+    return '<div class="row" style="margin:6px 0"><span>' + esc(it.domain) + '</span>' + tag + note + when + del + '</div>';
+  }).join("");
+  box.querySelectorAll("[data-del]").forEach((b) => {
+    b.onclick = async () => {
+      const done = busyBtn(b);
+      const r = await api("api/direct/delete", "POST", {domain: b.getAttribute("data-del")});
+      done();
+      $("d-msg").textContent = (r && r.message) || "";
+      if (r && r.ok) directLoad();
+    };
+  });
+}
+$("d-add").onclick = async () => {
+  const done = busyBtn($("d-add"));
+  const r = await api("api/direct/add", "POST", {domain: $("d-domain").value, note: $("d-note").value});
+  done();
+  $("d-msg").textContent = (r && (r.message || r.error)) || "";
+  if (r && r.ok) { $("d-domain").value = ""; $("d-note").value = ""; directLoad(); }
+};
+directLoad();
 function detailTable(rows) {
   if (!rows || !rows.length) return '<div class="meta">暂无节点记录。</div>';
   const head = ["节点", "状态", "出口 IP", "地区", "ASN / 组织", "IP质量", "速度", "延迟", "YouTube", "成功率"];

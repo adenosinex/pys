@@ -4116,6 +4116,21 @@ def _drive_token():
 
 def _drive_list(q):
     """One Drive files.list call; returns the files array."""
+    relay = _cred("drive_relay_url")
+    rtoken = _cred("drive_relay_token")
+    if relay and rtoken:
+        req = urllib.request.Request(
+            relay.rstrip("/") + "/api/drive/query",
+            data=json.dumps({"q": q}).encode(),
+            headers={"Authorization": rtoken,
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8",
+                                                     "replace"))
+            return data.get("files") or []
+        except Exception as exc:
+            raise _DriveError("Drive \u4e2d\u7ee7\u67e5\u8be2\u5931\u8d25\uff1a%s" % str(exc)[:100])
     params = urllib.parse.urlencode({
         "q": q, "fields": "files(id,name,size)", "spaces": "drive",
         "pageSize": "10"})
